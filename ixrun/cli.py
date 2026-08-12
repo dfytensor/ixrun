@@ -1,0 +1,146 @@
+"""IXRUN command-line interface.
+
+Usage examples:
+  python -m ixrun.cli search        -- analyze optimal level scheme
+  python -m ixrun.cli generate "Hello, my name is" --max-new-tokens 64
+  python -m ixrun.cli bench         -- full bf16 vs INT8-X benchmark
+  python -m ixrun.cli bench --mode streaming
+"""
+from __future__ import annotations
+import argparse
+import gc
+import sys
+import torch
+
+from .config import MODEL_PATH, DATASET_CACHE, DEFAULT_LEVELS
+
+
+def _cmd_search(args):
+    from transformers import AutoModelForCausalLM
+    from .search import search_optimal_levels
+
+    print(f"[search] loading {args.model} ...", flush=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True
+    )
+    results = search_optimal_levels(model, max_levels=args.max_levels, topk=args.topk)
+    print(f"\nTop {len(results)} level schemes (lower bpw = better compression):\n")
+    print(f"{'Levels':<16}{'bpw':>8}{'flag':>8}{'data':>8}{'comp':>8}{'fractions'}")
+    print("-" * 70)
+    for r in results:
+        frac_str = " ".join(f"{p*100:.0f}%" for p in r["fractions"])
+        marker = "  <-- default" if tuple(r["level_bits"]) == tuple(DEFAULT_LEVELS) else ""
+        print(
+            f"{str(r['level_bits']):<16}{r['bpw']:>8.2f}{r['flag_bpw']:>8.2f}"
+            f"{r['data_bpw']:>8.2f}{r['compression']:>7.2f}x  [{frac_str}]{marker}"
+        )
+
+
+def _cmd_generate(args):
+    from .engine import Int8XEngine
+
+    eng = Int8XEngine.from_pretrained(
+        args.model, mode=args.mode, level_bits=tuple(args.levels), verbose=True
+    )
+    print(f"\n[prompt] {args.prompt}\n", flush=True)
+    if args.stream:
+        for chunk in eng.stream(args.prompt, max_new_tokens=args.max_new_tokens,
+                                temperature=args.temperature, do_sample=args.do_sample):
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+        print()
+    else:
+        out = eng.generate(args.prompt, max_new_tokens=args.max_new_tokens,
+                           temperature=args.temperature, do_sample=args.do_sample)
+        print(out)
+
+
+def _cmd_bench(args):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from .linear import deploy_model
+    from .eval_utils import bench_forward, eval_ppl, load_wikitext
+
+    tok = AutoTokenizer.from_pretrained(args.model)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    texts = load_wikitext(cache_dir=DATASET_CACHE)
+
+    rows = []
+    # bf16 baseline
+    print("[bench] bf16 baseline ...", flush=True)
+    gc.collect()
+    torch.cuda.reset_peak_memory_stats()
+    m = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).cuda()
+    ms_b, mem_b = bench_forward(m, tok)
+    ppl_b = eval_ppl(m, tok, texts)
+    wt_mb = sum(p.numel() * 2 for p in m.parameters() if p.dtype == torch.bfloat16) / 1e6
+    rows.append(("bf16", f"{ms_b:.0f}ms", f"{mem_b:.1f}GB", f"{ppl_b:.2f}", f"{wt_mb:.0f}MB", "1.0x"))
+    del m
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # INT8-X
+    print(f"[bench] INT8-X deploy (mode={args.mode}) ...", flush=True)
+    gc.collect()
+    torch.cuda.reset_peak_memory_stats()
+    m = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).cuda()
+    if args.mode == "streaming":
+        from .engine import Int8XEngine
+
+        Int8XEngine._deploy_streaming(m, tuple(args.levels), verbose=True)
+    else:
+        deploy_model(m, level_bits=tuple(args.levels), cache="full", verbose=True)
+    m.eval()
+    ms_x, mem_x = bench_forward(m, tok, warmup=3, n_runs=10)
+    ppl_x = eval_ppl(m, tok, texts)
+    est_bytes = sum(
+        getattr(mod, "packed", {}).get("total_bytes", 0)
+        for _, mod in m.named_modules()
+    )
+    pk_mb = est_bytes / 1e6 if est_bytes > 0 else wt_mb / 2.9
+    rows.append((f"INT8-X({args.mode})", f"{ms_x:.0f}ms", f"{mem_x:.1f}GB",
+                 f"{ppl_x:.2f}", f"{pk_mb:.0f}MB", f"{wt_mb/pk_mb:.1f}x"))
+    del m
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    from .eval_utils import format_bench
+
+    print("\n" + format_bench(rows, ["Mode", "Fwd", "GPU", "ppl", "Store", "comp"]))
+    print(f"\nppl delta: {float(rows[1][3]) - float(rows[0][3]):+.2f}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="ixrun", description="INT8-X inference engine")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    ps = sub.add_parser("search", help="analyze optimal level-bit scheme")
+    ps.add_argument("--model", default=MODEL_PATH)
+    ps.add_argument("--max-levels", type=int, default=5)
+    ps.add_argument("--topk", type=int, default=12)
+    ps.set_defaults(func=_cmd_search)
+
+    pg = sub.add_parser("generate", help="generate text")
+    pg.add_argument("prompt")
+    pg.add_argument("--model", default=MODEL_PATH)
+    pg.add_argument("--mode", default="cached", choices=["cached", "streaming"])
+    pg.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
+    pg.add_argument("--max-new-tokens", type=int, default=128)
+    pg.add_argument("--temperature", type=float, default=0.7)
+    pg.add_argument("--do-sample", action="store_true", default=True)
+    pg.add_argument("--no-sample", dest="do_sample", action="store_false")
+    pg.add_argument("--stream", action="store_true")
+    pg.set_defaults(func=_cmd_generate)
+
+    pb = sub.add_parser("bench", help="benchmark bf16 vs INT8-X")
+    pb.add_argument("--model", default=MODEL_PATH)
+    pb.add_argument("--mode", default="cached", choices=["cached", "streaming"])
+    pb.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
+    pb.set_defaults(func=_cmd_bench)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
