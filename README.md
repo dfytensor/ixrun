@@ -10,7 +10,7 @@
 | **bfloat16_to_int8x** (`quantize.py`) | bf16 权重 → int8 → (3,5,8) 嵌套位图打包，~5.5 bit/w，2.9× 压缩 |
 | **分析搜索** (`search.py`) | 穷举 2~5 级位图组合，按 bit/w 排序找最优方案 |
 | **Triton 解码** (`triton_kernels.py`) | 融合单 kernel：cumsum + 位图查询 + 跨字位提取，并行解码 |
-| **流推理** (`engine.py`) | pinned-CPU 打包 + 共享 GPU decode buf + DMA，GPU 显存 ≈ 单层 |
+| **流推理** (`engine.py`) | GPU常驻packed + 共享decode buf + Triton实时解码 (3模式: cached/streaming/graph) |
 | **资源调度** (`ResourceScheduler`) | 估算 bf16/packed/peak 显存，按 GPU 预算选 cached/streaming 模式 |
 | **文本生成** (`generate.py`) | greedy/sampling + token 流式输出 |
 
@@ -79,13 +79,15 @@ python -m ixrun.cli bench --mode streaming
 
 ## MiniCPM5-1B 实测结果
 
-| 模式 | 前向 | GPU 显存 | ppl | 存储 | 压缩比 |
-|---|---|---|---|---|---|
-| bf16 基线 | 136ms | 2.2GB | 56.02 | 2161MB | 1.0× |
-| INT8-X cached | 57ms | 2.2GB | 62.15 | 463MB | 4.66× |
-| INT8-X streaming | 309ms | 0.8GB | — | 463MB* | 4.66× |
+| 模式 | 前向 | GPU 显存 | ppl | 存储 | 压缩比 | 说明 |
+|---|---|---|---|---|---|---|
+| bf16 基线 | 38ms | 2.2GB | 55.90 | 2161MB | 1.0× | 原始精度 |
+| INT8-X cached | 38ms | 2.2GB | 62.15 | 463MB | 4.66× | 解码一次,极速 |
+| INT8-X streaming | 46ms | 1.3GB | — | 463MB* | 4.66× | GPU常驻packed+共享buf,实时解码 |
+| INT8-X graph | 41ms | 4.3GB | — | 463MB* | 4.66× | CUDA Graph融合168层解码 |
 
-\* streaming 模式打包数据在 host RAM，GPU 仅占 22MB decode buffer。
+\* streaming: packed数据GPU常驻(463MB)+共享decode buf(14MB),总GPU权重≈1.3GB
+\* graph: packed+per-layer decode buf,CUDA Graph replay消除168次kernel launch
 
 搜索最优方案（实测）：`(3,4,5,6,8)` bpw=5.33 comp=3.00×，默认 `(3,5,8)` bpw=5.46 comp=2.93×。
 

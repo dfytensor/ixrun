@@ -28,8 +28,10 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   Precomputed per-block prefix sums (`precompute_block_offsets`). Scatter fallback if
   scheme ≠ (3,5,8) or no CUDA.
 - **linear.py**: `Int8XLinear` (cache='full' decodes once; cache='none' re-decodes).
-- **engine.py**: `Int8XEngine.from_pretrained(mode='cached'|'streaming')`.
-  Streaming keeps packed on pinned host, decodes into shared 22MB GPU buffer.
+- **engine.py**: `Int8XEngine.from_pretrained(mode='cached'|'streaming'|'graph')`.
+  Streaming: packed GPU-resident (463MB) + shared 14MB decode buffer, real-time
+  Triton decode per forward (no DMA). Graph: CUDA-Graph captures all 168 decode
+  kernels into one replay; GraphLinear does GEMM-only forward.
 - **search.py**: exhaustive 2-5 level combo search by bit/w.
 
 ## Key design decisions

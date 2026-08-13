@@ -88,6 +88,10 @@ def _cmd_bench(args):
         from .engine import Int8XEngine
 
         Int8XEngine._deploy_streaming(m, tuple(args.levels), verbose=True)
+    elif args.mode == "graph":
+        from .engine import Int8XEngine
+
+        Int8XEngine._deploy_graph(m, tuple(args.levels), verbose=True)
     else:
         deploy_model(m, level_bits=tuple(args.levels), cache="full", verbose=True)
     m.eval()
@@ -123,7 +127,7 @@ def main():
     pg = sub.add_parser("generate", help="generate text")
     pg.add_argument("prompt")
     pg.add_argument("--model", default=MODEL_PATH)
-    pg.add_argument("--mode", default="cached", choices=["cached", "streaming"])
+    pg.add_argument("--mode", default="cached", choices=["cached", "streaming", "graph"])
     pg.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pg.add_argument("--max-new-tokens", type=int, default=128)
     pg.add_argument("--temperature", type=float, default=0.7)
@@ -134,7 +138,7 @@ def main():
 
     pb = sub.add_parser("bench", help="benchmark bf16 vs INT8-X")
     pb.add_argument("--model", default=MODEL_PATH)
-    pb.add_argument("--mode", default="cached", choices=["cached", "streaming"])
+    pb.add_argument("--mode", default="cached", choices=["cached", "streaming", "graph"])
     pb.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pb.set_defaults(func=_cmd_bench)
 

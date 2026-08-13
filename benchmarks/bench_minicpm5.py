@@ -5,7 +5,10 @@ Run:  python -m benchmarks.bench_minicpm5
 """
 from __future__ import annotations
 import gc
+import sys
 import time
+sys.setrecursionlimit(10000)
+import pandas  # MUST before transformers (stack overflow fix on this env)
 import torch
 
 from ixrun.config import MODEL_PATH, DATASET_CACHE, DEFAULT_LEVELS
@@ -69,10 +72,10 @@ def main():
                  f"{ppl_c:.2f}", f"{pk_mb:.0f}MB", f"{wt_b/pk_mb:.2f}x"))
     del m; gc.collect(); torch.cuda.empty_cache()
 
-    # ── 4. INT8-X streaming ───────────────────────────────────────────────
-    print("\n[4] INT8-X streaming deploy ...", flush=True)
+    # ── 4. INT8-X streaming (GPU-resident packed, no DMA) ─────────────────
+    print("\n[4] INT8-X streaming deploy (GPU-packed + shared buf) ...", flush=True)
     gc.collect(); torch.cuda.reset_peak_memory_stats()
-    m = AutoModelForCausalLM.from_pretrained(MODEL_PATH, torch_dtype=torch.bfloat16).cuda()
+    m = AutoModelForCausalLM.from_pretrained(MODEL_PATH, dtype=torch.bfloat16).cuda()
     s_stats = Int8XEngine._deploy_streaming(m, DEFAULT_LEVELS, verbose=True)
     m.eval()
     ms_s, mem_s = bench_forward(m, tok, warmup=3, n_runs=10)
@@ -82,11 +85,34 @@ def main():
                  "—", f"{pk_mb:.0f}MB*", f"{wt_b/pk_mb:.2f}x"))
     del m; gc.collect(); torch.cuda.empty_cache()
 
+    # ── 4b. INT8-X graph (CUDA-Graph decode fusion) ───────────────────────
+    print("\n[4b] INT8-X graph deploy (CUDA-Graph decode fusion) ...", flush=True)
+    gc.collect(); torch.cuda.reset_peak_memory_stats()
+    m = AutoModelForCausalLM.from_pretrained(MODEL_PATH, dtype=torch.bfloat16).cuda()
+    g_stats, g_replay = Int8XEngine._deploy_graph(m, DEFAULT_LEVELS, verbose=True)
+    m.eval()
+    @torch.no_grad()
+    def fwd_graph(ids):
+        g_replay()
+        torch.cuda.synchronize()
+        return m(ids)
+    ids_b = tok("Hello " * 20, return_tensors="pt")["input_ids"].cuda()
+    for _ in range(3): fwd_graph(ids_b)
+    torch.cuda.synchronize(); t0 = time.time()
+    for _ in range(10): fwd_graph(ids_b)
+    torch.cuda.synchronize()
+    ms_g = (time.time() - t0) / 10 * 1000
+    mem_g = torch.cuda.max_memory_allocated() / 1e9
+    print(f"    fwd={ms_g:.0f}ms  gpu={mem_g:.1f}GB  (graph replay decode)", flush=True)
+    rows.append(("INT8-X graph", f"{ms_g:.0f}ms", f"{mem_g:.1f}GB",
+                 "—", f"{pk_mb:.0f}MB*", f"{wt_b/pk_mb:.2f}x"))
+    del m; gc.collect(); torch.cuda.empty_cache()
+
     # ── 5. Summary ────────────────────────────────────────────────────────
     print("\n" + "=" * 72)
     print(format_bench(rows, ["Mode", "Fwd", "GPU", "ppl", "Store", "comp"]))
     print(f"\n  ppl delta (cached vs bf16): {ppl_c - ppl_b:+.2f}")
-    print(f"  * streaming: packed on host RAM, only {s_stats['shared_gpu_MB']:.0f}MB GPU decode buf")
+    print(f"  * streaming/graph: packed GPU-resident, shared/per-layer decode buf only")
     print("=" * 72)
 
     # ── 6. Generation smoke test ──────────────────────────────────────────
