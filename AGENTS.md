@@ -6,6 +6,10 @@
 - Offline mode required (no internet to HF): prefix with
   `HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1`
 - Model: MiniCPM5-1B (Llama-arch, 24 layers) at path in `ixrun/config.py:MODEL_PATH`.
+- Model (large): Qwen3.8-27B (multimodal qwen3_5, 64 layers hybrid linear/full attn)
+  at `ixrun/config.py:QWEN38_PATH` = `E:\models\Qwen3.8-27B`. Needs transformers>=5.8
+  (installed: 5.15.0). 27B streaming: CPU lazy-load -> per-layer quantize -> packed
+  to GPU, bf16 freed eagerly; 606 layers, packed 16.91GB, runs on 24GB card.
 
 ## Commands
 ```powershell

@@ -199,6 +199,31 @@ class Int8XEngine:
 
     # ----- construction -----------------------------------------------------
     @classmethod
+    def _load_any(cls, model_path: str, dtype, low_cpu: bool = True):
+        """Load with the right auto-class (CausalLM / multimodal / generic)."""
+        from transformers import (
+            AutoConfig,
+            AutoModel,
+            AutoModelForCausalLM,
+            AutoModelForImageTextToText,
+        )
+
+        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        arch = (getattr(cfg, "architectures", None) or [""])[0]
+        try:
+            if "ConditionalGeneration" in arch or "ForConditionalGeneration" in arch:
+                return AutoModelForImageTextToText.from_pretrained(
+                    model_path, dtype=dtype, low_cpu_mem_usage=low_cpu
+                )
+            return AutoModelForCausalLM.from_pretrained(
+                model_path, dtype=dtype, low_cpu_mem_usage=low_cpu
+            )
+        except Exception:
+            return AutoModel.from_pretrained(
+                model_path, dtype=dtype, low_cpu_mem_usage=low_cpu
+            )
+
+    @classmethod
     def from_pretrained(
         cls,
         model_path: str,
@@ -207,17 +232,20 @@ class Int8XEngine:
         dtype=torch.bfloat16,
         verbose: bool = True,
     ) -> "Int8XEngine":
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, dtype=dtype, low_cpu_mem_usage=True
-        ).cuda()
+        # For big models (streaming/graph): stay on CPU during quantization;
+        # packed data moves to GPU per-layer, bf16 weights are freed as we go.
+        big = mode in ("streaming", "graph")
+        model = cls._load_any(model_path, dtype, low_cpu=True)
+        if not big:
+            model = model.cuda()
 
-        if verbose:
+        if verbose and not big:
             est = ResourceScheduler.estimate(model, level_bits)
             print(
                 f"[engine] estimate: bf16={est['bf16_weight_MB']:.0f}MB "
@@ -227,13 +255,16 @@ class Int8XEngine:
 
         if mode == "streaming":
             stats = cls._deploy_streaming(model, level_bits, verbose=verbose)
-            return cls(model, tokenizer, stats)
         elif mode == "graph":
             stats, replay_fn = cls._deploy_graph(model, level_bits, verbose=verbose)
             return cls(model, tokenizer, stats, graph_replay=replay_fn)
         else:
             stats = cls._deploy_cached(model, level_bits, verbose=verbose)
-            return cls(model, tokenizer, stats)
+
+        eng = cls(model, tokenizer, stats)
+        if big:
+            eng._finalize_device()
+        return eng
 
     # ----- deploy helpers ---------------------------------------------------
     @staticmethod
@@ -286,8 +317,18 @@ class Int8XEngine:
     @staticmethod
     @torch.no_grad()
     def _deploy_graph(model, level_bits, verbose=True):
-        """Streaming + CUDA-Graph capture of all decode kernels."""
+        """Streaming + CUDA-Graph capture of all decode kernels.
+
+        NOTE: graph mode needs one persistent decode buffer per layer
+        (= full bf16 weights on GPU) — only viable for small models.
+        """
         targets = list(iter_quantizable_linears(model))
+        total_params = sum(m.weight.numel() for _, m in targets)
+        if total_params * 2 > torch.cuda.get_device_properties(0).total_memory * 0.9:
+            raise RuntimeError(
+                f"graph mode needs {total_params*2/1e9:.1f}GB of per-layer decode "
+                f"buffers — too large for this GPU; use mode='streaming'"
+            )
 
         total_bytes = 0
         decode_specs = []  # (name, StreamingLinear, per_layer_decode_buf)
@@ -345,6 +386,22 @@ class Int8XEngine:
         )
 
     # ----- inference --------------------------------------------------------
+    def _finalize_device(self):
+        """After CPU-side streaming deploy, move leftover params to GPU.
+
+        Iterates per-module (a dotted-name setattr on the root model would
+        create a stray attribute instead of updating nested modules).
+        """
+        for _, mod in self.model.named_modules():
+            for p in mod.parameters(recurse=False):
+                if p.data.device.type != "cuda":
+                    p.data = p.data.cuda()
+            for bname, b in mod.named_buffers(recurse=False):
+                if b.device.type != "cuda":
+                    setattr(mod, bname, b.cuda())
+        gc.collect(); torch.cuda.empty_cache()
+        self.model.eval()
+
     def _pre_forward(self):
         if self._graph_replay is not None:
             self._graph_replay()

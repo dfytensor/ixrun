@@ -26,6 +26,14 @@ def test_bitpack_roundtrip():
     assert torch.equal(vals5, decoded5), "5-bit roundtrip failed"
     print("[ok] bitpack 5-bit roundtrip")
 
+    # multi-chunk path: > chunk_vals (1<<21) with non-word-aligned bits,
+    # exercises chunk-boundary packing (worst case: 3-bit streams)
+    big = torch.randint(0, 8, (2_500_003,), dtype=torch.int32)
+    pk = pack_bits_stream(big, 3)
+    dec = unpack_bits_stream(pk, big.numel(), 3)
+    assert torch.equal(big, dec), "3-bit multi-chunk roundtrip failed"
+    print(f"[ok] bitpack 3-bit multi-chunk roundtrip ({big.numel()/1e6:.1f}M vals)")
+
 
 def test_quantize_decode_lossless():
     dev = "cuda" if torch.cuda.is_available() else "cpu"

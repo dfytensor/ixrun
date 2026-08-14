@@ -106,6 +106,29 @@ ppl 55.90→62.15 的差距**全部来自 bf16→int8 量化本身**（任何 in
 
 搜索最优方案（实测）：`(3,4,5,6,8)` bpw=5.33 comp=3.00×，默认 `(3,5,8)` bpw=5.46 comp=2.93×。
 
+## Qwen3.8-27B 适配（多模态 + 混合线性/全注意力）
+
+ixrun 的量化/解码对架构完全透明（任何 `nn.Linear` 都适用）。Qwen3.8-27B
+（64 层 = 48 GatedDeltaNet 线性注意力 + 16 全注意力 + 27 层 ViT 视觉塔）：
+
+```
+[deploy] 606 layers | packed=16.91GB GPU | shared decode buf=178.3MB
+[vram]   allocated=22.45GB (含 bf16 embeddings ~5GB) — 单张 24GB 卡
+[verify] 5 层 bit-exact vs 纯 int8 (INT8-X == plain int8 同样成立)
+[gen]    "The capital of France is" → "Paris" ✓ / 中文相对论问题 ✓ (310 ms/tok)
+```
+
+27B bf16 (51.75GB) 无法放进 24GB GPU；INT8-X streaming 把权重压到 16.91GB
+实现单卡推理。大模型路径：CPU 懒加载 → 逐层量化 → packed 逐层上 GPU →
+bf16 原权重即时释放（64GB RAM 峰值安全，分块打包限制临时内存 <100MB/层）。
+
+```bash
+# 运行 (benchmarks/bench_qwen38.py)
+$env:HF_HUB_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts\python.exe' -m benchmarks.bench_qwen38
+```
+
+环境要求：transformers>=5.8 (qwen3_5 架构)，模型路径见 `ixrun/config.py:QWEN38_PATH`。
+
 ## 项目结构
 
 ```

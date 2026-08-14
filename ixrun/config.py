@@ -10,6 +10,9 @@ MODEL_PATH = (
     r"\4e9de7a0778dc1c362e983e6858f0e77542cbdca"
 )
 
+# Qwen3.8-27B (multimodal: vision + hybrid linear/full attention, 64 layers)
+QWEN38_PATH = r"E:\models\Qwen3.8-27B"
+
 # --- Dataset cache (for wikitext ppl eval) ---
 DATASET_CACHE = r"F:\hf_cache\datasets"
 
