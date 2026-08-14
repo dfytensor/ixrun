@@ -12,6 +12,9 @@
 # unit tests (fast, no model load)
 $env:HF_HUB_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts\python.exe' -m tests.test_core
 
+# group-scale (ixgs) tests — lossless + SNR + kernel equivalence
+$env:HF_HUB_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts\python.exe' -m ixgs.test_gs
+
 # full pipeline benchmark on MiniCPM5-1B (loads model 4x, ~3 min)
 $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts\python.exe' -m benchmarks.bench_minicpm5
 
@@ -40,3 +43,15 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
 - L3 (8-bit level) stored as raw uint8, not bit-packed (the Triton kernel loads it
   directly by index).
 - Decode correctness verified bit-exact (max_err=0.0) for both Triton and scatter paths.
+
+## ixgs (Group-Scale, v3) — future direction
+- `ixgs/` is a self-contained package: per-group scale (`group_max/15`, group=64)
+  + the same (3,5,8) lossless encoding. Validated on MiniMax-H3 video DiT where
+  per-tensor scales produce blocky output (coherent error accumulation across
+  50 layers x 10 denoise steps); group scales reach 25.4 dB vs per-tensor 20.1 dB.
+- Pitfalls encoded in its tests/docs: value-range tiers (not percentile), pad
+  empty L3 stream to >=1 elem, pad l1/l2 streams with one zero word, fp16-round
+  the group scales BEFORE quantizing (else decode doesn't close), ±0.0 sign is
+  value-identical (use numeric equality for losslessness checks).
+- Group-scale only wins on heavy-tailed weights (real LLM/DiT); pure gaussian
+  synthetic data favors per-tensor.
