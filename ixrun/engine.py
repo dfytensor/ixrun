@@ -77,16 +77,23 @@ class StreamingLinear(nn.Module):
         # fused decode+GEMV for single-token decode steps (generation hot
         # loop): reads only packed streams, bf16 weight never materializes
         self._use_fused = False
+        self._split_chunk = 0
         if (
             self._use_triton
             and self.in_features % 512 == 0
             and torch.cuda.is_available()
         ):
-            from .fused import compute_row_prefixes
+            from .fused import compute_row_prefixes, _pick_split
 
-            q1, q2 = compute_row_prefixes(packed)
+            split = _pick_split(self.in_features) if self.out_features < self.in_features else 1
+            if split > 1:
+                self._split_chunk = self.in_features // split
+                q1, q2 = compute_row_prefixes(packed, self._split_chunk)
+            else:
+                q1, q2 = compute_row_prefixes(packed)
             self.register_buffer("_q1", q1.cuda())
             self.register_buffer("_q2", q2.cuda())
+            self._y32 = None
             self._use_fused = True
 
         if bias is not None:
@@ -135,11 +142,27 @@ class StreamingLinear(nn.Module):
         ):
             from .fused import fused_gemv
 
-            y = fused_gemv(
-                x, self._b1, self._b2, self._l1, self._l2, self._l3,
-                self._q1, self._q2, self._scale,
-                self.out_features, self.in_features,
-            )
+            if self._split_chunk:
+                # split-K path: fp32 atomics into persistent buffer (must be
+                # re-zeroed before each use), converted to bf16 after
+                if self._y32 is None:
+                    self._y32 = torch.zeros(
+                        self.out_features, dtype=torch.float32, device=x.device
+                    )
+                self._y32.zero_()
+                y32 = fused_gemv(
+                    x, self._b1, self._b2, self._l1, self._l2, self._l3,
+                    self._q1, self._q2, self._scale,
+                    self.out_features, self.in_features,
+                    chunk=self._split_chunk, y32=self._y32,
+                )
+                y = y32.to(torch.bfloat16)
+            else:
+                y = fused_gemv(
+                    x, self._b1, self._b2, self._l1, self._l2, self._l3,
+                    self._q1, self._q2, self._scale,
+                    self.out_features, self.in_features,
+                )
             y = y.view(x.shape[:-1] + (self.out_features,))
             if self._bias is not None:
                 y = y + self._bias.to(y.dtype)
@@ -241,6 +264,12 @@ class Int8XEngine:
             AutoModelForCausalLM,
             AutoModelForImageTextToText,
         )
+
+        # fuse Qwen3.5 linear-attention Triton kernels (fla) if available —
+        # without this the delta rule runs as an eager fp32 python loop
+        from .fla_patch import apply_fla_kernels
+
+        apply_fla_kernels(verbose=True)
 
         cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         arch = (getattr(cfg, "architectures", None) or [""])[0]

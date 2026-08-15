@@ -41,7 +41,12 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   loop). Per-row sequential walk, register-carried rank counters seeded from tiny
   per-row prefix arrays (compute_row_prefixes); bf16 weight never materializes.
   Shape heuristic (num_warps, BK): tall (2,512) / wide (2,1024) / square (4,512).
-  Requires in_f % 512 == 0 (falls back otherwise).
+  Requires in_f % 512 == 0 (falls back otherwise). Wide layers (down_proj) use
+  split-K: S=2, chunk-boundary prefixes, fp32 atomic accumulate (~233G elem/s).
+- **fla_patch.py**: binds fla 0.5.2 Triton kernels (fused_recurrent_gdn /
+  chunk_gated_delta_rule) into qwen3_5's delta-rule functions — without it the
+  HF hub-kernel fallback silently uses an eager fp32 python loop (~120ms/token).
+  Applied automatically in engine._load_any.
 - **linear.py**: `Int8XLinear` (cache='full' decodes once; cache='none' re-decodes).
 - **engine.py**: `Int8XEngine.from_pretrained(mode='cached'|'streaming'|'graph')`.
   Streaming: packed GPU-resident (463MB) + shared 14MB decode buffer, real-time

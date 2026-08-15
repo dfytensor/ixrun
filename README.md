@@ -169,24 +169,27 @@ $env:HF_HUB_OFFLINE='1'; $env:PYTHONPATH='E:\IXRUN'
 
 ## 推理速度优化
 
-两层优化把 27B 生成速度从 **310 → 165 ms/tok（1.9×）**，MiniCPM5 45 → 40 ms/tok：
+多轮优化把 27B 生成速度从 **310 → 138 ms/tok（累计 2.25×）**：
 
-1. **decode kernel cumsum 削减（4→2）**：`nl1_local = arange - l1_local - 1`、
-   `l3_local = nl1_local - b2_local - 1` 数学推导替代两次 `tl.cumsum`（bit-exact 不变），
-   27B 生成 310→199 ms/tok
-2. **融合 decode+GEMV kernel**（`ixrun/fused.py`）：KV-cache 生成时每 token 每层只有
-   1 个输入 token，GEMM 退化为 GEMV — kernel 内直接解码+乘累加，bf16 权重**永不落地**。
-   每层省掉 27GB 写+27GB 读显存流量的主体；孤立测速 45-64×（0.36ms 处理 89M 权重层）。
-   rank 计数器在寄存器中随 k 顺序推进，行首全局前缀用两个 out_f 大小的微型数组
-   （`compute_row_prefixes`）。按层形状启发式选 (num_warps, BK)。
-   生成输出与原路径**逐字节一致**（fp32 累加顺序差异 <1e-3 相对误差）。
+1. **decode kernel cumsum 削减（4→2）**（bit-exact 不变）：310→199 ms/tok
+2. **融合 decode+GEMV kernel**（`ixrun/fused.py`）：KV-cache 生成时 GEMM 退化 GEMV，
+   kernel 内解码+乘累加，bf16 权重永不落地。孤立 0.31ms/89M 权重层（287G elem/s）。
+   199→165 ms/tok
+3. **fla Triton kernels 绑定**（`ixrun/fla_patch.py`）：transformers 5.15 期望的
+   `recurrent_gated_delta_rule` 在 fla 0.5.2 中名为 `fused_recurrent_gdn`，HF 的
+   hub-kernel fallback 因 API 不匹配**静默退回 fp32 Python 循环**（48 层 delta rule）。
+   patch 显式绑定 recurrent+chunk 两个 kernel。165→153 ms/tok
+4. **split-K wide GEMV**：down_proj (5120×17408) 单 kernel 只有 94G elem/s（行少
+   并行度低），按 in_f 切 2 块 + chunk 边界 rank 前缀 + fp32 atomic 累加 →
+   233G elem/s。153→138 ms/tok
 
 ```
-Qwen3.8-27B streaming 生成速度:  310 → 199 (cumsum) → 165 ms/tok (fused GEMV)
-实测 (200 tok 故事续写, greedy):  fused 165 ms/tok vs 旧路径 199 ms/tok
+Qwen3.8-27B streaming:  310 → 199 → 165 → 153 → 138 ms/tok
+实测 per-hook 分解 (138ms):  MLP 75ms · linear-attn 37ms · full-attn 14ms · glue 12ms
 ```
 
-prefill（多 token 前向）仍走 decode+F.linear 快路径（decode kernel 已加速）。
+已试弃用：torch.compile 子模块（graph-break 导致 0.95×）；全模型 CUDA Graph
+（qwen3_5 硬编码 DynamicCache 不可行）。
 
 ## Qwen3.8-27B 适配（多模态 + 混合线性/全注意力）
 
