@@ -191,6 +191,29 @@ Qwen3.8-27B streaming:  310 → 199 → 165 → 153 → 138 ms/tok
 已试弃用：torch.compile 子模块（graph-break 导致 0.95×）；全模型 CUDA Graph
 （qwen3_5 硬编码 DynamicCache 不可行）。
 
+## MTP（Multi-Token Prediction，实验特性）
+
+Qwen3.8-27B 自带 MTP 模块（`mtp_num_hidden_layers: 1`），transformers 加载时
+**直接忽略**（`_keys_to_ignore_on_load_unexpected`）。`ixrun/mtp.py` 从权重
+逆向重建了 MTP 头并接入投机解码：
+
+- 结构（teacher-forcing 变体搜索验证）：`z = fc(cat(norm_e(emb), norm_h(h)))`
+  **无残差** → 1 层 full-attn decoder → 共享 lm_head；norm 均为 Qwen3.5 的
+  `(1+w)` 变体
+- MTP 头 9 个 Linear 全部 INT8-X 量化（StreamingLinear + 融合 GEMV）
+- 实测：teacher-forcing t+2 准确率 62.5%，投机接受率 63.9%，输出与贪心一致
+
+**净收益为负**（213 vs 181 ms/tok）：拒绝路径需在干净 cache 上重跑（qwen3_5
+混合线性注意力的 recurrent state 无法回退，只能 clone），64% 接受率低于盈亏
+平衡点 ~72%。业界 MTP 2-4× 收益依赖 paged-KV 原地回退 + CUDA graph 批量验证。
+因此**默认不启用**；待 KV 架构升级后可重估。
+
+```python
+from ixrun.mtp import build_mtp_head, spec_generate
+mtp = build_mtp_head(eng.model, MODEL_PATH)   # None if checkpoint has no MTP
+out = spec_generate(eng.model, eng.tokenizer, ids, mtp, max_new_tokens=200)
+```
+
 ## Qwen3.8-27B 适配（多模态 + 混合线性/全注意力）
 
 ixrun 的量化/解码对架构完全透明（任何 `nn.Linear` 都适用）。Qwen3.8-27B
