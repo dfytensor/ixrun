@@ -116,10 +116,11 @@ if _HAS_TRITON:
             - 3
         )
 
-        # --- non-L1 rank (level-2 or level-3) ---
+        # --- non-L1 rank: derived from arange & l1_local (no second cumsum) ---
+        # cumsum(nl1)[i] = (i+1) - cumsum(is_l1)[i]  =>  local rank = i - l1_local - 1
         nl1_bit = 1 - is_l1
         nl1_before = pid * BLK - l1_before
-        nl1_local = tl.cumsum(nl1_bit, axis=0) - 1
+        nl1_local = tl.arange(0, BLK) - l1_local - 1
         nl1_rank = nl1_before + nl1_local
         nl1_rank = tl.where(nl1_bit == 1, nl1_rank, 0)
 
@@ -152,13 +153,14 @@ if _HAS_TRITON:
             - 15
         )
 
-        # L3: rank among (non-L1 AND non-L2) via its own cumsum.
-        # l3 count before block = non-L1 before block - L2 before block.
+        # L3: rank among (non-L1 AND non-L2), derived (no third cumsum):
+        # for an l3 element, count-before = nl1_count_before - l2_count_before;
+        # l2_count_before = b2_local + 1 at elements where is_l2==0
+        # (cumsum counts up to AND including i, subtract is_l2[i]=0 -> +1 back)
         is_l3 = tl.where(nl1_bit == 1, 1 - is_l2, 0)
         nl1_total_before = pid * BLK - l1_before
         l3_total_before = nl1_total_before - b2_before
-        l3_local = tl.cumsum(is_l3, axis=0) - 1
-        l3r = l3_total_before + l3_local
+        l3r = l3_total_before + (nl1_local - b2_local - 1)
         l3r = tl.where(is_l3 == 1, l3r, 0)
         l3r_safe = tl.where(l3r < 0, 0, l3r)
         l3v = tl.load(l3_ptr + l3r_safe, mask=mask, other=0).to(tl.int32) - 127

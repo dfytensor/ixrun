@@ -74,6 +74,21 @@ class StreamingLinear(nn.Module):
             self._b1_blk = self._b2_blk = None
             self._use_triton = False
 
+        # fused decode+GEMV for single-token decode steps (generation hot
+        # loop): reads only packed streams, bf16 weight never materializes
+        self._use_fused = False
+        if (
+            self._use_triton
+            and self.in_features % 512 == 0
+            and torch.cuda.is_available()
+        ):
+            from .fused import compute_row_prefixes
+
+            q1, q2 = compute_row_prefixes(packed)
+            self.register_buffer("_q1", q1.cuda())
+            self.register_buffer("_q2", q2.cuda())
+            self._use_fused = True
+
         if bias is not None:
             self.register_buffer("_bias", bias.detach().clone().cuda())
         else:
@@ -111,6 +126,25 @@ class StreamingLinear(nn.Module):
         return w_flat.view(self.out_features, self.in_features)
 
     def forward(self, x):
+        # single-token decode step (KV-cached generation): fused GEMV path,
+        # weights decoded in-register — no shared-buffer roundtrip at all
+        if (
+            self._use_fused
+            and x.dtype == torch.bfloat16
+            and x.numel() == self.in_features
+        ):
+            from .fused import fused_gemv
+
+            y = fused_gemv(
+                x, self._b1, self._b2, self._l1, self._l2, self._l3,
+                self._q1, self._q2, self._scale,
+                self.out_features, self.in_features,
+            )
+            y = y.view(x.shape[:-1] + (self.out_features,))
+            if self._bias is not None:
+                y = y + self._bias.to(y.dtype)
+            return y
+
         w = self._decode()
         bias = self._bias.to(x.dtype) if self._bias is not None else None
         return F.linear(x, w, bias)

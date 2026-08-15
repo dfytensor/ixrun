@@ -34,9 +34,14 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
 ## Architecture
 - **quantize.py**: bf16 → per-tensor int8 (scale=max_abs/127) → (3,5,8) nested-bitmap
   packing. Lossless on the int8 representation.
-- **triton_kernels.py**: fused decode via tl.cumsum + bitmap + cross-word bit extract.
-  Precomputed per-block prefix sums (`precompute_block_offsets`). Scatter fallback if
+- **triton_kernels.py**: fused decode via tl.cumsum + bitmap + cross-word bit extract
+  (optimized: 2 cumsums, nl1/l3 ranks derived algebraically). Scatter fallback if
   scheme ≠ (3,5,8) or no CUDA.
+- **fused.py**: fused decode+GEMV for single-token decode steps (generation hot
+  loop). Per-row sequential walk, register-carried rank counters seeded from tiny
+  per-row prefix arrays (compute_row_prefixes); bf16 weight never materializes.
+  Shape heuristic (num_warps, BK): tall (2,512) / wide (2,1024) / square (4,512).
+  Requires in_f % 512 == 0 (falls back otherwise).
 - **linear.py**: `Int8XLinear` (cache='full' decodes once; cache='none' re-decodes).
 - **engine.py**: `Int8XEngine.from_pretrained(mode='cached'|'streaming'|'graph')`.
   Streaming: packed GPU-resident (463MB) + shared 14MB decode buffer, real-time
