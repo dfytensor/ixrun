@@ -40,7 +40,8 @@ def _cmd_generate(args):
     from .engine import Int8XEngine
 
     eng = Int8XEngine.from_pretrained(
-        args.model, mode=args.mode, level_bits=tuple(args.levels), verbose=True
+        args.model, mode=args.mode, level_bits=tuple(args.levels),
+        cache_path=args.cache, verbose=True,
     )
     print(f"\n[prompt] {args.prompt}\n", flush=True)
     if args.stream:
@@ -53,6 +54,18 @@ def _cmd_generate(args):
         out = eng.generate(args.prompt, max_new_tokens=args.max_new_tokens,
                            temperature=args.temperature, do_sample=args.do_sample)
         print(out)
+
+
+def _cmd_chat(args):
+    from .engine import Int8XEngine
+    from .chat import chat_repl
+
+    eng = Int8XEngine.from_pretrained(
+        args.model, mode=args.mode, level_bits=tuple(args.levels),
+        cache_path=args.cache, verbose=True,
+    )
+    chat_repl(eng, max_new_tokens=args.max_new_tokens,
+              temperature=args.temperature, do_sample=args.do_sample)
 
 
 def _cmd_bench(args):
@@ -134,7 +147,18 @@ def main():
     pg.add_argument("--do-sample", action="store_true", default=True)
     pg.add_argument("--no-sample", dest="do_sample", action="store_false")
     pg.add_argument("--stream", action="store_true")
+    pg.add_argument("--cache", default=None, help="packed-weight cache file (streaming mode)")
     pg.set_defaults(func=_cmd_generate)
+
+    pc = sub.add_parser("chat", help="interactive chat REPL")
+    pc.add_argument("--model", default=MODEL_PATH)
+    pc.add_argument("--mode", default="streaming", choices=["cached", "streaming"])
+    pc.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
+    pc.add_argument("--max-new-tokens", type=int, default=256)
+    pc.add_argument("--temperature", type=float, default=0.7)
+    pc.add_argument("--no-sample", dest="do_sample", action="store_false")
+    pc.add_argument("--cache", default=None, help="packed-weight cache file (streaming mode)")
+    pc.set_defaults(func=_cmd_chat, do_sample=True)
 
     pb = sub.add_parser("bench", help="benchmark bf16 vs INT8-X")
     pb.add_argument("--model", default=MODEL_PATH)

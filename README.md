@@ -106,6 +106,27 @@ ppl 55.90→62.15 的差距**全部来自 bf16→int8 量化本身**（任何 in
 
 搜索最优方案（实测）：`(3,4,5,6,8)` bpw=5.33 comp=3.00×，默认 `(3,5,8)` bpw=5.46 comp=2.93×。
 
+## 启动体验
+
+```powershell
+# ── Qwen3.8-27B 交互式聊天 (24GB 单卡) ────────────────────────────
+# 首次: 量化 606 层并缓存 (~13 min); 之后启动 ~1 min
+$env:HF_HUB_OFFLINE='1'; $env:PYTHONPATH='E:\IXRUN'
+& 'F:\rwkv\.venv\Scripts\python.exe' -m ixrun.cli chat --model E:\models\Qwen3.8-27B --cache E:\models\qwen38_packed.pt
+
+# 聊天内命令: /exit 退出 · /new 清空历史 · /len N 改长度 · /think off 关闭思考
+# (Qwen3.8 思考模型的 <think> 块实时隐藏, 只显示答案)
+
+# ── 单次生成 ──────────────────────────────────────────────────────
+& 'F:\rwkv\.venv\Scripts\python.exe' -m ixrun.cli generate "介绍一下你自己" --model E:\models\Qwen3.8-27B --mode streaming --cache E:\models\qwen38_packed.pt --stream
+
+# ── MiniCPM5-1B (快速体验, 无需大显存) ────────────────────────────
+& 'F:\rwkv\.venv\Scripts\python.exe' -m ixrun.cli chat --cache E:\models\minicpm5_packed.pt   # 二次启动 2s
+```
+
+`--cache` 指定打包权重落盘文件：首次运行量化并保存，之后启动直接加载
+（跳过量化与 bf16 磁盘读取，MiniCPM5 实测 19× 加速）。
+
 ## Qwen3.8-27B 适配（多模态 + 混合线性/全注意力）
 
 ixrun 的量化/解码对架构完全透明（任何 `nn.Linear` 都适用）。Qwen3.8-27B

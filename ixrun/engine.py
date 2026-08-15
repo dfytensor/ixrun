@@ -231,6 +231,7 @@ class Int8XEngine:
         level_bits=(3, 5, 8),
         dtype=torch.bfloat16,
         verbose: bool = True,
+        cache_path: str | None = None,
     ) -> "Int8XEngine":
         from transformers import AutoTokenizer
 
@@ -254,7 +255,8 @@ class Int8XEngine:
             )
 
         if mode == "streaming":
-            stats = cls._deploy_streaming(model, level_bits, verbose=verbose)
+            stats = cls._deploy_streaming(model, level_bits, verbose=verbose,
+                                          cache_path=cache_path)
         elif mode == "graph":
             stats, replay_fn = cls._deploy_graph(model, level_bits, verbose=verbose)
             return cls(model, tokenizer, stats, graph_replay=replay_fn)
@@ -275,16 +277,52 @@ class Int8XEngine:
 
     @staticmethod
     @torch.no_grad()
-    def _deploy_streaming(model, level_bits, verbose=True):
-        """GPU-resident packed + shared decode buffer + Triton real-time decode."""
+    def _deploy_streaming(model, level_bits, verbose=True, cache_path=None):
+        """GPU-resident packed + shared decode buffer + Triton real-time decode.
+
+        cache_path: if set and the file exists, load the previously quantized
+        packed weights (skips the ~minutes quantization AND the bf16 disk read,
+        since lazy-loaded weights are never touched). If it doesn't exist,
+        quantize now and save for next time.
+        """
+        import os
+
         targets = list(iter_quantizable_linears(model))
+        layer_data = None
+
+        if cache_path is not None and os.path.exists(cache_path):
+            if verbose:
+                print(f"[engine][cache] loading packed weights from {cache_path}", flush=True)
+            blob = torch.load(cache_path, map_location="cpu", weights_only=False)
+            if tuple(blob["level_bits"]) != tuple(level_bits):
+                raise ValueError(
+                    f"cache was built with level_bits={blob['level_bits']}, "
+                    f"requested {tuple(level_bits)}; delete the cache or change level_bits"
+                )
+            layer_data = blob["layers"]
+            # sanity: names must match this model
+            have = {n for n, _ in model.named_modules()}
+            missing = [n for n, _, _ in layer_data if n not in have]
+            if missing:
+                raise ValueError(f"cache/model mismatch: {len(missing)} unknown layers")
+            if verbose:
+                print(f"[engine][cache] {len(layer_data)} layers loaded", flush=True)
+
+        if layer_data is None:
+            layer_data = []
+            for name, mod in targets:
+                p = int8x_quantize(mod.weight.data, level_bits)
+                bias = mod.bias.data if mod.bias is not None else None
+                layer_data.append((name, p, bias))
+            if cache_path is not None:
+                if verbose:
+                    print(f"[engine][cache] saving packed weights to {cache_path}", flush=True)
+                torch.save({"level_bits": tuple(level_bits), "layers": layer_data}, cache_path)
 
         max_N = 0
         total_bytes = 0
         stream_layers = []
-        for name, mod in targets:
-            p = int8x_quantize(mod.weight.data, level_bits)
-            bias = mod.bias.data if mod.bias is not None else None
+        for name, p, bias in layer_data:
             sl = StreamingLinear(p, bias=bias)
             stream_layers.append((name, sl))
             total_bytes += p["total_bytes"]
