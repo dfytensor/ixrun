@@ -173,22 +173,34 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False) -
         def sse():
             with gen_lock:
                 splitter = _ThinkSplitter(expect_think=expect_think)
+                it = eng.stream(prompt, **kw)
                 try:
-                    for chunk in eng.stream(prompt, **kw):
+                    for chunk in it:
                         r_delta, a_delta = splitter.feed(chunk)
                         if a_delta:
                             yield _sse_chunk(rid, created, req.model or model_id,
                                              content=a_delta)
-                    # note: unclosed think block (max_tokens hit mid-reasoning)
-                    # is intentionally not emitted as answer
+                        # note: unclosed think block (max_tokens hit mid-
+                        # reasoning) is intentionally not emitted as answer
+                except GeneratorExit:
+                    # client disconnected mid-stream: unwind WITHOUT yielding
+                    # (yielding after GeneratorExit raises RuntimeError)
+                    raise
                 finally:
-                    if req.stream_options and req.stream_options.get("include_usage"):
-                        yield _sse_chunk(rid, created, req.model or model_id,
-                                         content=None, finish="stop", usage=True)
-                    else:
-                        yield _sse_chunk(rid, created, req.model or model_id,
-                                         content=None, finish="stop")
-                    yield "data: [DONE]\n\n"
+                    # deterministic cleanup even if we're being closed:
+                    # it.close() cancels the generation thread (StoppingCriteria
+                    # flag) and joins it, all while we still hold gen_lock —
+                    # prevents a stray generation from corrupting the shared
+                    # decode buffers of the next request
+                    it.close()
+                # normal completion only (client still connected)
+                if req.stream_options and req.stream_options.get("include_usage"):
+                    yield _sse_chunk(rid, created, req.model or model_id,
+                                     content=None, finish="stop", usage=True)
+                else:
+                    yield _sse_chunk(rid, created, req.model or model_id,
+                                     content=None, finish="stop")
+                yield "data: [DONE]\n\n"
 
         return StreamingResponse(sse(), media_type="text/event-stream")
 
