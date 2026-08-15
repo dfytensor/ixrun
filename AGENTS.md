@@ -26,6 +26,9 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
 & 'F:\rwkv\.venv\Scripts\python.exe' -m ixrun.cli search
 & 'F:\rwkv\.venv\Scripts\python.exe' -m ixrun.cli generate "Hello" --stream
 & 'F:\rwkv\.venv\Scripts\python.exe' -m ixrun.cli bench
+& 'F:\rwkv\.venv\Scripts\python.exe' -m ixrun.cli chat --model E:\models\Qwen3.8-27B --cache E:\models\qwen38_packed.pt
+# OpenAI-compatible API server (fastapi+uvicorn, installed)
+& 'F:\rwkv\.venv\Scripts\python.exe' -m ixrun.cli serve --model E:\models\Qwen3.8-27B --cache E:\models\qwen38_packed.pt --port 8000 --model-id qwen3.8-27b
 ```
 
 ## Architecture

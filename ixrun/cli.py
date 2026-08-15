@@ -127,6 +127,21 @@ def _cmd_bench(args):
     print(f"\nppl delta: {float(rows[1][3]) - float(rows[0][3]):+.2f}")
 
 
+def _cmd_serve(args):
+    from .server import serve
+
+    serve(
+        args.model,
+        mode=args.mode,
+        cache_path=args.cache,
+        level_bits=tuple(args.levels),
+        host=args.host,
+        port=args.port,
+        model_id=args.model_id,
+        enable_thinking=args.think,
+    )
+
+
 def main():
     p = argparse.ArgumentParser(prog="ixrun", description="INT8-X inference engine")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -159,6 +174,18 @@ def main():
     pc.add_argument("--no-sample", dest="do_sample", action="store_false")
     pc.add_argument("--cache", default=None, help="packed-weight cache file (streaming mode)")
     pc.set_defaults(func=_cmd_chat, do_sample=True)
+
+    pv = sub.add_parser("serve", help="OpenAI-compatible API server")
+    pv.add_argument("--model", default=MODEL_PATH)
+    pv.add_argument("--mode", default="streaming", choices=["cached", "streaming"])
+    pv.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
+    pv.add_argument("--cache", default=None, help="packed-weight cache file (streaming mode)")
+    pv.add_argument("--host", default="127.0.0.1")
+    pv.add_argument("--port", type=int, default=8000)
+    pv.add_argument("--model-id", default=None, help="model id advertised via /v1/models")
+    pv.add_argument("--think", action="store_true",
+                    help="enable thinking mode (default: direct answers)")
+    pv.set_defaults(func=_cmd_serve)
 
     pb = sub.add_parser("bench", help="benchmark bf16 vs INT8-X")
     pb.add_argument("--model", default=MODEL_PATH)

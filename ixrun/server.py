@@ -1,0 +1,239 @@
+"""OpenAI-compatible HTTP API server for Int8XEngine.
+
+Endpoints:
+  GET  /v1/models
+  POST /v1/chat/completions   (stream=true SSE / stream=false JSON)
+  GET  /health
+
+Works with any OpenAI-compatible client — including opencode, which can be
+pointed at this server via an openai-compatible provider config.
+
+Run:
+  python -m ixrun.cli serve --model E:/models/Qwen3.8-27B --cache E:/models/qwen38_packed.pt
+"""
+from __future__ import annotations
+import json
+import threading
+import time
+import uuid
+
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
+
+from .engine import Int8XEngine
+
+__all__ = ["create_app"]
+
+
+def _split_think(text: str) -> tuple[str, str]:
+    """Return (reasoning, answer). Handles both explicit <think>...</think>
+    blocks and prompt-side auto-opened blocks (output starts mid-thinking)."""
+    if "</think>" in text:
+        head, tail = text.split("</think>", 1)
+        reasoning = head
+        if reasoning.lstrip().startswith("<think>"):
+            reasoning = reasoning.split("<think>", 1)[1]
+        return reasoning.strip(), tail.strip()
+    return "", text.strip()
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str | None = None
+    messages: list[ChatMessage]
+    stream: bool = False
+    max_tokens: int | None = Field(default=None, alias="max_tokens")
+    max_completion_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    stream_options: dict | None = None
+
+
+class _ThinkSplitter:
+    """Streaming state machine that suppresses <think> reasoning.
+
+    ``expect_think`` is set when the applied prompt auto-opened a think block
+    (Qwen3-style: prompt ends with '<think>'), in which case ALL output before
+    </think> is reasoning and must be buffered, not emitted.
+    """
+
+    def __init__(self, expect_think: bool = False):
+        self.expect_think = expect_think
+        self.mode = "think" if expect_think else None
+        self.buf = ""
+
+    def feed(self, chunk: str) -> tuple[str, str]:
+        """Returns (reasoning_delta, answer_delta) to emit."""
+        self.buf += chunk
+        if self.mode is None:
+            if self.buf.lstrip().startswith("<"):
+                self.mode = "think"
+            elif self.buf.strip() or len(self.buf) > 8:
+                self.mode = "plain"
+            else:
+                return "", ""
+        if self.mode == "plain":
+            out, self.buf = self.buf, ""
+            return "", out
+        # think mode: buffer until </think>
+        if "</think>" in self.buf:
+            _, tail = self.buf.split("</think>", 1)
+            self.buf = ""
+            self.mode = "plain"
+            return "", tail
+        return "", ""
+
+
+def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False) -> FastAPI:
+    app = FastAPI(title="ixrun inference server")
+    gen_lock = threading.Lock()  # single GPU: serialize generations
+
+    def _prompt(req: ChatCompletionRequest) -> tuple[str, bool]:
+        """Returns (prompt, expect_think)."""
+        msgs = [{"role": m.role, "content": m.content} for m in req.messages]
+        try:
+            try:
+                p = eng.tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                )
+            except TypeError:
+                p = eng.tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True
+                )
+        except Exception:
+            p = "".join(f"{m['role']}: {m['content']}\n" for m in msgs)
+        return p, p.rstrip().endswith("<think>")
+
+    def _gen_kwargs(req: ChatCompletionRequest) -> dict:
+        max_new = req.max_completion_tokens or req.max_tokens or 512
+        kw = dict(max_new_tokens=int(max_new))
+        if req.temperature is not None:
+            kw["temperature"] = req.temperature
+            kw["do_sample"] = True
+        else:
+            kw["do_sample"] = False
+        if req.top_p is not None:
+            kw["top_p"] = req.top_p
+        return kw
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "model": model_id}
+
+    @app.get("/v1/models")
+    def list_models():
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "ixrun",
+                }
+            ],
+        }
+
+    @app.post("/v1/chat/completions")
+    def chat_completions(req: ChatCompletionRequest):
+        prompt, expect_think = _prompt(req)
+        kw = _gen_kwargs(req)
+        rid = "chatcmpl-" + uuid.uuid4().hex[:12]
+        created = int(time.time())
+
+        if not req.stream:
+            with gen_lock:
+                text = eng.generate(prompt, **kw)
+            reasoning, answer = _split_think(text)
+            msg = {"role": "assistant", "content": answer}
+            if reasoning:
+                msg["reasoning_content"] = reasoning
+            return {
+                "id": rid,
+                "object": "chat.completion",
+                "created": created,
+                "model": req.model or model_id,
+                "choices": [
+                    {"index": 0, "finish_reason": "stop", "message": msg}
+                ],
+                "usage": {
+                    "prompt_tokens": -1,
+                    "completion_tokens": -1,
+                    "total_tokens": -1,
+                },
+            }
+
+        # ---- streaming (SSE) ----
+        def sse():
+            with gen_lock:
+                splitter = _ThinkSplitter(expect_think=expect_think)
+                try:
+                    for chunk in eng.stream(prompt, **kw):
+                        r_delta, a_delta = splitter.feed(chunk)
+                        if a_delta:
+                            yield _sse_chunk(rid, created, req.model or model_id,
+                                             content=a_delta)
+                    # note: unclosed think block (max_tokens hit mid-reasoning)
+                    # is intentionally not emitted as answer
+                finally:
+                    if req.stream_options and req.stream_options.get("include_usage"):
+                        yield _sse_chunk(rid, created, req.model or model_id,
+                                         content=None, finish="stop", usage=True)
+                    else:
+                        yield _sse_chunk(rid, created, req.model or model_id,
+                                         content=None, finish="stop")
+                    yield "data: [DONE]\n\n"
+
+        return StreamingResponse(sse(), media_type="text/event-stream")
+
+    def _sse_chunk(rid, created, model, content=None, finish=None, usage=False):
+        delta = {}
+        if content is not None:
+            delta["content"] = content
+        payload = {
+            "id": rid,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {"index": 0, "delta": delta, "finish_reason": finish}
+            ],
+        }
+        if usage:
+            payload["usage"] = {
+                "prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1
+            }
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    return app
+
+
+def serve(
+    model_path: str,
+    mode: str = "streaming",
+    cache_path: str | None = None,
+    level_bits=(3, 5, 8),
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    model_id: str | None = None,
+    enable_thinking: bool = False,
+):
+    """Load engine + run uvicorn (blocking)."""
+    import uvicorn
+
+    eng = Int8XEngine.from_pretrained(
+        model_path, mode=mode, level_bits=tuple(level_bits),
+        cache_path=cache_path, verbose=True,
+    )
+    if model_id is None:
+        model_id = (model_path.rstrip("/\\").replace("\\", "/").split("/")[-1]
+                    .lower().replace(".", "-"))
+    app = create_app(eng, model_id, enable_thinking=enable_thinking)
+    print(f"[server] listening on http://{host}:{port}/v1 (model={model_id})", flush=True)
+    uvicorn.run(app, host=host, port=port, log_level="warning")

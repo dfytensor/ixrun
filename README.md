@@ -106,6 +106,46 @@ ppl 55.90→62.15 的差距**全部来自 bf16→int8 量化本身**（任何 in
 
 搜索最优方案（实测）：`(3,4,5,6,8)` bpw=5.33 comp=3.00×，默认 `(3,5,8)` bpw=5.46 comp=2.93×。
 
+## API Server 模式（OpenAI 兼容）
+
+```powershell
+# 启动 server (Qwen3.8-27B, 缓存启动 ~30s)
+$env:HF_HUB_OFFLINE='1'; $env:PYTHONPATH='E:\IXRUN'
+& 'F:\rwkv\.venv\Scripts\python.exe' -m ixrun.cli serve --model E:\models\Qwen3.8-27B --cache E:\models\qwen38_packed.pt --port 8000 --model-id qwen3.8-27b
+# 加 --think 开启思考模式 (默认直答, 更适合编码客户端)
+```
+
+端点：`GET /v1/models` · `POST /v1/chat/completions`（支持 `stream=true` SSE）· `GET /health`
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
+`<think>` 推理块自动隐藏（模板侧探测），非流式响应中放在 `reasoning_content` 字段。
+
+### opencode 接入
+
+项目根或 `~/.config/opencode/opencode.json`：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ixrun": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "IXRUN Local",
+      "options": { "baseURL": "http://127.0.0.1:8000/v1" },
+      "models": {
+        "qwen3.8-27b": { "name": "Qwen3.8-27B INT8-X (local)" }
+      }
+    }
+  }
+}
+```
+
+然后在 opencode 里 `/models` 选 `IXRUN Local → qwen3.8-27b` 即可。
+
 ## 启动体验
 
 ```powershell

@@ -73,9 +73,15 @@ def chat_repl(eng, max_new_tokens=256, temperature=0.7, do_sample=True):
 
         history.append({"role": "user", "content": user})
         prompt = _apply_template(tok, history, enable_thinking)
+        # Qwen3-style templates auto-open <think> in the prompt; then ALL
+        # output before </think> is reasoning and must be buffered
+        expect_think = prompt.rstrip().endswith("<think>")
         print("ai  > ", end="", flush=True)
         full = ""
-        mode = None  # None=undecided, "think"=inside <think>, "plain"=visible
+        buf = ""
+        mode = None  # None=undecided, "think"=buffering, "plain"=visible
+        if expect_think:
+            mode = "think"
         try:
             for chunk in eng.stream(
                 prompt,
@@ -84,15 +90,18 @@ def chat_repl(eng, max_new_tokens=256, temperature=0.7, do_sample=True):
                 do_sample=do_sample,
             ):
                 full += chunk
+                buf += chunk
                 if mode is None:
-                    mode = "think" if full.lstrip().startswith("<") else "plain"
+                    mode = "think" if buf.lstrip().startswith("<") else "plain"
                 if mode == "plain":
-                    print(chunk, end="", flush=True)
-                elif "</think>" in full:
+                    print(buf, end="", flush=True)
+                    buf = ""
+                elif "</think>" in buf:
+                    tail = buf.split("</think>", 1)[1]
                     mode = "plain"
-                    part = chunk.split("</think>", 1)[1]
-                    if part:
-                        print(part, end="", flush=True)
+                    if tail:
+                        print(tail, end="", flush=True)
+                    buf = ""
         except KeyboardInterrupt:
             print("\n(interrupted)")
         print("\n")
