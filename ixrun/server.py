@@ -89,9 +89,18 @@ class _ThinkSplitter:
         return "", ""
 
 
-def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False) -> FastAPI:
+def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
+               batched: bool = False, min_batch: int = 8,
+               max_batch: int = 16) -> FastAPI:
     app = FastAPI(title="ixrun inference server")
     gen_lock = threading.Lock()  # single GPU: serialize generations
+    _bgen = None
+    if batched:
+        from .batching import BatchedGreedyGenerator
+
+        _bgen = BatchedGreedyGenerator(eng.model, eng.tokenizer,
+                                       min_batch=min_batch,
+                                       max_batch=max_batch)
 
     def _prompt(req: ChatCompletionRequest) -> tuple[str, bool]:
         """Returns (prompt, expect_think)."""
@@ -170,6 +179,32 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False) -
             }
 
         # ---- streaming (SSE) ----
+        if _bgen is not None and not req.temperature:
+            # continuous-batching path (greedy): coalesces concurrent
+            # requests into batch>=8 forwards — ~3x aggregate throughput
+            def sse_batched():
+                req_obj, out_q = _bgen.submit(prompt, kw.get("max_new_tokens", 512))
+                splitter = _ThinkSplitter(expect_think=expect_think)
+                try:
+                    while True:
+                        try:
+                            chunk = out_q.get(timeout=0.25)
+                        except Exception:
+                            if req_obj.done.is_set():
+                                break
+                            continue
+                        _, a_delta = splitter.feed(chunk)
+                        if a_delta:
+                            yield _sse_chunk(rid, created, req.model or model_id,
+                                             content=a_delta)
+                    yield _sse_chunk(rid, created, req.model or model_id,
+                                     content=None, finish="stop")
+                    yield "data: [DONE]\n\n"
+                except GeneratorExit:
+                    raise
+
+            return StreamingResponse(sse_batched(), media_type="text/event-stream")
+
         def sse():
             with gen_lock:
                 splitter = _ThinkSplitter(expect_think=expect_think)
@@ -235,6 +270,9 @@ def serve(
     port: int = 8000,
     model_id: str | None = None,
     enable_thinking: bool = False,
+    batched: bool = False,
+    min_batch: int = 8,
+    max_batch: int = 16,
 ):
     """Load engine + run uvicorn (blocking)."""
     import uvicorn
@@ -246,6 +284,8 @@ def serve(
     if model_id is None:
         model_id = (model_path.rstrip("/\\").replace("\\", "/").split("/")[-1]
                     .lower().replace(".", "-"))
-    app = create_app(eng, model_id, enable_thinking=enable_thinking)
-    print(f"[server] listening on http://{host}:{port}/v1 (model={model_id})", flush=True)
+    app = create_app(eng, model_id, enable_thinking=enable_thinking,
+                     batched=batched, min_batch=min_batch, max_batch=max_batch)
+    print(f"[server] listening on http://{host}:{port}/v1 (model={model_id}"
+          f"{', batched' if batched else ''})", flush=True)
     uvicorn.run(app, host=host, port=port, log_level="warning")

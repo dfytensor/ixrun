@@ -139,6 +139,7 @@ def _cmd_serve(args):
         port=args.port,
         model_id=args.model_id,
         enable_thinking=args.think,
+        batched=args.batched,
     )
 
 
@@ -185,6 +186,9 @@ def main():
     pv.add_argument("--model-id", default=None, help="model id advertised via /v1/models")
     pv.add_argument("--think", action="store_true",
                     help="enable thinking mode (default: direct answers)")
+    pv.add_argument("--batched", action="store_true",
+                    help="continuous batching: coalesce concurrent greedy requests "
+                         "into batch forwards (~3x aggregate throughput)")
     pv.set_defaults(func=_cmd_serve)
 
     pb = sub.add_parser("bench", help="benchmark bf16 vs INT8-X")
