@@ -45,11 +45,43 @@ class TpabLinear(nn.Module):
         self.tile_r = self.packed["tile_r"]
         self.staged = stage_gpu(self.packed, "cuda")
         self.gemv_stage = prepare_gemv_stage(self.packed, "cuda", staged=self.staged)
+        # free the CPU-side packed bodies (GPU copies exist; keeping them
+        # costs ~20x the model's packed size in host RAM on 27B and OOMs)
+        self.packed = {k: v for k, v in self.packed.items() if k != "bodies"}
+        # split-K routing: only LARGE layers benefit (sweep data: tall
+        # 17408x5120 -> 1.74x, wide 5120x17408 -> 1.27x, but small layers
+        # lose ~2x to the 4-op overhead of zero/atomics/overlay/cast —
+        # MiniCPM5 regressed 35 -> 62 ms/tok when split unconditionally)
+        t_c = self.in_features // 64
+        if self.in_features >= 8192 and t_c % 2 == 0:
+            self._split = 2
+        elif self.out_features >= 16000 and self.in_features >= 4096 and t_c % 4 == 0:
+            self._split = 4
+        else:
+            self._split = 1
+        self._y32 = None
 
     def forward(self, x):
         if x.dtype == torch.bfloat16 and x.numel() == self.in_features:
-            y = fused_gemv_tpab(x, self.gemv_stage, self.out_features,
-                                self.in_features, tile_r=self.tile_r)
+            if self._split > 1:
+                # split-K: fp32 atomics + external outlier overlay
+                from .tpab_gemv_splitk import fused_gemv_tpab_splitk
+                if self._y32 is None:
+                    self._y32 = torch.zeros(
+                        self.out_features, dtype=torch.float32, device=x.device)
+                gs = self.gemv_stage
+                y32 = fused_gemv_tpab_splitk(
+                    x, gs, self.out_features, self.in_features,
+                    tile_r=self.tile_r, split=self._split, y32=self._y32)
+                if gs.get("ol_rows_idx") is not None and gs["ol_row_k"].numel():
+                    xf = x.reshape(-1)
+                    contrib = (gs["ol_row_v"].to(torch.bfloat16).float()
+                               * xf[gs["ol_row_k"].long()].float())
+                    y32.index_add_(0, gs["ol_rows_idx"], contrib)
+                y = y32.to(torch.bfloat16)
+            else:
+                y = fused_gemv_tpab(x, self.gemv_stage, self.out_features,
+                                    self.in_features, tile_r=self.tile_r)
             return y.view(x.shape[:-1] + (self.out_features,))
         # multi-token: decode into the SHARED workspace, then F.linear
         ws = _get_shared_ws(self.packed["T"] * self.packed["n_per"], x.device)

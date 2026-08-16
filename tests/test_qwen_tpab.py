@@ -42,12 +42,13 @@ def gen(model, n=150, warm=12):
     return dt, out.shape[1] - ids.shape[1], tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
 
 # ---------------- HYBRID deploy (lazy CPU load, per-layer encode) ----------------
-P(f"=== HYBRID (TPAB@{SNR_DB:.0f}dB + INT8-X per shape) deploy on Qwen3.8-27B ===")
+P(f"=== TPAB@{SNR_DB:.0f}dB + split-K deploy on Qwen3.8-27B (all-TPAB) ===")
 t0 = time.time()
 m = Int8XEngine._load_any(QWEN38_PATH, torch.bfloat16, low_cpu=True)
 P(f"load: {time.time()-t0:.0f}s")
 
-stats = deploy_model_hybrid(m, snr_target_db=SNR_DB, verbose=True)
+from ixrun.tpab_linear import deploy_model_tpab as _dep
+stats = _dep(m, snr_target_db=SNR_DB, verbose=True, lazy=True)
 gc.collect(); torch.cuda.empty_cache()
 
 eng = Int8XEngine(m, tok, stats)
@@ -56,7 +57,7 @@ P(f"VRAM alloc={torch.cuda.memory_allocated()/1e9:.2f}GB "
   f"peak={torch.cuda.max_memory_allocated()/1e9:.2f}GB")
 
 dt, ntok, txt_t = gen(m)
-P(f"\nHYBRID : {dt:.1f}s / {ntok} tok = {dt/ntok*1000:.0f} ms/tok")
+P(f"\nTPAB-SK: {dt:.1f}s / {ntok} tok = {dt/ntok*1000:.0f} ms/tok")
 P(f"  out: {txt_t.strip()[:110]!r}")
 P(f"  VRAM peak: {torch.cuda.max_memory_allocated()/1e9:.2f}GB")
 del m, eng; gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()

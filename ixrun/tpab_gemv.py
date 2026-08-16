@@ -63,6 +63,7 @@ def prepare_gemv_stage(packed: dict, device="cuda", staged: dict | None = None) 
     st["ol_row_k"] = k.to(torch.int32)
     st["ol_row_v"] = v
     st["ol_offs"] = offs
+    st["ol_rows_idx"] = r                      # per-outlier output row (sorted)
     return st
 
 
