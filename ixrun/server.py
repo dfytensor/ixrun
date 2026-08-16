@@ -51,6 +51,10 @@ class ChatCompletionRequest(BaseModel):
     max_completion_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
+    frequency_penalty: float | None = None   # mapped to repetition (1+f)
+    presence_penalty: float | None = None    # ignored (kept for compat)
     stream_options: dict | None = None
 
 
@@ -129,6 +133,13 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
             kw["do_sample"] = False
         if req.top_p is not None:
             kw["top_p"] = req.top_p
+        if req.top_k:
+            kw["top_k"] = int(req.top_k)
+        rep = req.repetition_penalty
+        if rep is None and req.frequency_penalty is not None:
+            rep = 1.0 + max(req.frequency_penalty, 0.0)
+        if rep is not None and rep != 1.0:
+            kw["repetition_penalty"] = rep
         return kw
 
     @app.get("/health")
@@ -179,11 +190,21 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
             }
 
         # ---- streaming (SSE) ----
-        if _bgen is not None and not req.temperature:
-            # continuous-batching path (greedy): coalesces concurrent
-            # requests into batch>=8 forwards — ~3x aggregate throughput
+        if _bgen is not None:
+            # continuous-batching path: coalesces concurrent requests into
+            # batch>=8 forwards — ~3-5x aggregate throughput; supports
+            # temperature / top_p / top_k / repetition_penalty per row
             def sse_batched():
-                req_obj, out_q = _bgen.submit(prompt, kw.get("max_new_tokens", 512))
+                rep = req.repetition_penalty
+                if rep is None and req.frequency_penalty is not None:
+                    rep = 1.0 + max(req.frequency_penalty, 0.0)
+                req_obj, out_q = _bgen.submit(
+                    prompt, kw.get("max_new_tokens", 512),
+                    temperature=req.temperature or 1.0,
+                    top_p=req.top_p or 1.0,
+                    top_k=int(req.top_k or 0),
+                    repetition_penalty=rep or 1.0,
+                )
                 splitter = _ThinkSplitter(expect_think=expect_think)
                 try:
                     while True:

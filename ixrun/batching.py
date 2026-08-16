@@ -26,15 +26,63 @@ __all__ = ["BatchedGreedyGenerator"]
 
 
 class _Req:
-    __slots__ = ("ids", "cb", "done", "max_new", "n_out", "eos")
+    __slots__ = ("ids", "cb", "done", "max_new", "n_out", "eos",
+                 "temperature", "top_p", "top_k", "repetition_penalty",
+                 "generated", "dbuf")
 
-    def __init__(self, ids, max_new, cb):
+    def __init__(self, ids, max_new, cb, temperature=1.0, top_p=1.0,
+                 top_k=0, repetition_penalty=1.0):
         self.ids = ids                # [1, L] prompt tokens (GPU)
         self.cb = cb                  # callable(str_chunk) -> None
         self.max_new = max_new
         self.n_out = 0
         self.eos = False
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.repetition_penalty = repetition_penalty
+        self.generated = []           # sampled token ids (for rep penalty)
+        self.dbuf = ""                # streamer text buffer (prefix-stable)
         self.done = threading.Event()
+
+
+def _sample_rows(logits: torch.Tensor, reqs, active_idx) -> torch.Tensor:
+    """Per-row sampling: temperature -> top_k -> top_p -> multinomial.
+
+    logits: [B, V] float; rows not in active_idx return arbitrary valid ids
+    (their outputs are ignored). Repetition penalty applied on the raw
+    logits for each row's generated history.
+    """
+    B, V = logits.shape
+    out = torch.zeros(B, dtype=torch.long, device=logits.device)
+    for i in active_idx:
+        r = reqs[i]
+        row = logits[i].clone()
+        # repetition penalty (classic CTRL-style: divide pos / multiply neg)
+        if r.repetition_penalty != 1.0 and r.generated:
+            hist = torch.tensor(r.generated[-256:], device=row.device)
+            uniq = torch.unique(hist)
+            lv = row[uniq]
+            row[uniq] = torch.where(lv > 0, lv / r.repetition_penalty,
+                                    lv * r.repetition_penalty)
+        if r.temperature <= 0:
+            out[i] = row.argmax()
+            continue
+        row = row / r.temperature
+        if r.top_k and 0 < r.top_k < V:
+            kth = row.topk(r.top_k).values[-1]
+            row = row.where(row >= kth, float("-inf"))
+        if 0 < r.top_p < 1.0:
+            sv, si = row.sort(descending=True)
+            cum = torch.softmax(sv, -1).cumsum(-1)
+            keep = cum - torch.softmax(sv, -1) < r.top_p
+            keep[0] = True
+            sv = sv.where(keep, float("-inf"))
+            row = torch.full_like(row, float("-inf"))
+            row.scatter_(0, si, sv)
+        probs = torch.softmax(row, -1)
+        out[i] = torch.multinomial(probs, 1)
+    return out
 
 
 class BatchedGreedyGenerator:
@@ -63,14 +111,18 @@ class BatchedGreedyGenerator:
         self._thread.start()
 
     # ------------------------------------------------------------------ #
-    def submit(self, prompt_text: str, max_new_tokens: int = 128):
+    def submit(self, prompt_text: str, max_new_tokens: int = 128,
+               temperature: float = 1.0, top_p: float = 1.0, top_k: int = 0,
+               repetition_penalty: float = 1.0):
         out_q: _queue.Queue = _queue.Queue()
 
         def cb(chunk: str):
             out_q.put(chunk)
 
         ids = self.tok(prompt_text, return_tensors="pt")["input_ids"]
-        req = _Req(ids.cuda(), max_new_tokens, cb)
+        req = _Req(ids.cuda(), max_new_tokens, cb,
+                   temperature=temperature, top_p=top_p, top_k=top_k,
+                   repetition_penalty=repetition_penalty)
         with self.lock:
             self.pending.append(req)
         self.wake.set()
@@ -132,22 +184,34 @@ class BatchedGreedyGenerator:
         out = model(input_ids=inp, attention_mask=attn, position_ids=pos,
                     use_cache=True)
         past = out.past_key_values
-        nxt = out.logits[:, -1].argmax(-1)          # [B]
+        logits_last = out.logits[:, -1].float()                # [B, V]
 
         while not self.stop_flag:
             active = [i for i, r in enumerate(reqs)
                       if not r.eos and r.n_out < r.max_new]
             if not active:
                 break
-            # stream tokens for active rows
+            nxt = _sample_rows(logits_last, reqs, active)      # [B]
+            # stream tokens for active rows; per-token decode with a
+            # hold-back for incomplete BPE/UTF-8 boundaries (the same
+            # trick TextIteratorStreamer uses)
             for i in active:
                 t_id = nxt[i].item()
                 if t_id in eos_ids:
                     reqs[i].eos = True
                     continue
-                chunk = tok.decode([t_id], skip_special_tokens=True)
-                reqs[i].cb(chunk)
-                reqs[i].n_out += 1
+                r = reqs[i]
+                r.generated.append(t_id)
+                r.n_out += 1
+                piece = tok.decode([t_id], skip_special_tokens=True)
+                if piece.endswith("\ufffd"):            # incomplete boundary
+                    r.dbuf += piece                    # hold back
+                    continue
+                if r.dbuf:
+                    piece = r.dbuf + piece
+                    r.dbuf = ""
+                if piece:
+                    r.cb(piece)
             still = [i for i in active if not reqs[i].eos]
             if not still:
                 break
@@ -161,7 +225,10 @@ class BatchedGreedyGenerator:
             past = out.past_key_values
             attn = step_attn
             pos = step_pos
-            nxt = out.logits[:, -1].argmax(-1)
+            logits_last = out.logits[:, -1].float()
 
         for r in reqs:
+            if r.dbuf:
+                r.cb(r.dbuf)
+                r.dbuf = ""
             r.done.set()
