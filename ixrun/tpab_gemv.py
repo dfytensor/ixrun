@@ -46,13 +46,13 @@ def prepare_gemv_stage(packed: dict, device="cuda", staged: dict | None = None) 
         st["goff_g"] = packed["goff"].to(dev)
         st["gbase_g"] = packed["gbase_bit"].to(dev)
 
-    # outliers grouped by row
+    # outliers grouped by row (rect-tile aware)
     O, I = packed["shape"]
-    tile = packed["tile"]
+    tile_r, tile_c = packed["tile_r"], packed["tile_c"]
     ol_t = packed["ol_t"].to(dev).to(torch.int64)
     ol_l = packed["ol_l"].to(dev).to(torch.int64)
-    r = ol_t // (I // tile) * tile + ol_l // tile          # out row
-    k = (ol_t % (I // tile)) * tile + ol_l % tile          # in col
+    r = ol_t // (I // tile_c) * tile_r + ol_l // tile_c
+    k = (ol_t % (I // tile_c)) * tile_c + ol_l % tile_c
     v = packed["ol_val"].to(dev).float()
 
     order = torch.argsort(r, stable=True)
@@ -75,10 +75,12 @@ if _HAS:
         olk_ptr, olv_ptr, oloff_ptr,
         T_C: tl.constexpr,
         IN_F: tl.constexpr,
+        TILE_R: tl.constexpr,
+        TILE_C: tl.constexpr,
     ):
         n = tl.program_id(0)
-        row_tile = n // 64
-        in_row = n % 64
+        row_tile = n // TILE_R
+        in_row = n % TILE_R
 
         acc = 0.0
         for kc in tl.range(0, T_C):
@@ -88,7 +90,7 @@ if _HAS:
             gbase = tl.load(gbase_ptr + b)
             goff = tl.load(goff_ptr + t).to(tl.int64)
 
-            L = in_row * 64 + tl.arange(0, 64)
+            L = in_row * TILE_C + tl.arange(0, TILE_C)
             bitpos = gbase + (goff + L.to(tl.int64)) * b
             word = (bitpos // 32).to(tl.int32)
             shift = (bitpos % 32).to(tl.int32)
@@ -96,13 +98,13 @@ if _HAS:
             w1 = tl.load(body_ptr + word).to(tl.uint32)
             cross = (shift + b) > 32
             w2 = tl.where(cross, tl.load(body_ptr + word + 1).to(tl.uint32),
-                          tl.zeros((64,), tl.uint32))
+                          tl.zeros((TILE_C,), tl.uint32))
             raw = tl.where(cross, (w1 >> shift) | (w2 << (32 - shift)),
                            w1 >> shift)
             mask = tl.exp2(b.to(tl.float32)).to(tl.int32) - 1
             v = (raw & mask.to(tl.uint32)).to(tl.int32) - ((mask + 1) // 2 - 1)
 
-            k0 = kc * 64 + tl.arange(0, 64)
+            k0 = kc * TILE_C + tl.arange(0, TILE_C)
             x = tl.load(x_ptr + k0).to(tl.float32)
             # bf16-round the dequantized weight to match the reference path
             # (decode_tpab_ref materializes bf16 weights before F.linear)
@@ -121,7 +123,8 @@ if _HAS:
         tl.store(y_ptr + n, acc.to(tl.bfloat16))
 
 
-def fused_gemv_tpab(x: torch.Tensor, st: dict, out_f: int, in_f: int):
+def fused_gemv_tpab(x: torch.Tensor, st: dict, out_f: int, in_f: int,
+                    tile_r: int = 64):
     """y = x @ W.T for a single token; W TPAB-decoded in registers.
 
     x: [in_f] bf16 (flattened). Returns [out_f] bf16.
@@ -133,7 +136,7 @@ def fused_gemv_tpab(x: torch.Tensor, st: dict, out_f: int, in_f: int):
         x.reshape(-1), y,
         st["body_g"], st["bits_g"], st["scales_g"], st["goff_g"], st["gbase_g"],
         st["ol_row_k"], st["ol_row_v"], st["ol_offs"],
-        T_C=T_C, IN_F=in_f,
+        T_C=T_C, IN_F=in_f, TILE_R=tile_r, TILE_C=64,
         num_warps=2,
     )
     return y

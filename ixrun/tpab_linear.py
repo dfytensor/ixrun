@@ -36,12 +36,14 @@ class TpabLinear(nn.Module):
         self.out_features, self.in_features = weight.shape
         self.packed = encode_tpab(weight.detach(), snr_target_db=snr_target_db,
                                   outlier_frac=outlier_frac)
+        self.tile_r = self.packed["tile_r"]
         self.staged = stage_gpu(self.packed, "cuda")
         self.gemv_stage = prepare_gemv_stage(self.packed, "cuda", staged=self.staged)
 
     def forward(self, x):
         if x.dtype == torch.bfloat16 and x.numel() == self.in_features:
-            y = fused_gemv_tpab(x, self.gemv_stage, self.out_features, self.in_features)
+            y = fused_gemv_tpab(x, self.gemv_stage, self.out_features,
+                                self.in_features, tile_r=self.tile_r)
             return y.view(x.shape[:-1] + (self.out_features,))
         # multi-token: decode into the SHARED workspace, then F.linear
         ws = _get_shared_ws(self.packed["T"] * self.packed["n_per"], x.device)
@@ -65,7 +67,16 @@ def deploy_model_tpab(model, snr_target_db=26.0, outlier_frac=0.004, verbose=Tru
     n_skip = 0
     for name, mod in targets:
         O, I = mod.weight.shape
-        if O % 64 or I % 64:
+        if I % 64:
+            n_skip += 1
+            continue
+        # rectangular tiles handle any O with a power-of-two divisor <=64
+        # (e.g. 48x5120 delta-gates tesselate as 48x64 strips); only rows
+        # with no such divisor (odd primes) are skipped
+        tr = 64
+        while O % tr and tr > 1:
+            tr //= 2
+        if O % tr:
             n_skip += 1
             continue
         tl = TpabLinear(mod.weight.data, snr_target_db, outlier_frac)

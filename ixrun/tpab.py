@@ -35,25 +35,40 @@ CAND_BITS = (2, 3, 4, 5, 6)
 
 @torch.no_grad()
 def encode_tpab(w: torch.Tensor, snr_target_db: float = 30.0,
-                tile: int = TILE, outlier_frac: float = 0.01,
-                k_cands: tuple = (0, 1, 2, 4, 8, 16, 32, 64)) -> dict:
-    """bf16 weight [O, I] (O, I multiples of `tile`) -> TPAB packed dict.
+                tile: int | None = None, outlier_frac: float = 0.01,
+                k_cands: tuple = (0, 1, 2, 4, 8, 16, 32, 64),
+                tile_r: int | None = None) -> dict:
+    """bf16 weight [O, I] -> TPAB packed dict with RECTANGULAR tiles.
+
+    Tiles are tile_r x TILE_C (TILE_C=64). tile_r auto-picks a divisor of O
+    that is <= 64 (largest power-of-two divisor capped at 64; e.g. O=48 ->
+    tile_r=48, O=1152 -> 48, O=5120 -> 64) so row-starved shapes like the
+    Qwen delta-gates (48x5120) tesselate without padding. I must be a
+    multiple of 64.
 
     Per-tile joint search over (outlier count k, bit width b): pick the
-    cheapest combination meeting the SNR target — tiles with tight value
-    ranges drop to low b with few/no outliers; heavy-tailed tiles trade
-    outliers for a finer grid. `outlier_frac` is kept only for API compat
-    (the k candidates bound it).
+    cheapest combination meeting the SNR target.
     """
     O, I = w.shape
-    if O % tile or I % tile:
-        raise ValueError(f"shape {O}x{I} not divisible by tile {tile}")
-    T_r, T_c = O // tile, I // tile
+    if I % TILE:
+        raise ValueError(f"in_f {I} not a multiple of {TILE}")
+    if tile is not None:                    # legacy square-tile API
+        tile_r = tile
+    if tile_r is None:
+        tile_r = TILE
+        while O % tile_r and tile_r > 1:
+            tile_r //= 2
+        if O % tile_r:                      # odd primes (e.g. 43) fallback
+            raise ValueError(f"out_f {O} has no power-of-two divisor <= 64")
+    if O % tile_r:
+        raise ValueError(f"out_f {O} not divisible by tile_r {tile_r}")
+    T_r, T_c = O // tile_r, I // TILE
     T = T_r * T_c
-    n_per = tile * tile
+    n_per = tile_r * TILE
     dev = w.device
 
-    v = w.float().view(T_r, tile, T_c, tile).permute(0, 2, 1, 3).reshape(T, n_per)
+    v = (w.float().view(T_r, tile_r, T_c, TILE).permute(0, 2, 1, 3)
+          .reshape(T, n_per))
 
     # sorted magnitudes per tile (descending) for cheap k-threshold lookup
     abs_sorted = v.abs().sort(dim=1, descending=True).values     # [T, n_per]
@@ -148,7 +163,8 @@ def encode_tpab(w: torch.Tensor, snr_target_db: float = 30.0,
         + len(ol_t) * 6                                # outlier idx(2x int16-packable) + fp16
     )
     return {
-        "shape": (O, I), "tile": tile, "T": T, "n_per": n_per,
+        "shape": (O, I), "tile": tile_r, "tile_r": tile_r, "tile_c": TILE,
+        "T": T, "n_per": n_per,
         "bits": bits.cpu(), "scales": scales.cpu(),
         "goff": goff.to(torch.int32).cpu(),
         "gbase_bit": torch.tensor(gbase_bit, dtype=torch.int64),
@@ -182,9 +198,9 @@ def decode_tpab_ref(packed: dict, device=None) -> torch.Tensor:
         out[idx] = q * s
     ol_t = packed["ol_t"].to(dev)
     out[ol_t, packed["ol_l"].to(dev)] = packed["ol_val"].to(dev).float()
-    T_r, T_c = O // packed["tile"], I // packed["tile"]
-    t = packed["tile"]
-    return (out.view(T_r, T_c, t, t).permute(0, 2, 1, 3).reshape(O, I)).to(torch.bfloat16)
+    tr, tc = packed["tile_r"], packed["tile_c"]
+    T_r, T_c = O // tr, I // tc
+    return (out.view(T_r, T_c, tr, tc).permute(0, 2, 1, 3).reshape(O, I)).to(torch.bfloat16)
 
 
 # --------------------------------------------------------------------------- #
@@ -281,10 +297,10 @@ def decode_tpab_triton(packed: dict, device="cuda", out_f32: torch.Tensor | None
     flat = st["ol_t_g"].to(torch.int64) * n_per + st["ol_l_g"].to(torch.int64)
     out[flat] = st["ol_val_g"].float()
     O, I = packed["shape"]
-    T_r, T_c = O // packed["tile"], I // packed["tile"]
-    t = packed["tile"]
+    tr, tc = packed["tile_r"], packed["tile_c"]
+    T_r, T_c = O // tr, I // tc
     used = out[: T * n_per]  # shared workspace may be larger than this layer
-    return (used.view(T_r, T_c, t, t).permute(0, 2, 1, 3).reshape(O, I)).to(torch.bfloat16)
+    return (used.view(T_r, T_c, tr, tc).permute(0, 2, 1, 3).reshape(O, I)).to(torch.bfloat16)
 
 
 @torch.no_grad()
@@ -303,4 +319,4 @@ def decode_tiles(packed: dict, tile_ids: torch.Tensor, device="cuda",
     out = torch.zeros(n * n_per, dtype=torch.float32, device=dev)
     tiles = tile_ids.to(torch.int32).to(dev)
     _launch_decode(out, tiles, st, n, n_per, dev)
-    return out.view(n, packed["tile"], packed["tile"])
+    return out.view(n, packed["tile_r"], packed["tile_c"])

@@ -52,7 +52,13 @@ def deploy_model_hybrid(model, snr_target_db=24.0, verbose=True):
     max_N = 0
     for name, mod in targets:
         O, I = mod.weight.shape
-        if O % 64 or I % 64:
+        if I % 64:
+            stats["skipped"] += 1
+            continue
+        tr = 64
+        while O % tr and tr > 1:
+            tr //= 2
+        if O % tr:
             stats["skipped"] += 1
             continue
         backend = pick_backend(O, I)
