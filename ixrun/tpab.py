@@ -248,7 +248,8 @@ def decode_tpab_triton(packed: dict, device="cuda", out_f32: torch.Tensor | None
     O, I = packed["shape"]
     T_r, T_c = O // packed["tile"], I // packed["tile"]
     t = packed["tile"]
-    return (out.view(T_r, T_c, t, t).permute(0, 2, 1, 3).reshape(O, I)).to(torch.bfloat16)
+    used = out[: T * n_per]  # shared workspace may be larger than this layer
+    return (used.view(T_r, T_c, t, t).permute(0, 2, 1, 3).reshape(O, I)).to(torch.bfloat16)
 
 
 @torch.no_grad()
