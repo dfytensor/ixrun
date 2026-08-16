@@ -237,6 +237,39 @@ $env:HF_HUB_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts\python.exe' -m benchmarks.benc
 
 环境要求：transformers>=5.8 (qwen3_5 架构)，模型路径见 `ixrun/config.py:QWEN38_PATH`。
 
+## TPAB：Tile-并行自适应位宽编码（INT8-X 后继原型）
+
+64×64 tile 独立编码（fp16 scale + 自适应位宽 2-6bit + 离群值逃逸表），
+**定长位布局** — 解码零 rank/cumsum、任意 tile 任意顺序（INT8-X 做不到）。
+逐 tile 联合搜索 (离群数 k × 位宽 b) 的最便宜达标组合；SNR 目标 22/24/26/28dB
+四档可调（INT8-X 锁死 int8 精度）。
+
+### 按模型规模的实测结论
+
+| 规模 | 最优后端 | 实测 |
+|---|---|---|
+| 1B（MiniCPM5） | **TPAB@28dB** | 生成 35 vs 312 ms/tok（**8.9×**），Δppl +0.94 vs +6.13（**6.5×** 质量） |
+| 27B（Qwen3.8） | **INT8-X streaming** | 136 vs 145-152 ms/tok — TPAB 反慢 6-12% |
+
+**27B 上 TPAB 不赢的原因**（架构级认识）：fused GEMV 已把线性层压到不再是
+瓶颈（down_proj kernel 级 4.7× 优势被 attention/glue/launch 稀释）。TPAB 的
+e2e 优势在小模型（kernel 占比高）充分兑现；27B 剩余瓶颈在 48 层 GatedDeltaNet
++ 16 层 full attention 与 Python 开销 — 已接近 eager HF 地板。
+
+```
+kernel 级 GEMV 吞吐（4090D, 真实重尾权重）:
+  5120x17408 (down):    TPAB 203G/s vs INT8-X  44G/s  → 4.66x
+  10240x5120 (qkvz):    TPAB 220G/s vs INT8-X  58G/s  → 3.83x
+  5120x5120  (o_proj):  TPAB 214G/s vs INT8-X 654G/s  → 0.33x (int8x wins)
+  17408x5120 (gate/up): TPAB 220G/s vs INT8-X 250G/s  → 0.88x (int8x wins)
+解码 kernel（全矩阵）:  TPAB 72-192G/s vs INT8-X 4-5G/s = 15-47×
+随机 tile 访问:         TPAB 1000/1000 bit-exact vs INT8-X 不可能
+```
+
+混合后端 `ixrun/hybrid.py`（按形状实测查表选编码）保留供中等规模实验。
+模块：`ixrun/tpab.py`（编码/解码）· `tpab_gemv.py`（融合 GEMV）·
+`tpab_linear.py`（部署层）· `hybrid.py`（混合策略）。
+
 ## 项目结构
 
 ```
