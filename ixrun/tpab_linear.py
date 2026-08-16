@@ -34,7 +34,13 @@ class TpabLinear(nn.Module):
     def __init__(self, weight: torch.Tensor, snr_target_db=26.0, outlier_frac=0.004):
         super().__init__()
         self.out_features, self.in_features = weight.shape
-        self.packed = encode_tpab(weight.detach(), snr_target_db=snr_target_db,
+        # encode on CPU: deploy-time VRAM stays flat (the search temporaries
+        # are ~3x the packed size per layer; on GPU they stacked on top of
+        # the still-resident bf16 weights and pushed peaks +1.7GB)
+        w = weight.detach()
+        was_cuda = w.is_cuda
+        self.packed = encode_tpab(w.cpu() if was_cuda else w,
+                                  snr_target_db=snr_target_db,
                                   outlier_frac=outlier_frac)
         self.tile_r = self.packed["tile_r"]
         self.staged = stage_gpu(self.packed, "cuda")
@@ -57,8 +63,15 @@ class TpabLinear(nn.Module):
 
 
 @torch.no_grad()
-def deploy_model_tpab(model, snr_target_db=26.0, outlier_frac=0.004, verbose=True):
-    """Replace every quantizable Linear with TpabLinear (in-place)."""
+def deploy_model_tpab(model, snr_target_db=26.0, outlier_frac=0.004, verbose=True,
+                      lazy=False):
+    """Replace every quantizable Linear with TpabLinear (in-place).
+
+    lazy=True: the model was loaded with low_cpu_mem_usage (weights stay on
+    disk/mmap until touched) — encode each layer from its CPU tensor then
+    drop it, so the full bf16 weights NEVER materialize on GPU. This is the
+    big-model path (deploy peak ~= final resident + one layer's bf16).
+    """
     from .linear import iter_quantizable_linears, _set_parent_child
 
     targets = list(iter_quantizable_linears(model))
@@ -70,16 +83,19 @@ def deploy_model_tpab(model, snr_target_db=26.0, outlier_frac=0.004, verbose=Tru
         if I % 64:
             n_skip += 1
             continue
-        # rectangular tiles handle any O with a power-of-two divisor <=64
-        # (e.g. 48x5120 delta-gates tesselate as 48x64 strips); only rows
-        # with no such divisor (odd primes) are skipped
         tr = 64
         while O % tr and tr > 1:
             tr //= 2
         if O % tr:
             n_skip += 1
             continue
-        tl = TpabLinear(mod.weight.data, snr_target_db, outlier_frac)
+        w = mod.weight.data
+        if lazy:
+            # force materialization of just this layer to CPU RAM
+            # (low_cpu_mem keeps tensors meta until first touch)
+            w = w.to("cpu", torch.bfloat16)
+        tl = TpabLinear(w, snr_target_db, outlier_frac)
+        mod.weight.data = torch.empty(0)      # release the bf16 reference
         _set_parent_child(model, name, tl)
         total_bytes += tl.packed["total_bytes"]
         n_elems += O * I
