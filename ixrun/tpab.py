@@ -36,8 +36,15 @@ CAND_BITS = (2, 3, 4, 5, 6)
 @torch.no_grad()
 def encode_tpab(w: torch.Tensor, snr_target_db: float = 30.0,
                 tile: int = TILE, outlier_frac: float = 0.01,
-                max_tile_chunk: int = 4096) -> dict:
-    """bf16 weight [O, I] (O, I multiples of `tile`) -> TPAB packed dict."""
+                k_cands: tuple = (0, 1, 2, 4, 8, 16, 32, 64)) -> dict:
+    """bf16 weight [O, I] (O, I multiples of `tile`) -> TPAB packed dict.
+
+    Per-tile joint search over (outlier count k, bit width b): pick the
+    cheapest combination meeting the SNR target — tiles with tight value
+    ranges drop to low b with few/no outliers; heavy-tailed tiles trade
+    outliers for a finer grid. `outlier_frac` is kept only for API compat
+    (the k candidates bound it).
+    """
     O, I = w.shape
     if O % tile or I % tile:
         raise ValueError(f"shape {O}x{I} not divisible by tile {tile}")
@@ -48,43 +55,71 @@ def encode_tpab(w: torch.Tensor, snr_target_db: float = 30.0,
 
     v = w.float().view(T_r, tile, T_c, tile).permute(0, 2, 1, 3).reshape(T, n_per)
 
-    k = max(1, int(outlier_frac * n_per))
-    top = v.abs().topk(k + 1, dim=1).values          # [T, k+1] descending
-    thr = top[:, k]                                   # (k+1)-th largest
-    is_ol = v.abs() > thr.unsqueeze(1)
-    v2 = v * (~is_ol)
+    # sorted magnitudes per tile (descending) for cheap k-threshold lookup
+    abs_sorted = v.abs().sort(dim=1, descending=True).values     # [T, n_per]
+    power = v.pow(2).sum(dim=1).clamp(min=1e-30)
 
+    best_cost = torch.full((T,), float("inf"), device=dev)
+    best_b = torch.zeros(T, dtype=torch.uint8, device=dev)
+    best_s = torch.ones(T, dtype=torch.float16, device=dev)
+    best_q = torch.zeros(T, n_per, dtype=torch.int32, device=dev)
+    best_is_ol = torch.zeros(T, n_per, dtype=torch.bool, device=dev)
+
+    OL_BYTE = 6.0        # per-outlier storage: idx(2B packable) + fp16(2B) ~6B
+    for k in k_cands:
+        if k == 0:
+            thr = torch.full((T,), float("inf"), device=dev)
+        else:
+            thr = abs_sorted[:, k - 1]        # k-th largest magnitude
+        is_ol = v.abs() > thr.unsqueeze(1)
+        v2 = v * (~is_ol)
+        M = v2.abs().amax(dim=1).clamp(min=1e-12)
+        n_ol = is_ol.sum(dim=1).to(torch.int32)
+        power_k = v2.pow(2).sum(dim=1).clamp(min=1e-30)
+
+        for b in CAND_BITS:
+            qmax = 2 ** (b - 1) - 1
+            s = (M / qmax).half().float()
+            q = (v2 / s.unsqueeze(1)).round().clamp(-qmax, qmax).to(torch.int32)
+            # end-to-end error: include the decoder's bf16 rounding of the
+            # reconstructed weight — at low bpw this term is a real share of
+            # the error budget (search targets must match measured SNR)
+            rec = (q.float() * s.unsqueeze(1)).to(torch.bfloat16).float()
+            err = (v2 - rec).pow(2).sum(dim=1)
+            # grid fidelity vs the in-grid power (outliers decode exactly,
+            # so the layer-level error is dominated by this term)
+            snr = 10 * torch.log10(power_k / err.clamp(min=1e-30))
+            ok = snr >= snr_target_db
+            cost = (n_per * b / 8.0) + n_ol * OL_BYTE + 7.0     # + header
+            better = ok & (cost < best_cost)
+            if better.any():
+                best_cost[better] = cost[better]
+                best_b[better] = b
+                best_s[better] = s[better].half()
+                best_q[better] = q[better]
+                best_is_ol[better] = is_ol[better]
+
+    # tiles that never met the target: force widest b, zero outliers
+    fail = best_cost.isinf()
+    if fail.any():
+        b = CAND_BITS[-1]
+        qmax = 2 ** (b - 1) - 1
+        M = v.abs().amax(dim=1).clamp(min=1e-12)
+        s = (M / qmax).half().float()
+        q = (v / s.unsqueeze(1)).round().clamp(-qmax, qmax).to(torch.int32)
+        best_b[fail] = b
+        best_s[fail] = s[fail].half()
+        best_q[fail] = q[fail]
+        best_is_ol[fail] = False
+    n_fallback = int(fail.sum().item())
+
+    # materialize outliers from the EXACT sets chosen during the search
+    # (recomputing thresholds by index is off-by-one under ties)
+    is_ol = best_is_ol
     ol_t, ol_l = is_ol.nonzero(as_tuple=True)
     ol_val = v[ol_t, ol_l].to(torch.float16).cpu()
 
-    power = v2.pow(2).sum(dim=1).clamp(min=1e-30)
-    M = v2.abs().amax(dim=1).clamp(min=1e-12)
-
-    bits = torch.zeros(T, dtype=torch.uint8, device=dev)
-    scales = torch.ones(T, dtype=torch.float16, device=dev)
-    q_sel = torch.zeros(T, n_per, dtype=torch.int32, device=dev)
-    assigned = torch.zeros(T, dtype=torch.bool, device=dev)
-
-    for b in CAND_BITS:
-        qmax = 2 ** (b - 1) - 1
-        s = (M / qmax).half().float()                 # fp16-round BEFORE quantize
-        q = (v2 / s.unsqueeze(1)).round().clamp(-qmax, qmax).to(torch.int32)
-        err = (v2 - q.float() * s.unsqueeze(1)).pow(2).sum(dim=1)
-        ok = (10 * torch.log10(power / err.clamp(min=1e-30)) >= snr_target_db) & (~assigned)
-        if ok.any():
-            bits[ok] = b
-            scales[ok] = s[ok].half()
-            q_sel[ok] = q[ok]
-            assigned |= ok
-    if (~assigned).any():                             # fallback: widest
-        b = CAND_BITS[-1]
-        qmax = 2 ** (b - 1) - 1
-        s = (M / qmax).half().float()
-        q = (v2 / s.unsqueeze(1)).round().clamp(-qmax, qmax).to(torch.int32)
-        bits[~assigned] = b
-        scales[~assigned] = s[~assigned].half()
-        q_sel[~assigned] = q[~assigned]
-    n_fallback = int((~assigned).sum().item())
+    bits, scales, q_sel = best_b, best_s, best_q
 
     # group bodies by bit width; tiles keep order inside their group
     goff = torch.zeros(T, dtype=torch.int64)          # element offset in group

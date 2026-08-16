@@ -1,4 +1,4 @@
-"""End-to-end: TPAB backend on MiniCPM5 — quality (ppl) + generation speed.
+﻿"""End-to-end: TPAB backend on MiniCPM5 鈥?quality (ppl) + generation speed.
 
 Compares: bf16 / INT8-X streaming / TPAB streaming.
 """
@@ -40,7 +40,9 @@ def run(label):
     elif label == "int8x":
         deploy_model(m, level_bits=DEFAULT_LEVELS, cache="none", verbose=False)
     elif label == "tpab":
-        stats = deploy_model_tpab(m, snr_target_db=26.0, outlier_frac=0.004, verbose=True)
+        stats = deploy_model_tpab(m, snr_target_db=28.0, verbose=True)
+    elif label == "tpab26":
+        stats = deploy_model_tpab(m, snr_target_db=26.0, verbose=True)
     m.eval()
     ppl = eval_ppl(m, tok, texts, max_samples=30)
     gen(m, 8)  # warmup (Triton JIT)
@@ -53,7 +55,9 @@ def run(label):
 
 p_bf = run("bf16")
 p_ix = run("int8x")
-p_tp = run("tpab")
-P(f"\ndelta: int8x {p_ix-p_bf:+.2f}  tpab {p_tp-p_bf:+.2f}")
+p28 = run("tpab")
+p26 = run("tpab26")
+P(f"\ndelta: int8x {p_ix-p_bf:+.2f}  tpab28 {p28-p_bf:+.2f}  tpab26 {p26-p_bf:+.2f}")
 P("DONE")
 LOG.close()
+
