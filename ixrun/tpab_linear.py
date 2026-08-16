@@ -80,8 +80,15 @@ class TpabLinear(nn.Module):
                     y32.index_add_(0, gs["ol_rows_idx"], contrib)
                 y = y32.to(torch.bfloat16)
             else:
-                y = fused_gemv_tpab(x, self.gemv_stage, self.out_features,
-                                    self.in_features, tile_r=self.tile_r)
+                from .tpab_gemv_mr import fused_gemv_tpab_mr
+                r = 8 if (self.tile_r % 8 == 0 and self.out_features % 8 == 0) else (
+                    4 if (self.tile_r % 4 == 0 and self.out_features % 4 == 0) else 1)
+                if r > 1:
+                    y = fused_gemv_tpab_mr(x, self.gemv_stage, self.out_features,
+                                           self.in_features, tile_r=self.tile_r, r=r)
+                else:
+                    y = fused_gemv_tpab(x, self.gemv_stage, self.out_features,
+                                        self.in_features, tile_r=self.tile_r)
             return y.view(x.shape[:-1] + (self.out_features,))
         # multi-token: decode into the SHARED workspace, then F.linear
         ws = _get_shared_ws(self.packed["T"] * self.packed["n_per"], x.device)
