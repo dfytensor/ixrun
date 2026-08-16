@@ -25,15 +25,26 @@ except Exception:
     _HAS = False
 
 
-def prepare_gemv_stage(packed: dict, device="cuda") -> dict:
-    """Stage TPAB packed data + per-row outlier lists for the GEMV kernel."""
+def prepare_gemv_stage(packed: dict, device="cuda", staged: dict | None = None) -> dict:
+    """Stage TPAB packed data + per-row outlier lists for the GEMV kernel.
+
+    Pass `staged` (from tpab.stage_gpu) to SHARE the already-uploaded
+    bodies/metadata instead of duplicating them.
+    """
     dev = torch.device(device)
     st = dict(packed)
-    st["body_g"] = torch.cat(packed["bodies"]).to(dev)
-    st["bits_g"] = packed["bits"].to(dev)
-    st["scales_g"] = packed["scales"].to(dev)
-    st["goff_g"] = packed["goff"].to(dev)
-    st["gbase_g"] = packed["gbase_bit"].to(dev)
+    if staged is not None:
+        st["body_g"] = staged["bodies_g"]
+        st["bits_g"] = staged["bits_g"]
+        st["scales_g"] = staged["scales_g"]
+        st["goff_g"] = staged["goff_g"]
+        st["gbase_g"] = staged["gbase_g"]
+    else:
+        st["body_g"] = torch.cat(packed["bodies"]).to(dev)
+        st["bits_g"] = packed["bits"].to(dev)
+        st["scales_g"] = packed["scales"].to(dev)
+        st["goff_g"] = packed["goff"].to(dev)
+        st["gbase_g"] = packed["gbase_bit"].to(dev)
 
     # outliers grouped by row
     O, I = packed["shape"]

@@ -37,7 +37,7 @@ class TpabLinear(nn.Module):
         self.packed = encode_tpab(weight.detach(), snr_target_db=snr_target_db,
                                   outlier_frac=outlier_frac)
         self.staged = stage_gpu(self.packed, "cuda")
-        self.gemv_stage = prepare_gemv_stage(self.packed, "cuda")
+        self.gemv_stage = prepare_gemv_stage(self.packed, "cuda", staged=self.staged)
 
     def forward(self, x):
         if x.dtype == torch.bfloat16 and x.numel() == self.in_features:
