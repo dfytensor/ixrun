@@ -60,10 +60,24 @@ class TpabLinear(nn.Module):
         else:
             self._split = 1
         self._y32 = None
+        # b-specialized fast path for single-bitwidth large layers (26dB+
+        # heavy-tailed layers encode to uniform b=6): compile-time B kills
+        # the runtime-bit math; measured tall/wide +7-22%, square regresses
+        # so only large non-square layers opt in
+        self._fast_b = 0
+        if (self.in_features >= 8192 or self.out_features >= 16000):
+            ub = set(self.packed["bits"].tolist())
+            if len(ub) == 1 and next(iter(ub)) in (4, 6):
+                self._fast_b = next(iter(ub))
 
     def forward(self, x):
         if x.dtype == torch.bfloat16 and x.numel() == self.in_features:
-            if self._split > 1:
+            if self._fast_b and self._split == 1:
+                from .tpab_gemv_b import fused_gemv_tpab_b
+                y = fused_gemv_tpab_b(x, self.gemv_stage, self.out_features,
+                                      self.in_features, tile_r=self.tile_r,
+                                      b=self._fast_b)
+            elif self._split > 1:
                 # split-K: fp32 atomics + external outlier overlay
                 from .tpab_gemv_splitk import fused_gemv_tpab_splitk
                 if self._y32 is None:
