@@ -47,13 +47,14 @@ if _HAS:
             t = row_tile * T_C + kc
             b = tl.load(bits_ptr + t).to(tl.int32)
             s = tl.load(scales_ptr + t).to(tl.float32)
-            gbase = tl.load(gbase_ptr + b)
-            goff = tl.load(goff_ptr + t).to(tl.int64)
+            gbase = tl.load(gbase_ptr + b).to(tl.int32)
+            goff = tl.load(goff_ptr + t)
 
             L = rows_in_tile[:, None] * TILE_C + tl.arange(0, TILE_C)[None, :]  # [R, C]
-            bitpos = gbase + (goff + L.to(tl.int64)) * b        # [R, C]
-            word = (bitpos // 32).to(tl.int32)
-            shift = (bitpos % 32).to(tl.int32)
+            # int32 shifts instead of int64 div/mod (see tpab.py note)
+            bitpos = gbase + goff * b + L * b     # [R, C] int32
+            word = bitpos >> 5
+            shift = bitpos & 31
 
             w1 = tl.load(body_ptr + word).to(tl.uint32)         # [R, C]
             cross = (shift + b) > 32

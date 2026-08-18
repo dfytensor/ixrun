@@ -1,4 +1,4 @@
-"""TPAB: Tile-parallel Adaptive Bit-width weight compression.
+﻿"""TPAB: Tile-parallel Adaptive Bit-width weight compression.
 
 Prototype successor to INT8-X. The (3,5,8) nested bitmap needs global rank
 prefixes (sequential walks + cumsum) to locate each value's stream position,
@@ -9,16 +9,16 @@ into 64x64 tiles, each independently coded:
                   per-tile SNR target; ~1% outliers escape first, shrinking
                   the tile's dynamic range)
     tile body   : fixed-width b-bit codes. Element L of tile t sits at bit
-                  group_base[b] + tile_off[t] * b + L * b — pure bit
+                  group_base[b] + tile_off[t] * b + L * b 鈥?pure bit
                   extraction, no ranks, no cumsum, ANY tile in ANY order.
 
 Bodies are grouped by bit width (each group fixed-width => one batched pack);
 `goff` gives each tile's element offset inside its group, `gbase` each
 group's bit base in the concatenated stream.
 
-decode_tpab_ref   — vectorized torch reference
-decode_tpab_triton— tile-parallel Triton kernel (grid = tiles x chunks)
-decode_tiles      — random-access decode of an arbitrary subset of tiles
+decode_tpab_ref   鈥?vectorized torch reference
+decode_tpab_triton鈥?tile-parallel Triton kernel (grid = tiles x chunks)
+decode_tiles      鈥?random-access decode of an arbitrary subset of tiles
                     (impossible for INT8-X without a full sequential walk)
 """
 from __future__ import annotations
@@ -97,7 +97,7 @@ def encode_tpab(w: torch.Tensor, snr_target_db: float = 30.0,
             s = (M / qmax).half().float()
             q = (v2 / s.unsqueeze(1)).round().clamp(-qmax, qmax).to(torch.int32)
             # end-to-end error: include the decoder's bf16 rounding of the
-            # reconstructed weight — at low bpw this term is a real share of
+            # reconstructed weight 鈥?at low bpw this term is a real share of
             # the error budget (search targets must match measured SNR)
             rec = (q.float() * s.unsqueeze(1)).to(torch.bfloat16).float()
             err = (v2 - rec).pow(2).sum(dim=1)
@@ -167,7 +167,7 @@ def encode_tpab(w: torch.Tensor, snr_target_db: float = 30.0,
         "T": T, "n_per": n_per,
         "bits": bits.cpu(), "scales": scales.cpu(),
         "goff": goff.to(torch.int32).cpu(),
-        "gbase_bit": torch.tensor(gbase_bit, dtype=torch.int64),
+        "gbase_bit": torch.tensor(gbase_bit, dtype=torch.int32),
         "bodies": bodies,
         "ol_t": ol_t.to(torch.int32).cpu(), "ol_l": ol_l.to(torch.int32).cpu(),
         "ol_val": ol_val,
@@ -235,13 +235,16 @@ if _HAS:
 
         b = tl.load(bits_ptr + t).to(tl.int32)
         s = tl.load(scales_ptr + t).to(tl.float32)
-        gbase = tl.load(gbase_ptr + b)
-        goff = tl.load(goff_ptr + t).to(tl.int64)
+        gbase = tl.load(gbase_ptr + b).to(tl.int32)
+        goff = tl.load(goff_ptr + t)
 
         L = pid_c * BLK + tl.arange(0, BLK)
-        bitpos = gbase + (goff + L.to(tl.int64)) * b
-        word = (bitpos // 32).to(tl.int32)
-        shift = (bitpos % 32).to(tl.int32)
+        # int32 bit math: layer bit-coords max ~534M < 2^31. Shifts/ANDs
+        # replace int64 div/mod (which dominated the decode kernel —
+        # int64 division is emulated on GPU, tens of cycles per element).
+        bitpos = gbase + goff * b + L * b
+        word = bitpos >> 5
+        shift = bitpos & 31
 
         w1 = tl.load(body_ptr + word).to(tl.uint32)
         cross = (shift + b) > 32
@@ -308,8 +311,7 @@ def decode_tiles(packed: dict, tile_ids: torch.Tensor, device="cuda",
                  staged: dict | None = None) -> torch.Tensor:
     """Random-access decode of an arbitrary subset of tiles: [n, tile, tile] f32.
 
-    Outliers are NOT applied here (they live outside the tile streams) —
-    callers needing exact values should overlay them from the packed table.
+    Outliers are NOT applied here (they live outside the tile streams) 鈥?    callers needing exact values should overlay them from the packed table.
     """
     assert _HAS
     dev = torch.device(device)
@@ -320,3 +322,4 @@ def decode_tiles(packed: dict, tile_ids: torch.Tensor, device="cuda",
     tiles = tile_ids.to(torch.int32).to(dev)
     _launch_decode(out, tiles, st, n, n_per, dev)
     return out.view(n, packed["tile_r"], packed["tile_c"])
+

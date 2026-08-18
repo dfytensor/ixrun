@@ -103,3 +103,24 @@ H3 生产实现（流式推理、共享 decode buffer、TE/DiT 分离）在：
 - `E:\h3_engine\ix358_triton.py` — kernel + 流式 Linear（本包的 kernel 即由此提炼）
 - `E:\h3_engine\encode_dit_v3.py` — GPU 编码器（23.8GB DiT, ~10 分钟）
 - `E:\h3_engine\dit_standalone.py` — 独立去噪推理（10 步 787s @ 480p）
+
+## 追记（2026-08-17）：H3 深挖后的方法论教训
+
+在 MiniMax-H3 DiT 上的后续深挖发现：早期"自造量化必糊"的结论被**两个基准 bug 污染**——
+(1) standalone NF4 解码数学错误（nibble 顺序 + nested offset 遗漏）；(2) scheduler
+shift 用错（7.0 应为 12.0）。修复后重新测得真排名：NF4 pipeline lap=296，
+NF4-replica（本组逆向的 bit-exact 复刻）standalone lap=240，TPAB 各变体 15-30。
+
+**最终结论不变（TPAB/DG4 在 H3 画质不足），但方法论教训永久有效：**
+- 任何"方案A vs 方案B"的结论，先验证 B 的实现正确性（逆向到 bit-exact 是金标准）
+- 嵌套位图/分组量化的解码细节（nibble 顺序、双重 absmax 的 offset）极易错且错得静默
+- 逐层 SNR 是必要不充分指标：误差相关结构（相干 vs 去相关）决定深层累积行为
+
+## 终章（2026-08-17 深夜）：TPAB 在 H3 上的盖棺实验
+
+修复全部三个基准 bug（NF4 解码 nibble/offset、scheduler shift、TE embeds 污染）后，
+TPAB strip+NU 在干净环境重测：26dB 目标 lap=55，提高到 30dB 目标（bpw 6.0->6.9，
+体积 28.5GB，逐层 SDR 30.7dB 反超 NF4 十 dB）画质纹丝不动（lap=48）。
+**加 bit 无效 = 结构性死因**：变字宽条带间独立 scale 产生误差不连续，50 层混沌放大
+后高频细节死亡。对照 NF4（4.1bpw, lap=711）：统一字宽 + 分位数码表 + 双重 fp8 scale
+是系统性优势。结论：变字宽/tile 混合方案不适合深层视频 DiT；TPAB 定位回归文本 LLM。
