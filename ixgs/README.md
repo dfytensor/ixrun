@@ -124,3 +124,16 @@ TPAB strip+NU 在干净环境重测：26dB 目标 lap=55，提高到 30dB 目标
 **加 bit 无效 = 结构性死因**：变字宽条带间独立 scale 产生误差不连续，50 层混沌放大
 后高频细节死亡。对照 NF4（4.1bpw, lap=711）：统一字宽 + 分位数码表 + 双重 fp8 scale
 是系统性优势。结论：变字宽/tile 混合方案不适合深层视频 DiT；TPAB 定位回归文本 LLM。
+
+## 终局定论（2026-08-18）：PEAK-Q 在 H3 上成功
+
+量化考古的最终章：TPAB 全变体覆灭后，PEAK-Q（本库 peakq.py）在 MiniMax-H3 视频
+DiT 上盲测胜出 NF4（用户验收"非常好" vs "好"）。成功要素与 TPAB 的失败要素
+严格互补：
+- 组峰值 BIT-EXACT（TPAB 的 outlier 摘除破坏峰值；int8 缩放破坏峰值）
+- 误差锚定组局部相对误差（TPAB 误差锚定条带决策边界）
+- 组粒度 16（比 NF4 的 64 更细，误差更局部）
+- 46% 权重完全无损 + 54dB SNR
+
+生产配方：NF4-TE + PEAK-Q-DiT(Ref2VA 专权重) + PEAK-Q-VAE + TEACache，
+480p/124f/20步 实测 14.5min，画质超 NF4 全套。文档: F:\B站视频计划2\生产管线.md

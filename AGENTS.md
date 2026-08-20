@@ -53,6 +53,37 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   Triton decode per forward (no DMA). Graph: CUDA-Graph captures all 168 decode
   kernels into one replay; GraphLinear does GEMM-only forward.
 - **search.py**: exhaustive 2-5 level combo search by bit/w.
+- **peakq.py**: PEAK-Q (Peak-Exact Adaptive K-bit) — exponent-group bf16
+  re-encoding. Per 16-elem group: emax (8b) + sign stream + tiered payloads by
+  delta = emax-expo: T1 (delta<=1, mant7+d1=8b, BIT-EXACT), T2 (delta<=3,
+  mant6+d1=7b), T3 (delta<=7 saturated, mant5+d2=7b). Nested B1/B2 bitmaps +
+  tl.cumsum rank algebra copied from `_ix_decode_kernel`; T1 stream is raw
+  uint8 (kernel loads by rank, NOT by bit index). 10.50 bpw (1.52x), 69%
+  elements bit-exact, SNR 54 dB vs INT8-X 20-33 dB on MiniCPM5. No sparse
+  fixup kernel (saturation instead) → single-kernel decode, CUDA-Graph safe.
+  Delta-field bits = ceil(log2(hi-lo+1)) where lo=prev_dmax+1 — off-by-one
+  here silently disables the Triton path (guarded by payload_bits==[8,7,7]).
+  Also hosts `_peakq_gemv_kernel` (+split-K variant): fused decode+GEMV for
+  single-token steps, bf16 W never materialized; row prefixes reuse
+  fused.compute_row_prefixes (same dict layout). Best in-context config
+  (2 warps, BK=256), needs in_f % 256 == 0 (BK MUST divide in_f or the tail
+  tile reads out of bounds → illegal memory access). MiniCPM5 end-to-end
+  (KV-cache gen): cached 30ms/tok ≡ bf16 31; streaming fused 37ms/tok,
+  1.8GB vs 2.2GB. Isolated min-of-reps kernel timing on this WDDM-shared
+  desktop GPU is UNRELIABLE (picked (1,256) which is 15% slower in-model);
+  always verify configs with deployed-model generation timing.
+- **peakq.py v2 rows layout** (TPAB-inspired): `layout='rows'` restarts every
+  row's T2/T3 streams + B2 bitmap at word boundaries (t1/t2/t3/b2 offsets
+  int32[out_f+1]). Kernels `_peakq_decode_v2_kernel` (grid=out_f) and
+  `_peakq_gemv_v2_kernel` (R rows/program, defaults R=4 BK=256 warps=2,
+  out_f%R auto-halves fallback) need NO prefix tables — deploy skips
+  compute_row_prefixes entirely, rows are randomly accessible, multi-row is
+  free (rank state is per-row). Storage +1% (10.50 -> 10.59 bpw on MiniCPM5,
+  offsets dominate on tiny mats). In-context: v2 35.2 ms/tok ≡ v1 35.5.
+- **Host-RAM hygiene** (from tpab): PeakQLinear strips CPU packed bodies
+  after GPU staging (`_strip_packed_bodies`); shared decode buffer singleton
+  `_get_shared_w_buf`; `deploy_peakq_lazy` = big-model path (low_cpu_mem lazy
+  load, per-layer CPU encode -> GPU stage -> drop, peak ~= resident + 1 layer).
 
 ## Key design decisions
 - Scale computed as float32 (`max_abs/127.0`) then stored as bf16 — test ground truth
