@@ -1,0 +1,10 @@
+# packed weight blobs (46GB) — regenerate with pack_to_disk*.py
+*.safetensors
+# runtime logs / caches
+__pycache__/
+*.log
+log*.txt
+*_log.txt
+hd_log.txt
+
+*.png

@@ -10,3 +10,5 @@ chk*
 tests/*_out.txt
 tests/*_run.txt
 tests/*_err.txt
+
+output*.png
