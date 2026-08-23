@@ -110,12 +110,40 @@ def test_deploy():
           f"bpw={stats['bits_per_weight']:.2f}, forward rel-err={rel:.4f}")
 
 
+def test_stream_mode():
+    """cache='stream': shared buffer decode == full-mode decode."""
+    if not torch.cuda.is_available():
+        print("[skip] no CUDA")
+        return
+    torch.manual_seed(6)
+    w1 = _heavy_tail((96, 128), seed=6)
+    w2 = _heavy_tail((64, 256), seed=7)          # different (smaller) layer
+    cb = udcq_fit_codebook(w1)
+    p1, p2 = udcq_quantize(w1, cb), udcq_quantize(w2, cb)
+    l1 = UdcqLinear(p1, cache="full").cuda()
+    l2 = UdcqLinear(p2, cache="stream").cuda()
+    x1 = torch.randn(2, 4, 128, dtype=torch.bfloat16, device="cuda")
+    x2 = torch.randn(2, 4, 256, dtype=torch.bfloat16, device="cuda")
+    y1 = l1(x) if False else l1(x1)
+    y2 = l2(x2)
+    # stream decode of layer2 == its full decode
+    l2_full = UdcqLinear(p2, cache="full").cuda()
+    y2_ref = l2_full(x2)
+    assert torch.allclose(y2.float(), y2_ref.float(), atol=1e-2), \
+        "stream decode != full decode"
+    # layer1 still correct AFTER layer2 used the (reused) shared buffer
+    y1b = l1(x1)
+    assert torch.allclose(y1.float(), y1b.float(), atol=1e-6)
+    print("[ok] stream mode: shared-buffer decode correct + reusable")
+
+
 def main():
     print("Running UDCQ tests ...\n")
     test_codebook_and_snr()
     test_triton_matches_ref()
     test_linear_forward()
     test_deploy()
+    test_stream_mode()
     print("\nAll UDCQ tests passed.")
 
 

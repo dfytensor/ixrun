@@ -225,19 +225,78 @@ def _decode_udcq_ref(packed: dict, device=None,
 # --------------------------------------------------------------------------- #
 #  Layer + deploy
 # --------------------------------------------------------------------------- #
-class UdcqLinear(nn.Module):
-    """nn.Linear backed by UDCQ packed weight (decode once, F.linear)."""
+# shared decode workspace singleton: one bf16 buffer sized to the largest
+# layer serves ALL UdcqLinear instances in streaming mode (layers decode
+# sequentially — same pattern as PeakQLinear._get_shared_w_buf).
+_SHARED_W_BUF = None
+_SHARED_W_SIZE = 0
 
-    def __init__(self, packed: dict, bias=None):
+
+def _get_shared_w_buf(n_elems: int, device) -> torch.Tensor:
+    global _SHARED_W_BUF, _SHARED_W_SIZE
+    if _SHARED_W_BUF is None or _SHARED_W_SIZE < n_elems:
+        _SHARED_W_BUF = torch.zeros(n_elems, dtype=torch.bfloat16, device=device)
+        _SHARED_W_SIZE = n_elems
+    return _SHARED_W_BUF
+
+
+class UdcqLinear(nn.Module):
+    """nn.Linear backed by UDCQ packed weight.
+
+    cache='full'    : decode once to bf16, plain F.linear (fastest).
+    cache='stream'  : packed streams GPU-resident (idx/scale/sign as
+        registered buffers — no per-forward DMA); every forward re-decodes
+        into the SHARED buffer via the single LUT kernel. GPU weight memory
+        ~= packed (510MB model-wide) + one shared buf. Same protocol as
+        PeakQLinear streaming.
+    """
+
+    def __init__(self, packed: dict, bias=None, cache: str = "full"):
         super().__init__()
         self.out_features = packed["out_f"]
         self.in_features = packed["in_f"]
-        self.packed = packed
+        self.N = packed["N"]
+        self._cache = cache
         self._w = None
+        self._w_buf = None
         if bias is not None:
             self.register_buffer("_bias", bias.detach().clone())
         else:
             self._bias = None
+        if cache == "full":
+            self.packed = packed
+        else:
+            # GPU-resident packed streams (codebook shared globally via attr)
+            for key, val in [
+                ("_idx", packed["idx"]),
+                ("_scale", packed["scale"]),
+                ("_sign", packed["sign_packed"]),
+                ("_cb", packed["codebook"]),
+            ]:
+                self.register_buffer(key, val.cuda())
+            self.packed = {k: v for k, v in packed.items()
+                           if not isinstance(v, torch.Tensor)}
+            self.packed["codebook"] = None     # staged on GPU already
+
+    def _stream_decode(self):
+        import triton
+
+        total = self.out_features * self.in_features
+        buf = _get_shared_w_buf(total, self._idx.device)
+        w_flat = buf[:total]
+        w_flat.zero_()
+        w_valid = w_flat[: self.N]
+        _udcq_decode_kernel[(triton.cdiv(self.N, 1024),)](
+            w_valid,
+            self._idx.reshape(-1),
+            self._sign,
+            self._scale,
+            self._cb,
+            self.N,
+            GROUP=self.packed["g"],
+            BLK=1024,
+        )
+        return w_flat.view(self.out_features, self.in_features)
 
     def _decode(self, device):
         if self._w is None or self._w.device != device:
@@ -245,20 +304,28 @@ class UdcqLinear(nn.Module):
         return self._w
 
     def forward(self, x):
-        w = self._decode(x.device).to(x.dtype)
+        if self._cache == "full":
+            w = self._decode(x.device)
+        else:
+            w = self._stream_decode()
+        w = w.to(x.dtype)
         b = self._bias.to(x.dtype) if self._bias is not None else None
         return F.linear(x, w, b)
 
     def extra_repr(self):
         return (f"in={self.in_features}, out={self.out_features}, "
-                f"bpw={self.packed['bits_per_weight']:.2f}")
+                f"bpw={self.packed['bits_per_weight']:.2f}, "
+                f"cache={self._cache}")
 
 
 @torch.no_grad()
 def deploy_udcq(model: nn.Module, nlev: int = UDCQ_NLEV, g: int = UDCQ_G,
-                verbose: bool = True) -> dict:
+                cache: str = "full", verbose: bool = True) -> dict:
     """Replace every quantizable Linear with UdcqLinear (in-place).
 
+    cache='full'   decodes each layer once (bf16 resident).
+    cache='stream' keeps only the packed streams GPU-resident + one shared
+                   decode buffer (~510MB + 14MB for MiniCPM5 vs 1.36GB bf16).
     The universal codebook is fitted on the FIRST target tensor only.
     """
     targets = list(iter_quantizable_linears(model))
@@ -268,8 +335,9 @@ def deploy_udcq(model: nn.Module, nlev: int = UDCQ_NLEV, g: int = UDCQ_G,
     for name, mod in targets:
         packed = udcq_quantize(mod.weight.data, cb, g=g)
         bias = mod.bias.data if mod.bias is not None else None
-        new = UdcqLinear(packed, bias=bias)
+        new = UdcqLinear(packed, bias=bias, cache=cache)
         _set_parent_child(model, name, new)
+        mod.weight.data = torch.empty(0)       # drop the bf16 original
         total_bytes += packed["total_bytes"]
         n_elems += packed["N"]
     stats = {
