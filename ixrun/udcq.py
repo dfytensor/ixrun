@@ -34,6 +34,7 @@ __all__ = [
     "udcq_fit_codebook",
     "udcq_quantize",
     "decode_udcq_triton",
+    "udcq_fused_gemv",
     "UdcqLinear",
     "deploy_udcq",
     "udcq_snr",
@@ -176,6 +177,68 @@ if _HAS_TRITON:
         w = val * sc * sgn
         tl.store(out_ptr + offs, w.to(tl.bfloat16), mask=mask)
 
+    @triton.jit
+    def _udcq_gemv_kernel(
+        x_ptr,            # [IN_F] bf16, single token
+        y_ptr,            # [OUT_F] bf16
+        idx_ptr,          # uint8 [N] byte-aligned LUT indices
+        sign_ptr,         # int32 words, flat 1-bit stream
+        scale_ptr,        # f16 [ng]
+        cb_ptr,           # f16 [16] global codebook
+        IN_F: tl.constexpr,
+        OUT_F: tl.constexpr,
+        GROUP: tl.constexpr,
+        BK: tl.constexpr,
+        R: tl.constexpr,
+    ):
+        """Fused decode+GEMV: y = x @ W.T, W = sign*scale*CB[idx] decoded in
+        registers. UDCQ's byte-aligned idx makes this a pure LUT walk —
+        no bitmaps, no ranks, no cross-word extraction (unlike PEAK-Q/BF16X).
+        bf16 weight never materializes."""
+        pid = tl.program_id(0)
+        rows = pid * R + tl.arange(0, R)
+        base = rows.to(tl.int64) * IN_F
+        acc = tl.zeros((R,), tl.float32)
+
+        for k0 in tl.range(0, IN_F, BK):
+            kidx = k0 + tl.arange(0, BK)
+            offs = base[:, None] + kidx[None, :]           # [R, BK]
+
+            i = tl.load(idx_ptr + offs).to(tl.int32)
+            val = tl.load(cb_ptr + i).to(tl.float32)       # LUT
+            sc = tl.load(scale_ptr + offs // GROUP).to(tl.float32)
+            sw = tl.load(sign_ptr + offs // 32).to(tl.uint32)
+            sgn = ((sw >> (offs % 32)) & 1).to(tl.float32) * 2 - 1
+
+            w = val * sc * sgn
+            xv = tl.load(x_ptr + kidx).to(tl.float32)      # shared by R rows
+            acc += tl.sum(w * xv[None, :], axis=1)
+
+        tl.store(y_ptr + rows, acc.to(tl.bfloat16))
+
+
+# measured-in-context defaults (same protocol as PEAKQ_V2): R=4 rows/program
+UDCQ_GEMV_R = 4
+UDCQ_GEMV_BK = 256
+UDCQ_GEMV_WARPS = 2
+
+
+def udcq_fused_gemv(x, idx, sign, scale, cb, out_f, in_f,
+                    g=UDCQ_G, r=UDCQ_GEMV_R, bk=UDCQ_GEMV_BK,
+                    num_warps=UDCQ_GEMV_WARPS):
+    """y = x @ W.T single token, UDCQ-decoded in registers."""
+    y = torch.empty(out_f, dtype=torch.bfloat16, device=x.device)
+    while r > 1 and out_f % r != 0:               # odd out_f fallback
+        r //= 2
+    assert in_f % bk == 0
+    _udcq_gemv_kernel[(out_f // r,)](
+        x.reshape(-1), y,
+        idx.reshape(-1), sign, scale, cb,
+        IN_F=in_f, OUT_F=out_f, GROUP=g, BK=bk, R=r,
+        num_warps=num_warps,
+    )
+    return y
+
 
 def decode_udcq_triton(packed: dict, device=None,
                        dtype=torch.bfloat16) -> torch.Tensor:
@@ -306,9 +369,21 @@ class UdcqLinear(nn.Module):
     def forward(self, x):
         if self._cache == "full":
             w = self._decode(x.device)
-        else:
-            w = self._stream_decode()
-        w = w.to(x.dtype)
+            w = w.to(x.dtype)
+            b = self._bias.to(x.dtype) if self._bias is not None else None
+            return F.linear(x, w, b)
+        # streaming: single-token decode steps use the fused GEMV (one
+        # kernel per layer, weight never materialized — halves launch count
+        # vs decode-then-GEMM and removes the buffer round-trip)
+        if x.numel() == self.in_features:
+            y = udcq_fused_gemv(
+                x, self._idx, self._sign, self._scale, self._cb,
+                self.out_features, self.in_features, g=self.packed["g"],
+            ).to(x.dtype)
+            if self._bias is not None:
+                y = y + self._bias.to(x.dtype)
+            return y.view(*x.shape[:-1], self.out_features)
+        w = self._stream_decode().to(x.dtype)
         b = self._bias.to(x.dtype) if self._bias is not None else None
         return F.linear(x, w, b)
 

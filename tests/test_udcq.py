@@ -137,6 +137,30 @@ def test_stream_mode():
     print("[ok] stream mode: shared-buffer decode correct + reusable")
 
 
+def test_fused_gemv():
+    if not torch.cuda.is_available():
+        print("[skip] no CUDA")
+        return
+    from ixrun.udcq import udcq_fused_gemv
+    for shape in ((128, 512), (96, 1024), (33, 512)):   # incl. odd out_f
+        # (in_f must be a BK=256 multiple for the GEMV; odd out_f exercises
+        #  the R auto-halving fallback)
+        w = _heavy_tail(shape, seed=abs(hash(shape)) % 999)
+        cb = udcq_fit_codebook(w)
+        p = udcq_quantize(w, cb)
+        out_f, in_f = shape
+        dev = "cuda"
+        x = torch.randn(in_f, dtype=torch.bfloat16, device=dev)
+        y = udcq_fused_gemv(
+            x, p["idx"].to(dev), p["sign_packed"].to(dev),
+            p["scale"].to(dev), p["codebook"].to(dev), out_f, in_f)
+        w_ref = _decode_udcq_ref(p, device=dev)
+        y_ref = torch.mv(w_ref.float(), x.float())
+        rel = ((y.float() - y_ref).norm() / y_ref.norm()).item()
+        assert rel < 1e-2, f"fused gemv {shape}: rel {rel:.4f}"
+    print("[ok] fused GEMV matches decoded-weight GEMV across 3 shapes")
+
+
 def main():
     print("Running UDCQ tests ...\n")
     test_codebook_and_snr()
@@ -144,6 +168,7 @@ def main():
     test_linear_forward()
     test_deploy()
     test_stream_mode()
+    test_fused_gemv()
     print("\nAll UDCQ tests passed.")
 
 
