@@ -126,11 +126,12 @@ def test_stream_mode():
     x2 = torch.randn(2, 4, 256, dtype=torch.bfloat16, device="cuda")
     y1 = l1(x) if False else l1(x1)
     y2 = l2(x2)
-    # stream decode of layer2 == its full decode
+    # stream decode of layer2 == its full decode (rel-norm: fused GEMM
+    # accumulates in fp32 tile order, elementwise bf16 can differ ~1e-2)
     l2_full = UdcqLinear(p2, cache="full").cuda()
     y2_ref = l2_full(x2)
-    assert torch.allclose(y2.float(), y2_ref.float(), atol=1e-2), \
-        "stream decode != full decode"
+    rel = ((y2.float() - y2_ref.float()).norm() / y2_ref.float().norm()).item()
+    assert rel < 5e-2, f"stream decode rel-err {rel:.4f}"
     # layer1 still correct AFTER layer2 used the (reused) shared buffer
     y1b = l1(x1)
     assert torch.allclose(y1.float(), y1b.float(), atol=1e-6)
@@ -161,6 +162,30 @@ def test_fused_gemv():
     print("[ok] fused GEMV matches decoded-weight GEMV across 3 shapes")
 
 
+def test_fused_gemm():
+    """multi-token fused GEMM vs decoded-weight GEMM."""
+    if not torch.cuda.is_available():
+        print("[skip] no CUDA")
+        return
+    from ixrun.udcq import udcq_fused_gemm
+    for shape in ((128, 512), (96, 1024)):
+        out_f, in_f = shape
+        w = _heavy_tail(shape, seed=out_f + in_f)
+        cb = udcq_fit_codebook(w)
+        p = udcq_quantize(w, cb)
+        dev = "cuda"
+        args = (p["idx"].to(dev), p["sign_packed"].to(dev),
+                p["scale"].to(dev), p["codebook"].to(dev))
+        for M in (7, 64, 256):
+            x = torch.randn(M, in_f, dtype=torch.bfloat16, device=dev)
+            y = udcq_fused_gemm(x, *args, out_f, in_f)
+            w_ref = _decode_udcq_ref(p, device=dev)
+            y_ref = F.linear(x, w_ref)
+            rel = ((y.float() - y_ref.float()).norm() / y_ref.float().norm()).item()
+            assert rel < 5e-2, f"fused gemm {shape} M={M}: rel {rel:.4f}"
+    print("[ok] fused GEMM matches decoded GEMM (M=7/64/256, 2 shapes)")
+
+
 def main():
     print("Running UDCQ tests ...\n")
     test_codebook_and_snr()
@@ -169,6 +194,7 @@ def main():
     test_deploy()
     test_stream_mode()
     test_fused_gemv()
+    test_fused_gemm()
     print("\nAll UDCQ tests passed.")
 
 

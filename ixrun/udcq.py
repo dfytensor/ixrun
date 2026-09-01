@@ -35,6 +35,7 @@ __all__ = [
     "udcq_quantize",
     "decode_udcq_triton",
     "udcq_fused_gemv",
+    "udcq_fused_gemm",
     "UdcqLinear",
     "deploy_udcq",
     "udcq_snr",
@@ -69,6 +70,8 @@ def udcq_fit_codebook(w_calib: torch.Tensor, nlev: int = UDCQ_NLEV,
     emax = Gm.max(1, keepdim=True).values.clamp(min=1e-12)
     x = (Gm / emax).reshape(-1)
     x = x[x > 1e-6]
+    if x.numel() > 1 << 22:                     # torch.quantile input cap
+        x = x[torch.randint(0, x.numel(), (1 << 22,))]
 
     q = torch.linspace(0, 1, nlev + 1, dtype=x.dtype)[1:-1]
     cent = torch.unique(torch.quantile(x, q))
@@ -93,6 +96,17 @@ def udcq_fit_codebook(w_calib: torch.Tensor, nlev: int = UDCQ_NLEV,
 # --------------------------------------------------------------------------- #
 #  Pack (per Linear): U1 projection scale + 4-bit idx + sign stream
 # --------------------------------------------------------------------------- #
+def _nearest_cb(x_flat: torch.Tensor, CB: torch.Tensor) -> torch.Tensor:
+    """argmin_j |x - CB[j]| for a flat tensor, chunked (N x nlev distance
+    matrix would OOM on lm_head-sized inputs: 1.37B x 16 x 4B = 88GB)."""
+    out = torch.empty(x_flat.numel(), dtype=torch.long)
+    CH = 1 << 22
+    for s in range(0, x_flat.numel(), CH):
+        d = (x_flat[s:s + CH, None] - CB[None, :]).abs()
+        out[s:s + CH] = d.argmin(1)
+    return out
+
+
 @torch.no_grad()
 def udcq_quantize(weight: torch.Tensor, codebook: torch.Tensor,
                   g: int = UDCQ_G, rounds: int = 2) -> dict:
@@ -112,15 +126,12 @@ def udcq_quantize(weight: torch.Tensor, codebook: torch.Tensor,
     s = Gm.max(1, keepdim=True).values.clamp(min=1e-12)
     for _ in range(rounds):
         x = Gm / s
-        d = (x.reshape(-1, 1) - CB[None, :]).abs()
-        idx = d.argmin(1).view(-1, g)
+        idx = _nearest_cb(x.reshape(-1), CB).view(-1, g)
         c = CB[idx]
         num = (Gm * c).sum(1, keepdim=True)
         den = (c * c).sum(1, keepdim=True).clamp(min=1e-12)
         s = (num / den).clamp(min=1e-12)
-    x = Gm / s
-    d = (x.reshape(-1, 1) - CB[None, :]).abs()
-    idx = d.argmin(1).view(-1, g)
+    idx = _nearest_cb((Gm / s).reshape(-1), CB).view(-1, g)
     s_f16 = s.half()                              # storage
     # decode must use the f16 scale (same rounding path as tests/deploy)
     s_dec = s_f16.float()
@@ -216,11 +227,81 @@ if _HAS_TRITON:
 
         tl.store(y_ptr + rows, acc.to(tl.bfloat16))
 
+    @triton.jit
+    def _udcq_gemm_fused_kernel(
+        x_ptr,            # [M, IN_F] bf16 activations
+        y_ptr,            # [M, OUT_F] bf16 output
+        idx_ptr,          # uint8 [N] byte-aligned LUT indices (row-major W)
+        sign_ptr,         # int32 words, flat 1-bit stream
+        scale_ptr,        # f16 [ng]
+        cb_ptr,           # f16 [16] global codebook
+        M,
+        OUT_F: tl.constexpr, IN_F: tl.constexpr, GROUP: tl.constexpr,
+        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    ):
+        """Fused decode+GEMM v2: decode directly into [BK, BN] dot-operand
+        layout (no tl.trans smem round-trip), int32 arithmetic throughout
+        (int64 div is emulated on GPU), power-of-2 shifts for GROUP/32."""
+        pid_n = tl.program_id(0)
+        pid_m = tl.program_id(1)
+        offs_n = pid_n * BN + tl.arange(0, BN)
+        offs_m = pid_m * BM + tl.arange(0, BM)
+        mask_m = offs_m < M
+        mask_n = offs_n < OUT_F
+
+        acc = tl.zeros((BM, BN), tl.float32)
+
+        for k0 in tl.range(0, IN_F, BK):
+            offs_k = k0 + tl.arange(0, BK)
+            # W.T element (k, n) = W[n, k] at flat n*IN_F + k
+            pos = offs_n[None, :] * IN_F + offs_k[:, None]    # [BK, BN] i32
+
+            i = tl.load(idx_ptr + pos, mask=mask_n[None, :],
+                        other=0).to(tl.int32)
+            val = tl.load(cb_ptr + i).to(tl.float32)          # LUT
+            # GROUP and 32 are power-of-2 -> shift instead of division
+            sc = tl.load(scale_ptr + (pos // GROUP),
+                         mask=mask_n[None, :], other=0.0).to(tl.float32)
+            sw = tl.load(sign_ptr + (pos // 32),
+                         mask=mask_n[None, :], other=0).to(tl.uint32)
+            sgn = ((sw >> (pos % 32)) & 1).to(tl.float32) * 2 - 1
+            wt = (val * sc * sgn).to(tl.bfloat16)             # [BK, BN] regs
+
+            xt = tl.load(x_ptr + offs_m[:, None] * IN_F + offs_k[None, :],
+                         mask=mask_m[:, None], other=0.0)     # [BM, BK]
+            acc += tl.dot(xt, wt)                             # no trans
+
+        tl.store(y_ptr + offs_m[:, None] * OUT_F + offs_n[None, :],
+                 acc.to(tl.bfloat16),
+                 mask=mask_m[:, None] & mask_n[None, :])
+
 
 # measured-in-context defaults (same protocol as PEAKQ_V2): R=4 rows/program
 UDCQ_GEMV_R = 4
 UDCQ_GEMV_BK = 256
 UDCQ_GEMV_WARPS = 2
+
+
+# GEMM tile defaults (BM, BN, BK, warps, stages) — tuned on 4090 for
+# MiniCPM5/Qwen3.8 shapes; verify in-context before changing (AGENTS.md rule)
+UDCQ_GEMM_CFG = (64, 128, 64, 8, 2)
+
+
+def udcq_fused_gemm(x, idx, sign, scale, cb, out_f, in_f,
+                    g=UDCQ_G, cfg=UDCQ_GEMM_CFG):
+    """y = x @ W.T multi-token, UDCQ-decoded in registers (pipelined)."""
+    M = x.shape[0]
+    y = torch.empty(M, out_f, dtype=torch.bfloat16, device=x.device)
+    BM, BN, BK, warps, stages = cfg
+    assert in_f % BK == 0
+    grid = (triton.cdiv(out_f, BN), triton.cdiv(M, BM))
+    _udcq_gemm_fused_kernel[grid](
+        x, y, idx.reshape(-1), sign, scale, cb,
+        M, OUT_F=out_f, IN_F=in_f, GROUP=g,
+        BM=BM, BN=BN, BK=BK,
+        num_warps=warps, num_stages=stages,
+    )
+    return y
 
 
 def udcq_fused_gemv(x, idx, sign, scale, cb, out_f, in_f,
@@ -375,9 +456,28 @@ class UdcqLinear(nn.Module):
         # streaming: single-token decode steps use the fused GEMV (one
         # kernel per layer, weight never materialized — halves launch count
         # vs decode-then-GEMM and removes the buffer round-trip)
+        w = None
         if x.numel() == self.in_features:
             y = udcq_fused_gemv(
                 x, self._idx, self._sign, self._scale, self._cb,
+                self.out_features, self.in_features, g=self.packed["g"],
+            ).to(x.dtype)
+            if self._bias is not None:
+                y = y + self._bias.to(x.dtype)
+            return y.view(*x.shape[:-1], self.out_features)
+        # multi-token dispatch (measured on 4090, see tests):
+        #   M <= 256 -> pipelined fused decode+GEMM (reads ~10bpw, wins vs
+        #               cublas 0.85-1.56x at M=256, better below — the
+        #               Marlin/ZipServ regime; decode redundancy x M/BM is
+        #               still small)
+        #   M >  256 -> decode-to-shared-buffer + cublas (each W read once;
+        #               fused re-decodes per m-tile and loses ~8x at M=4096)
+        M = x.numel() // self.in_features
+        if (M <= 256 and self.in_features % UDCQ_GEMM_CFG[2] == 0
+                and self.out_features % UDCQ_GEMM_CFG[1] == 0):
+            x2 = x.reshape(M, self.in_features)
+            y = udcq_fused_gemm(
+                x2, self._idx, self._sign, self._scale, self._cb,
                 self.out_features, self.in_features, g=self.packed["g"],
             ).to(x.dtype)
             if self._bias is not None:
