@@ -53,8 +53,8 @@ __global__ __launch_bounds__(256) void udcq_mma_v2_kernel(
     __nv_bfloat16* Xs[2] = {(__nv_bfloat16*)smem_raw,
                             (__nv_bfloat16*)(smem_raw + BM * BK * 2)};
     uint8_t* Is[2] = {smem_raw + 2 * BM * BK * 2,
-                      smem_raw + 2 * BM * BK * 2 + BN * BK};
-    __nv_bfloat16* Ws = (__nv_bfloat16*)(smem_raw + 2 * BM * BK * 2 + 2 * BN * BK);
+                      smem_raw + 2 * BM * BK * 2 + BN * BK / 2};
+    __nv_bfloat16* Ws = (__nv_bfloat16*)(smem_raw + 2 * BM * BK * 2 + BN * BK);
     float* CBs = (float*)(Ws + BN * BK);
 
     const int tid = threadIdx.x;
@@ -81,9 +81,11 @@ __global__ __launch_bounds__(256) void udcq_mma_v2_kernel(
     };
     // stage idx tile (row-contiguous 64B rows) into buf s
     auto stage_idx = [&](int k0, int s) {
-        for (int i = tid * 16; i < BN * BK; i += 256 * 16) {
-            const int n = i / BK;
-            cp_async16(Is[s] + i, idx + (long)(n0 + n) * IN_F + k0 + (i % BK));
+        // idx is nibble-packed globally: element pos -> byte pos>>1.
+        // Per W row: 64 elems = 32 bytes = 2 x 16B chunks (aligned: IN_F even).
+        for (int i = tid * 16; i < BN * BK / 2; i += 256 * 16) {
+            const int n = i / (BK / 2);
+            cp_async16(Is[s] + i, idx + ((long)(n0 + n) * IN_F + k0) / 2 + (i % (BK / 2)));
         }
     };
     auto commit = [&]() { asm volatile("cp.async.commit_group;\n"); };
@@ -117,7 +119,9 @@ __global__ __launch_bounds__(256) void udcq_mma_v2_kernel(
         for (int i = tid; i < BN * BK; i += 256) {
             const int n = i >> 6, k = i & 63;
             const long pos = (long)(n0 + n) * IN_F + k0 + k;
-            const float v = CBs[Is[s][i]] * __half2float(scale[(unsigned)(pos >> 4)]);
+            const uint8_t byte = Is[s][i >> 1];
+            const uint8_t code = (i & 1) ? (byte >> 4) : (byte & 0x0F);
+            const float v = CBs[code] * __half2float(scale[(unsigned)(pos >> 4)]);
             const unsigned sgn = ((unsigned)sign[pos >> 5] >> (pos & 31)) & 1;
             const unsigned bits = __bfloat16_as_ushort(__float2bfloat16(v));
             Ws[i] = __ushort_as_bfloat16(bits ^ ((sgn ^ 1u) << 15));
@@ -171,7 +175,7 @@ torch::Tensor udcq_mma_v2(torch::Tensor x, torch::Tensor idx, torch::Tensor sign
                           int64_t out_f, int64_t in_f) {
     const int M = x.size(0);
     auto y = torch::empty({M, out_f}, x.options());
-    const int smem = 2 * BM * BK * 2 + 2 * BN * BK + BN * BK * 2 + 64;
+    const int smem = 2 * BM * BK * 2 + BN * BK + BN * BK * 2 + 64;
     static bool cfg = false;
     if (!cfg) {
         cudaFuncSetAttribute(udcq_mma_v2_kernel,
@@ -193,7 +197,7 @@ torch::Tensor udcq_mma_v2(torch::Tensor x, torch::Tensor idx, torch::Tensor sign
 
 CPP_SRC = "torch::Tensor udcq_mma_v2(torch::Tensor x, torch::Tensor idx, torch::Tensor sign, torch::Tensor scale, torch::Tensor cb, int64_t out_f, int64_t in_f);"
 
-mod = load_inline(name='udcq_mma_v2r', cpp_sources=CPP_SRC, cuda_sources=CUDA_SRC,
+mod = load_inline(name='udcq_mma_v2n', cpp_sources=CPP_SRC, cuda_sources=CUDA_SRC,
                   functions=['udcq_mma_v2'],
                   extra_cuda_cflags=['-O3', '--use_fast_math'], verbose=False)
 

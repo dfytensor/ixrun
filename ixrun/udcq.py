@@ -141,16 +141,22 @@ def udcq_quantize(weight: torch.Tensor, codebook: torch.Tensor,
     from .bitpack import pack_bits_stream
 
     sign_words = pack_bits_stream(sign_bits, 1)
-    # accounting: idx 4b + sign (packed words) + scale f16/g. The codebook is
-    # GLOBAL (one per model, 16 entries) — amortized to ~0 bpw and excluded
-    # from the per-layer total.
+    # accounting: idx 4b (REAL storage — nibble-packed below) + sign words +
+    # scale f16/g. The codebook is GLOBAL (16 entries/model) — amortized ~0.
     total_bits = n * 4 + sign_words.numel() * 32 + (n // g) * 16
+    # nibble-pack idx: 2 codes/byte, even element = low nibble. This makes
+    # the 6bpw accounting TRUE for GPU residency (byte-aligned idx measured
+    # 10bpw real and blew the 27B budget by 13GB).
+    idx_bytes = idx.reshape(-1).to(torch.uint8)
+    if n % 2:
+        idx_bytes = torch.cat([idx_bytes, torch.zeros(1, dtype=torch.uint8)])
+    idx4 = (idx_bytes[0::2] & 0x0F) | ((idx_bytes[1::2] & 0x0F) << 4)
     return {
         "g": g,
         "out_f": of,
         "in_f": inf_,
         "N": n,
-        "idx": idx.to(torch.uint8).contiguous(),       # [ng, g] values 0..15
+        "idx": idx4.contiguous(),                        # [ceil(N/2)] nibbles
         "scale": s_f16.reshape(-1).contiguous(),       # [ng]
         "sign_packed": sign_words.contiguous(),
         "codebook": CB.half().contiguous(),            # [nlev] f16 (global)
@@ -167,7 +173,7 @@ if _HAS_TRITON:
     @triton.jit
     def _udcq_decode_kernel(
         out_ptr,          # bf16 [N]
-        idx_ptr,          # uint8 [N] values 0..15 (byte-aligned LUT index)
+        idx_ptr,          # uint8 [ceil(N/2)] NIBBLE-packed LUT indices
         sign_ptr,         # int32 words, flat 1-bit stream
         scale_ptr,        # f16 [ng]
         cb_ptr,           # f16 [16] global codebook
@@ -179,7 +185,8 @@ if _HAS_TRITON:
         offs = pid * BLK + tl.arange(0, BLK)
         mask = offs < N
 
-        i = tl.load(idx_ptr + offs, mask=mask, other=0).to(tl.int32)
+        b = tl.load(idx_ptr + (offs // 2), mask=mask, other=0)
+        i = tl.where(offs % 2 == 0, b & 0x0F, (b >> 4) & 0x0F).to(tl.int32)
         val = tl.load(cb_ptr + i).to(tl.float32)          # LUT
         sc = tl.load(scale_ptr + offs // GROUP, mask=mask, other=0).to(tl.float32)
         sw = tl.load(sign_ptr + offs // 32, mask=mask, other=0).to(tl.uint32)
@@ -215,7 +222,9 @@ if _HAS_TRITON:
             kidx = k0 + tl.arange(0, BK)
             offs = base[:, None] + kidx[None, :]           # [R, BK]
 
-            i = tl.load(idx_ptr + offs).to(tl.int32)
+            b = tl.load(idx_ptr + offs // 2)
+            i = tl.where(offs % 2 == 0, b & 0x0F,
+                         (b >> 4) & 0x0F).to(tl.int32)
             val = tl.load(cb_ptr + i).to(tl.float32)       # LUT
             sc = tl.load(scale_ptr + offs // GROUP).to(tl.float32)
             sw = tl.load(sign_ptr + offs // 32).to(tl.uint32)
@@ -256,8 +265,9 @@ if _HAS_TRITON:
             # W.T element (k, n) = W[n, k] at flat n*IN_F + k
             pos = offs_n[None, :] * IN_F + offs_k[:, None]    # [BK, BN] i32
 
-            i = tl.load(idx_ptr + pos, mask=mask_n[None, :],
-                        other=0).to(tl.int32)
+            b = tl.load(idx_ptr + pos // 2, mask=mask_n[None, :], other=0)
+            i = tl.where(pos % 2 == 0, b & 0x0F,
+                         (b >> 4) & 0x0F).to(tl.int32)
             val = tl.load(cb_ptr + i).to(tl.float32)          # LUT
             # GROUP and 32 are power-of-2 -> shift instead of division
             sc = tl.load(scale_ptr + (pos // GROUP),
@@ -296,7 +306,7 @@ def udcq_fused_gemm(x, idx, sign, scale, cb, out_f, in_f,
     assert in_f % BK == 0
     grid = (triton.cdiv(out_f, BN), triton.cdiv(M, BM))
     _udcq_gemm_fused_kernel[grid](
-        x, y, idx.reshape(-1), sign, scale, cb,
+        x, y, idx, sign, scale, cb,
         M, OUT_F=out_f, IN_F=in_f, GROUP=g,
         BM=BM, BN=BN, BK=BK,
         num_warps=warps, num_stages=stages,
@@ -314,7 +324,7 @@ def udcq_fused_gemv(x, idx, sign, scale, cb, out_f, in_f,
     assert in_f % bk == 0
     _udcq_gemv_kernel[(out_f // r,)](
         x.reshape(-1), y,
-        idx.reshape(-1), sign, scale, cb,
+        idx, sign, scale, cb,
         IN_F=in_f, OUT_F=out_f, GROUP=g, BK=bk, R=r,
         num_warps=num_warps,
     )
@@ -359,7 +369,10 @@ def _decode_udcq_ref(packed: dict, device=None,
 
     sign = unpack_bits_stream(packed["sign_packed"].to(device),
                               packed["N"], 1, device=device).float() * 2 - 1
-    vals = (CB[idx.reshape(-1)] * s.repeat_interleave(g))[:packed["N"]]
+    # nibble-packed idx: even element = low nibble
+    ib = packed["idx"].to(device)
+    codes = torch.stack([ib & 0x0F, (ib >> 4) & 0x0F], 1).reshape(-1).long()
+    vals = CB[codes[:packed["N"]]] * s.repeat_interleave(g)[:packed["N"]]
     w = torch.zeros(packed["out_f"] * packed["in_f"],
                     dtype=vals.dtype, device=vals.device)
     w[: packed["N"]] = vals * sign          # pad tail decodes to 0
@@ -432,7 +445,7 @@ class UdcqLinear(nn.Module):
         w_valid = w_flat[: self.N]
         _udcq_decode_kernel[(triton.cdiv(self.N, 1024),)](
             w_valid,
-            self._idx.reshape(-1),
+            self._idx,
             self._sign,
             self._scale,
             self._cb,
