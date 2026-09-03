@@ -354,6 +354,70 @@ def main():
     hard_reset()
     print(f'[probe pre-mtp] {[int(x) for x in probe]}', flush=True)
 
+    # ---- direct kernel A/B on deployed layer 3 k_proj (real buffers) ----
+    from ixrun.udcq import udcq_fused_gemm, udcq_fused_gemv
+    l3 = tm.layers[3]
+    if l3.block_type != 'full_attention':
+        for cand in tm.layers:
+            if cand.block_type == 'full_attention':
+                l3 = cand
+                break
+    kp = l3.self_attn.k_proj
+    in_f = kp.in_features
+    torch.manual_seed(0)
+    hA = torch.randn(1, 1, in_f, dtype=torch.bfloat16, device=dev)
+    hB = torch.randn(1, 1, in_f, dtype=torch.bfloat16, device=dev)
+    yA = kp(hA).reshape(1, -1)          # GEMV
+    yB = kp(hB).reshape(1, -1)          # GEMV
+    x2 = torch.cat([hA, hB], dim=1).reshape(2, in_f)
+    y2 = kp(x2)                          # GEMM path (M=2)
+    d0 = (y2[0].float() - yA[0].float()).abs().max().item()
+    d1 = (y2[1].float() - yB[0].float()).abs().max().item()
+    ref = yA.float().abs().mean().item()
+    print(f'[kproj A/B] |y| mean {ref:.4f} | GEMM-vs-GEMV row0 max {d0:.4f} '
+          f'row1 max {d1:.4f}', flush=True)
+
+    # ---- linear_attn output A/B: sequential S=1 x2 vs block S=2 ----
+    l0 = next(l for l in tm.layers if l.block_type == 'linear_attention')
+    H0 = l0.config.hidden_size if hasattr(l0, 'config') else H
+    cosB1 = torch.zeros(1, 1, cos_all.shape[-1], dtype=cos_all.dtype, device=dev)
+    sinB1 = torch.zeros_like(cosB1)
+    cosB2 = torch.zeros(1, 2, cos_all.shape[-1], dtype=cos_all.dtype, device=dev)
+    sinB2 = torch.zeros_like(cosB2)
+
+    def la_out(h1, h2, pos0):
+        """h1,h2: [1,1,H] tokens. Returns (seq_outputs, block_outputs)."""
+        hard_reset()
+        # sequential
+        cosB1.copy_(cos_all[pos0].view(1, 1, -1))
+        sinB1.copy_(sin_all[pos0].view(1, 1, -1))
+        o1 = l0.linear_attn(h1, cache_params=cache, attention_mask=None,
+                            position_ids=None)
+        cosB1.copy_(cos_all[pos0 + 1].view(1, 1, -1))
+        sinB1.copy_(sin_all[pos0 + 1].view(1, 1, -1))
+        o2 = l0.linear_attn(h2, cache_params=cache, attention_mask=None,
+                            position_ids=None)
+        hard_reset()
+        cosB2[:, 0].copy_(cos_all[pos0].view(1, -1))
+        cosB2[:, 1].copy_(cos_all[pos0 + 1].view(1, -1))
+        sinB2[:, 0].copy_(sin_all[pos0].view(1, -1))
+        sinB2[:, 1].copy_(sin_all[pos0 + 1].view(1, -1))
+        hb = torch.cat([h1, h2], dim=1)
+        ob = l0.linear_attn(hb, cache_params=cache, attention_mask=None,
+                            position_ids=None)
+        return torch.cat([o1, o2], 1), ob
+
+    torch.manual_seed(1)
+    hh1 = torch.randn(1, 1, H, dtype=torch.bfloat16, device=dev) * 0.1
+    hh2 = torch.randn(1, 1, H, dtype=torch.bfloat16, device=dev) * 0.1
+    oseq, oblk = la_out(hh1, hh2, 50)
+    dA = (oseq[0, 0].float() - oblk[0, 0].float()).abs().max().item()
+    dB = (oseq[0, 1].float() - oblk[0, 1].float()).abs().max().item()
+    refm = oseq.float().abs().mean().item()
+    print(f'[la A/B] |out| mean {refm:.4f} | seq-vs-block tok0 max {dA:.4f} '
+          f'tok1 max {dB:.4f}', flush=True)
+    hard_reset()
+
 
 
     # =================== full speculative loop ===================
@@ -472,8 +536,31 @@ def main():
               flush=True)
         if i >= 3:
             break
+    # path B2: EAGER M=2 (same inputs, no graph)
+    full_restore(base)
+    emb2[:, 0].copy_(embed1(tokA[0]).view(1, H))
+    emb2[:, 1].copy_(embed1(tokA[1]).view(1, H))
+    cos2[:, 0].copy_(cos_all[tA].view(1, -1))
+    cos2[:, 1].copy_(cos_all[tA + 1].view(1, -1))
+    sin2[:, 0].copy_(sin_all[tA].view(1, -1))
+    sin2[:, 1].copy_(sin_all[tA + 1].view(1, -1))
+    pos2[0] = tA; pos2[1] = tA + 1
+    run(emb2, cos2, sin2, pos2)
+    snapB2 = full_snap()
+    n_bad_kv_eager = 0
+    dmax_eager = 0.0
+    for i, (kvA, kvB) in enumerate(zip(snapA[1], snapB2[1])):
+        if kvA is None:
+            continue
+        d = (kvA[0].float() - kvB[0].float()).abs()
+        c = int(snapA[0][i][2].item())
+        dm = d[:, :, c - 2:c].max().item()
+        dmax_eager = max(dmax_eager, dm)
+        if dm > 1e-3:
+            n_bad_kv_eager += 1
+    print(f'[state-diff] EAGER M=2 vs g1+g1: bad {n_bad_kv_eager}/16, '
+          f'dK max {dmax_eager:.4f} (graph was 4.55)', flush=True)
     hard_reset()
-    # ================= end bisect =================
 
     from collections import defaultdict
 
