@@ -189,6 +189,41 @@ def main():
     print(f'[PATCHED A/B 8-layer] |h| mean {refm:.4f} | tok0 max {d0:.5f} '
           f'tok1 max {d1:.5f}  (was 0.41 / 3.06)', flush=True)
 
+    # ---- per-layer divergence scan: rebuild paths capturing h after each layer
+    def run_capture(emb, cos, sin, pos):
+        hs = []
+        h = emb
+        for layer in list(tm.layers)[:8]:
+            h = layer(h, position_embeddings=(cos, sin), attention_mask=None,
+                      position_ids=pos.view(1, -1), past_key_values=cache)
+            if isinstance(h, tuple):
+                h = h[0]
+            hs.append(h.clone())
+        return hs
+
+    # path A capture
+    hard_reset()
+    for i, tid in enumerate(seeds):
+        run(embed1(tid), cos_all[i].view(1, 1, -1), sin_all[i].view(1, 1, -1),
+            torch.tensor([i], device=dev))
+    hA1c = run_capture(h1, cos_all[t0].view(1, 1, -1),
+                       sin_all[t0].view(1, 1, -1), torch.tensor([t0], device=dev))
+    hA2c = run_capture(h2, cos_all[t0 + 1].view(1, 1, -1),
+                       sin_all[t0 + 1].view(1, 1, -1),
+                       torch.tensor([t0 + 1], device=dev))
+    # path B capture
+    hard_reset()
+    for i, tid in enumerate(seeds):
+        run(embed1(tid), cos_all[i].view(1, 1, -1), sin_all[i].view(1, 1, -1),
+            torch.tensor([i], device=dev))
+    hBc = run_capture(hh, cos2, sin2,
+                      torch.tensor([t0, t0 + 1], device=dev))
+    for li in range(8):
+        ltype = list(tm.layers)[li].block_type[:6]
+        da = (hBc[li][0, 0].float() - hA1c[li][0, 0].float()).abs().max().item()
+        db = (hBc[li][0, 1].float() - hA2c[li][0, 0].float()).abs().max().item()
+        print(f'  layer{li} ({ltype}): tok0 {da:8.4f} tok1 {db:8.4f}', flush=True)
+
 
 if __name__ == '__main__':
     main()
