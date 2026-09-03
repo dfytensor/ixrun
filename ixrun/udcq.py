@@ -380,12 +380,23 @@ def udcq_fused_gemv(x, idx, sign, scale, cb, out_f, in_f,
     return y
 
 
+# multi-token GEMV config override (in-context tuning: set env before run,
+# verify with deployed-model timing per AGENTS.md rule)
+import os as _os
+UDCQ_MT_R = int(_os.environ.get('UDCQ_MT_R', UDCQ_GEMV_R))
+UDCQ_MT_BK = int(_os.environ.get('UDCQ_MT_BK', UDCQ_GEMV_BK))
+UDCQ_MT_WARPS = int(_os.environ.get('UDCQ_MT_WARPS', UDCQ_GEMV_WARPS))
+
+
 def udcq_fused_gemv_mt(x, idx, sign, scale, cb, out_f, in_f,
-                       g=UDCQ_G, r=UDCQ_GEMV_R, bk=UDCQ_GEMV_BK,
-                       num_warps=UDCQ_GEMV_WARPS):
+                       g=UDCQ_G, r=None, bk=None,
+                       num_warps=None):
     """y = x @ W.T for T tokens (x: [T, in_f]), one decode walk.
     Bit-exact vs T separate udcq_fused_gemv calls (same walk + same
     per-token accumulation expression). T in {2, 4, 8}."""
+    r = UDCQ_MT_R if r is None else r
+    bk = UDCQ_MT_BK if bk is None else bk
+    num_warps = UDCQ_MT_WARPS if num_warps is None else num_warps
     T, in_f2 = x.shape
     assert in_f2 == in_f and T in (2, 4, 8), (T, in_f, in_f2)
     y = torch.empty(T, out_f, dtype=torch.bfloat16, device=x.device)

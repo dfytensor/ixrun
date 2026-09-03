@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """round4b: speculative decode, fast-iteration version.
 
 - loads the disk blob (2min) instead of re-quantizing (55min)
@@ -97,7 +97,7 @@ def _attn_forward_static(self, hidden_states, position_embeddings,
 
     if q_len > 1:
         # [B, heads, S, D] -> [B, S, heads*D]: transpose is REQUIRED before
-        # the flatten — without it head/token dims interleave (q_len=1 was
+        # the flatten 鈥?without it head/token dims interleave (q_len=1 was
         # accidentally fine because S=1; S=2 produced garbled layout ->
         # layer divergence dmax 6.0)
         attn_output = attn_output.transpose(1, 2)
@@ -126,8 +126,10 @@ class MTPHeadBf16(nn.Module):
         self.lm_head = lm_head
 
     @torch.no_grad()
-    def forward(self, tok_emb, h, pos):
-        # rope for the draft position (q_len=1)
+    def forward2(self, tok_emb, h, pos):
+        """Returns (logits, normed_z). normed_z = self.norm(z) is the
+        recursion state for chained MTP drafts (matches the single-step
+        convention: h input is a final-norm-equivalent hidden)."""
         cos, sin = self.rotary(h, pos)
         x = self.fc(torch.cat([self.norm_e(tok_emb), self.norm_h(h)],
                               dim=-1).to(torch.bfloat16))
@@ -135,7 +137,13 @@ class MTPHeadBf16(nn.Module):
                        position_embeddings=(cos, sin), use_cache=False)
         if isinstance(z, tuple):
             z = z[0]
-        return self.lm_head(self.norm(z))
+        nz = self.norm(z)
+        return self.lm_head(nz), nz
+
+    @torch.no_grad()
+    def forward(self, tok_emb, h, pos):
+        # rope for the draft position (q_len=1)
+        return self.forward2(tok_emb, h, pos)[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -252,7 +260,7 @@ def load_mtp(m):
     tm = m.model
     if hasattr(tm, 'language_model'):
         tm = tm.language_model
-    # construct WITHOUT the shared lm_head as a child module — .to(bf16)
+    # construct WITHOUT the shared lm_head as a child module 鈥?.to(bf16)
     # would recurse into the UdcqLinear's f16 buffers (scale/codebook),
     # rebind their storage and corrupt the main decode + graph pointers
     head = MTPHeadBf16(cfg.hidden_size, layer, tm.rotary_emb, None).to(torch.bfloat16)
@@ -313,6 +321,45 @@ def main():
     cos2 = torch.zeros(1, 2, cos_all.shape[-1], dtype=cos_all.dtype, device=dev)
     sin2 = torch.zeros_like(cos2)
     pos2 = torch.zeros(2, dtype=torch.long, device=dev)
+    emb4 = torch.zeros(1, 4, H, dtype=torch.bfloat16, device=dev)
+    cos4 = torch.zeros(1, 4, cos_all.shape[-1], dtype=cos_all.dtype, device=dev)
+    sin4 = torch.zeros_like(cos4)
+    pos4 = torch.zeros(4, dtype=torch.long, device=dev)
+
+    # GPU embedding table for in-graph gathers (chain drafts + prefix
+    # fills need token embeddings from GPU-resident ints — the CPU-row
+    # CpuEmbed path requires a sync and cannot be captured).
+    # int8 + per-row fp32 scale (1.27GB vs 2.54GB bf16): peak VRAM stays
+    # under 24GB — oversubscription triggers WDDM sysmem paging and the
+    # whole pipeline crawls at ~130GB/s (measured 232ms/iter vs ~70).
+    print('staging emb_gpu (int8)...', flush=True)
+    emb_f = blob['embed'].float()
+    emb_s = (emb_f.abs().amax(dim=1) / 127.0).clamp_min(1e-12)
+    emb_i8 = (emb_f / emb_s.unsqueeze(1)).round().to(torch.int8)
+    emb_i8 = emb_i8.cuda()
+    s_g = emb_s.cuda().unsqueeze(1)          # [vocab, 1] fp32
+    del emb_f
+    print(f'  emb_i8 {tuple(emb_i8.shape)} '
+          f'{emb_i8.numel() / 1e9:.2f}GB', flush=True)
+
+    def emb_rows(ids_t):
+        """Dequantized embedding rows; ids_t: int tensor (GPU). All ops
+        capture-safe (F.embedding = index_select, no advanced indexing)."""
+        q = F.embedding(ids_t, emb_i8)
+        sc = F.embedding(ids_t, s_g)
+        return (q.float() * sc).to(torch.bfloat16)
+
+    # static graph-output buffers (allocated OUTSIDE any capture -> never
+    # aliased by the shared pool; graphs copy into them before capture end)
+    V = m.lm_head.out_features
+    out_h1 = torch.zeros(1, 1, H, dtype=torch.bfloat16, device=dev)
+    out_l1 = torch.zeros(1, 1, V, dtype=torch.bfloat16, device=dev)
+    out_h2 = torch.zeros(1, 2, H, dtype=torch.bfloat16, device=dev)
+    out_l2 = torch.zeros(1, 2, V, dtype=torch.bfloat16, device=dev)
+    out_h4 = torch.zeros(1, 4, H, dtype=torch.bfloat16, device=dev)
+    out_l4 = torch.zeros(1, 4, V, dtype=torch.bfloat16, device=dev)
+    a_buf = torch.zeros(4, dtype=torch.long, device=dev)
+    dec_gpu = torch.zeros(6, dtype=torch.long, device=dev)
 
     def run(emb, cos, sin, pos):
         h = emb
@@ -347,29 +394,41 @@ def main():
                     rs.zero_()
 
     # ------- graphs -------
-    print('capturing g1/g2...', flush=True)
-    for b in (emb1, cos1, sin1, emb2, cos2, sin2):
+    print('capturing g1/g2/g4...', flush=True)
+    for b in (emb1, cos1, sin1, emb2, cos2, sin2, emb4, cos4, sin4):
         b.zero_()
-    pos1.fill_(0); pos2.fill_(0)
+    pos1.fill_(0); pos2.fill_(0); pos4.fill_(0)
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
             run(emb1, cos1, sin1, pos1)
             run(emb2, cos2, sin2, pos2)
+            run(emb4, cos4, sin4, pos4)
     torch.cuda.current_stream().wait_stream(s)
     g1 = torch.cuda.CUDAGraph()
-    pool = torch.cuda.graph_pool_handle()   # BOTH graphs share one pool —
+    pool = torch.cuda.graph_pool_handle()   # ALL graphs share one pool —
     with torch.cuda.graph(g1, pool=pool):   # separate pools alias corrupt g1
         h1_s, log1_s = run(emb1, cos1, sin1, pos1)
+        out_h1.copy_(h1_s)                   # static outputs (pool-safe)
+        out_l1.copy_(log1_s)
     # v5: g2 = TRUE T=2 layer-wise batch (single forward on emb2 buffers).
     # Exact by construction: projections via multi-token GEMV (bit-exact
     # vs sequential M=1), GDN core per-token via gdn_seq_patch v3,
-    # attention q_len=2 causal over static cache. log2_s[:, 0] = verify
-    # logits (after t1), log2_s[:, 1] = continuation (after d).
+    # attention q_len=2 causal over static cache. out_l2[:, 0] = verify
+    # logits (after t1), out_l2[:, 1] = continuation (after d).
     g2 = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g2, pool=pool):
         h2_s, log2_s = run(emb2, cos2, sin2, pos2)
+        out_h2.copy_(h2_s)
+        out_l2.copy_(log2_s)
+    # k=3 verify graph: T=4, one replay processes [t1, d1, d2, d3] —
+    # out_l4[:, j] = logits after token j (verify + next-t1 candidates).
+    g4 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g4, pool=pool):
+        h4_s, log4_s = run(emb4, cos4, sin4, pos4)
+        out_h4.copy_(h4_s)
+        out_l4.copy_(log4_s)
     hard_reset()
     print('graphs ok', flush=True)
 
@@ -441,9 +500,9 @@ def main():
         o2 = l0.linear_attn(h2, cache_params=cache, attention_mask=None,
                             position_ids=None)
         hard_reset()
-        cosB2[:, 0].copy_(cos_all[pos0].view(1, -1))
+        cosB2[:, 0].copy_(cos_all[pos0])
         cosB2[:, 1].copy_(cos_all[pos0 + 1].view(1, -1))
-        sinB2[:, 0].copy_(sin_all[pos0].view(1, -1))
+        sinB2[:, 0].copy_(sin_all[pos0])
         sinB2[:, 1].copy_(sin_all[pos0 + 1].view(1, -1))
         hb = torch.cat([h1, h2], dim=1)
         ob = l0.linear_attn(hb, cache_params=cache, attention_mask=None,
@@ -498,7 +557,7 @@ def main():
 
 
     # =================== full speculative loop ===================
-    # NOTE: conv_states/recurrent_states are DICTS {state_idx: tensor} —
+    # NOTE: conv_states/recurrent_states are DICTS {state_idx: tensor} 鈥?
     # iterating the object yields INT KEYS, not tensors. All snapshot/
     # restore/collect code MUST iterate .values() (this exact bug silently
     # disabled GDN rollback = the accept-path corruption root cause).
@@ -553,28 +612,121 @@ def main():
     mtp = load_mtp(m)
     print('mtp head loaded (with layer, orig attn)', flush=True)
 
-    # ---- capture g_mtp: MTP head in a graph (kills the ~50ms eager cost) ----
-    print('capturing g_mtp...', flush=True)
-    mtp_emb_buf = torch.zeros(1, 1, H, dtype=torch.bfloat16, device=dev)
+    # ---- capture g_mtp4: 4-step MTP chain with known-token selection ----
+    # Inputs: mtp_h_buf (h after last PROCESSED token), chain_in[4]
+    # (known-token queue: pending committed-but-unprocessed tokens + new
+    # root; tail slots are garbage), pend_len (GPU [1]).
+    # Step j: predict p_j = argmax(MTP(emb(tok_j), u_j)); the block's
+    # next token is chain_in[j+1] when inside the known prefix, else the
+    # prediction itself (data-dependent select, capture-safe where()).
+    # tok_out[4] = the verify block (known prefix + fresh drafts).
+    print('capturing g_mtp4...', flush=True)
     mtp_h_buf = torch.zeros(1, 1, H, dtype=torch.bfloat16, device=dev)
     mtp_pos_buf = torch.zeros(1, 1, dtype=torch.long, device=dev)
+    chain_in = torch.zeros(4, dtype=torch.long, device=dev)
+    pend_len = torch.zeros(1, dtype=torch.long, device=dev)
+    tok_out = torch.zeros(4, dtype=torch.long, device=dev)
+    ar4c = torch.arange(4, device=dev)
+
+    def mtp_chain():
+        h = mtp_h_buf
+        tok = chain_in[0]
+        tok_out[0].copy_(tok)
+        for j in range(4):
+            e = emb_rows(tok.view(1)).view(1, 1, H)
+            lg, h = mtp.forward2(e, h, mtp_pos_buf)
+            p = lg[:, -1].argmax()
+            if j < 3:
+                nxt = torch.where(ar4c[j + 1] < pend_len[0],
+                                  chain_in[j + 1], p)
+                tok_out[j + 1].copy_(nxt)
+                tok = nxt
+        return tok_out
+
     s_m = torch.cuda.Stream()
     s_m.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s_m):
         for _ in range(3):
-            mtp(mtp_emb_buf, mtp_h_buf, mtp_pos_buf)
+            mtp_chain()
     torch.cuda.current_stream().wait_stream(s_m)
-    g_mtp = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g_mtp, pool=pool):
-        mtp_logits_s = mtp(mtp_emb_buf, mtp_h_buf, mtp_pos_buf)
-    print('g_mtp captured', flush=True)
+    g_mtp4 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g_mtp4, pool=pool):
+        mtp_chain()
+    print('g_mtp4 captured', flush=True)
 
-    def mtp_draft(t1_tok, h_last_t):
-        mtp_emb_buf.copy_(embed1(t1_tok))
-        mtp_h_buf.copy_(h_last_t)
-        mtp_pos_buf.fill_(0)  # pos value doesn't matter for no-cache attn
-        g_mtp.replay()
-        return mtp_logits_s[:, -1].argmax().item()
+    # ---- buffers + merged graph bodies ----
+    pin_t = torch.zeros(1, dtype=torch.long, pin_memory=True)
+    t_gpu = torch.zeros(1, dtype=torch.long, device=dev)
+    ar4 = torch.arange(4, device=dev)
+
+    # chainprep: MTP chain -> tok_out, then fill emb4/cos4/sin4/pos4
+    # (pinned->device async copy, capture-safe) + fast_snap. One replay.
+    def chainprep_fn():
+        mtp_chain()
+        t_gpu.copy_(pin_t, non_blocking=True)
+        idx = t_gpu + ar4
+        emb4.copy_(emb_rows(tok_out).view(1, 4, H))
+        cos4.copy_(torch.index_select(cos_all, 0, idx).view(1, 4, -1))
+        sin4.copy_(torch.index_select(sin_all, 0, idx).view(1, 4, -1))
+        pos4.copy_(idx)
+        torch._foreach_copy_(_srcs, _dsts)                     # fast_snap
+
+    # decisions: L = accepted prefix length (1..4); known-prefix
+    # positions auto-match (deterministic re-verification).
+    def dec_fn():
+        a0 = out_l4[0, 0].argmax()
+        a1 = out_l4[0, 1].argmax()
+        a2 = out_l4[0, 2].argmax()
+        a3 = out_l4[0, 3].argmax()
+        m1 = a0 == tok_out[1]
+        m2 = (a1 == tok_out[2]) & m1
+        m3 = (a2 == tok_out[3]) & m2
+        L = 1 + m1.to(torch.long) + m2.to(torch.long) + m3.to(torch.long)
+        dec_gpu[0] = L
+        dec_gpu[1] = tok_out[0]
+        dec_gpu[2] = tok_out[1]
+        dec_gpu[3] = tok_out[2]
+        dec_gpu[4] = tok_out[3]
+        a_buf[0].copy_(a0)
+        a_buf[1].copy_(a1)
+        a_buf[2].copy_(a2)
+        a_buf[3].copy_(a3)
+
+    # g4dec: T=4 verify forward -> static outputs -> decisions.
+    def g4dec_fn():
+        h4_s, log4_s = run(emb4, cos4, sin4, pos4)
+        out_h4.copy_(h4_s)
+        out_l4.copy_(log4_s)
+        dec_fn()
+
+    print('capturing g_chainprep/g4dec...', flush=True)
+    s_p = torch.cuda.Stream()
+    s_p.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s_p):
+        for _ in range(3):
+            chainprep_fn()
+            g4dec_fn()
+    torch.cuda.current_stream().wait_stream(s_p)
+    g_chainprep = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g_chainprep, pool=pool):
+        chainprep_fn()
+    g4dec = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g4dec, pool=pool):
+        g4dec_fn()
+    print('g_chainprep/g4dec captured', flush=True)
+
+    # ---- per-graph GPU cost (20 reps, one sync) ----
+    if os.environ.get('IXGRAPHTIME'):
+        for gname, gg in [('g_mtp4', g_mtp4), ('g_chainprep', g_chainprep),
+                          ('g4dec', g4dec), ('g4', g4), ('g2', g2),
+                          ('g1', g1)]:
+            gg.replay(); torch.cuda.synchronize()
+            t0g = time.time()
+            for _ in range(20):
+                gg.replay()
+            torch.cuda.synchronize()
+            print(f'  [graphtime] {gname}: '
+                  f'{(time.time() - t0g) / 20 * 1e3:.1f}ms', flush=True)
 
     # ================= state-diff bisect: g1+g1 vs g2 ===============
     prompt0 = 'The theory of relativity states that'
@@ -747,9 +899,9 @@ def main():
     full_restore(base)
     emb2[:, 0].copy_(embed1(tokA[0]).view(1, H))
     emb2[:, 1].copy_(embed1(tokA[1]).view(1, H))
-    cos2[:, 0].copy_(cos_all[tA].view(1, -1))
+    cos2[:, 0].copy_(cos_all[tA])
     cos2[:, 1].copy_(cos_all[tA + 1].view(1, -1))
-    sin2[:, 0].copy_(sin_all[tA].view(1, -1))
+    sin2[:, 0].copy_(sin_all[tA])
     sin2[:, 1].copy_(sin_all[tA + 1].view(1, -1))
     pos2[0] = tA; pos2[1] = tA + 1
     run(emb2, cos2, sin2, pos2)
@@ -783,9 +935,9 @@ def main():
     full_restore(base)
     emb2[:, 0].copy_(embed1(tokA[0]).view(1, H))
     emb2[:, 1].copy_(embed1(tokA[1]).view(1, H))
-    cos2[:, 0].copy_(cos_all[tA].view(1, -1))
+    cos2[:, 0].copy_(cos_all[tA])
     cos2[:, 1].copy_(cos_all[tA + 1].view(1, -1))
-    sin2[:, 0].copy_(sin_all[tA].view(1, -1))
+    sin2[:, 0].copy_(sin_all[tA])
     sin2[:, 1].copy_(sin_all[tA + 1].view(1, -1))
     pos2[0] = tA; pos2[1] = tA + 1
     run(emb2, cos2, sin2, pos2)     # T2 (one q_len=2 at layer 3)
@@ -827,9 +979,9 @@ def main():
     full_restore(base)
     emb2[:, 0].copy_(embed1(tokA[0]).view(1, H))
     emb2[:, 1].copy_(embed1(tokA[1]).view(1, H))
-    cos2[:, 0].copy_(cos_all[tA].view(1, -1))
+    cos2[:, 0].copy_(cos_all[tA])
     cos2[:, 1].copy_(cos_all[tA + 1].view(1, -1))
-    sin2[:, 0].copy_(sin_all[tA].view(1, -1))
+    sin2[:, 0].copy_(sin_all[tA])
     sin2[:, 1].copy_(sin_all[tA + 1].view(1, -1))
     pos2[0] = tA; pos2[1] = tA + 1
     g2.replay()
@@ -877,9 +1029,9 @@ def main():
     full_restore(base)
     emb2[:, 0].copy_(embed1(tokA[0]).view(1, H))
     emb2[:, 1].copy_(embed1(tokA[1]).view(1, H))
-    cos2[:, 0].copy_(cos_all[tA].view(1, -1))
+    cos2[:, 0].copy_(cos_all[tA])
     cos2[:, 1].copy_(cos_all[tA + 1].view(1, -1))
-    sin2[:, 0].copy_(sin_all[tA].view(1, -1))
+    sin2[:, 0].copy_(sin_all[tA])
     sin2[:, 1].copy_(sin_all[tA + 1].view(1, -1))
     pos2[0] = tA; pos2[1] = tA + 1
     run(emb2, cos2, sin2, pos2)
@@ -911,9 +1063,7 @@ def main():
             h_last, logits_last = run(emb1, cos1, sin1, pos1)
         h_last, logits_last = h_last.clone(), logits_last.clone()
 
-        # graph-numerics reference (g1 replays): the eager path and captured
-        # graphs differ on near-tie argmaxes (round3 finding), so the loop
-        # must be validated against ITS OWN numerics
+        # reference (sequential g1 greedy) for advisory fork check
         ref = []
         t = len(ids)
         for _ in range(6):
@@ -937,62 +1087,69 @@ def main():
             h_last, logits_last = run(emb1, cos1, sin1, pos1)
         h_last, logits_last = h_last.clone(), logits_last.clone()
 
+        # ---- queue-architecture spec loop: ONE sync, ZERO replays ----
+        # Every iteration: 4-step MTP chain (known-prefix advance +
+        # drafts) -> T=4 verify -> decisions. Partial accepts roll back
+        # and RE-QUEUE the accepted prefix as the next block's known
+        # tokens (auto-reverified) — no prefix-recompute replays.
+        dec_pin = torch.zeros(6, dtype=torch.long, device='cpu',
+                              pin_memory=True)
+        chain_in[0] = int(logits_last[:, -1].argmax().item())
+        pend_len[0] = 1
+        pend_cpu = 1                  # known-prefix length incl. root
+        mtp_h_buf.copy_(h_last)
+
         gen = []
-        n_acc = n_rej = n_mtp = 0
-        # timing breakdown
-        t_draft = t_snap = t_verify = t_rb = t_all = 0.0
+        n_iter = 0
+        acc_hist = [0, 0, 0, 0]        # committed-tokens-per-iter (1..4)
+        t_draft = t_verify = t_commit = 0.0
         t = len(ids)
         t0 = time.time()
-        while len(gen) < N and t < MAX_CTX - 4:
+        while len(gen) < N and t < MAX_CTX - 6:
+            # -- 1. chain + prep fills + snap (ONE replay) --
             _t0 = time.time()
-            t1 = logits_last[:, -1].argmax().item()
-            d = mtp_draft(t1, h_last)
-            n_mtp += 1
+            pin_t[0] = t
+            g_chainprep.replay()       # -> tok_out, emb4/cos4/sin4/pos4
             _t1 = time.time(); t_draft += _t1 - _t0
 
-            fast_snap()
-            _t2 = time.time(); t_snap += _t2 - _t1
-            # v5: single T=2 batched verify — [t1 @ t, d @ t+1]
-            emb2[:, 0].copy_(embed1(t1).view(1, H))
-            emb2[:, 1].copy_(embed1(d).view(1, H))
-            torch._foreach_copy_(
-                [cos2[:, 0], sin2[:, 0], cos2[:, 1], sin2[:, 1]],
-                [cos_all[t].view(1, -1), sin_all[t].view(1, -1),
-                 cos_all[t + 1].view(1, -1), sin_all[t + 1].view(1, -1)])
-            pos2[0] = t
-            pos2[1] = t + 1
-            g2.replay()
-            _t3 = time.time(); t_verify += _t3 - _t2
-            t2 = log2_s[:, 0].argmax().item()
-            if len(gen) < 4:
-                print(f'    it{len(gen)}: t1={t1} d={d} t2={t2} '
-                      f'log20_max={log2_s[:, 0].float().abs().max():.1f} '
-                      f'log21_max={log2_s[:, 1].float().abs().max():.1f} '
-                      f'{"ACC" if t2 == d else "REJ"}', flush=True)
+            # -- 2. T=4 verify + decisions (ONE replay) + THE sync --
+            g4dec.replay()             # -> dec_gpu, a_buf, out_h4/out_l4
+            dec_pin.copy_(dec_gpu, non_blocking=True)
+            torch.cuda.synchronize()   # THE sync
+            _t2 = time.time(); t_verify += _t2 - _t1
+            L = int(dec_pin[0])
+            tv = [int(dec_pin[1]), int(dec_pin[2]),
+                  int(dec_pin[3]), int(dec_pin[4])]
+            if len(gen) < 6:
+                print(f'    it{n_iter}: block={tv} L={L}', flush=True)
 
-            if t2 == d:
-                gen.extend([t1, d])
-                h_last = h2_s[:, 1:2]                # hidden after d
-                logits_last = log2_s[:, 1:2]         # logits after d
-                t += 2
-                n_acc += 1
-                if d == tok.eos_token_id:
-                    break
+            # -- 3. commit ONLY newly-processed tokens; queue setup --
+            # block = [known prefix (pend_cpu-1, already committed),
+            #          root + drafts (new)]. L >= pend_cpu always
+            # (known positions auto-match).
+            committed = tv[pend_cpu - 1: L]
+            gen.extend(committed)
+            acc_hist[len(committed) - 1] += 1
+            n_iter += 1
+            t += L
+            # next chain: known prefix = this block's accepted tokens +
+            # the new root a_{L-1} (all GPU-resident)
+            if L == 4:
+                chain_in[0].copy_(a_buf[3])
+                pend_len[0] = 1
+                pend_cpu = 1
+                mtp_h_buf.copy_(out_h4[:, 3:4])
             else:
-                fast_rollback()
-                emb1.copy_(embed1(t1))
-                cos1.copy_(cos_all[t].view(1, 1, -1))
-                sin1.copy_(sin_all[t].view(1, 1, -1))
-                pos1.fill_(t)
-                g1.replay()
-                gen.append(t1)
-                h_last = h1_s
-                logits_last = log1_s
-                t += 1
-                n_rej += 1
-                if t1 == tok.eos_token_id:
-                    break
-            t_rb += time.time() - _t3
+                fast_rollback()        # GDN/cum state -> pre-block
+                chain_in[:L].copy_(tok_out[:L])
+                chain_in[L].copy_(a_buf[L - 1])
+                pend_len[0] = L + 1
+                pend_cpu = L + 1
+                # mtp_h_buf untouched: it still holds the pre-block h
+                # (the chain reads it, nothing writes it) = correct seed
+            t_commit += time.time() - _t2
+            if tok.eos_token_id in committed:
+                break
         torch.cuda.synchronize()
         dt = time.time() - t0
         # divergence check
@@ -1000,24 +1157,52 @@ def main():
         if gen[:k] != ref[:k]:
             fork = next(i for i in range(k) if gen[i] != ref[i])
             print(f'  [note] trajectory fork at token {fork} '
-                  f'(near-tie numerics: g2-GEMM vs g1-GEMV)', flush=True)
-        n_iter = n_acc + n_rej
-        print(f'  [timing] iter={n_iter} draft={t_draft/n_iter*1000:.1f}ms '
-              f'snap={t_snap/n_iter*1000:.1f}ms verify={t_verify/n_iter*1000:.1f}ms '
-              f'commit+rb={t_rb/n_iter*1000:.1f}ms(avg) '
-              f'rb_per_rej={t_rb/max(n_rej,1)*1000:.1f}ms '
+                  f'(near-tie argmax on draft path)', flush=True)
+        tokavg = sum((i + 1) * h for i, h in enumerate(acc_hist)) / n_iter
+        print(f'  [timing] iter={n_iter} tok/iter={tokavg:.2f} '
+              f'hist={acc_hist} draft={t_draft/n_iter*1000:.1f}ms '
+              f'verify+sync={t_verify/n_iter*1000:.1f}ms '
+              f'commit={t_commit/n_iter*1000:.1f}ms '
               f'total={dt/n_iter*1000:.1f}ms/iter', flush=True)
-        return gen, dt, (n_acc, n_rej, n_mtp)
+        return gen, dt, (n_iter, acc_hist)
 
     for prompt in ['The theory of relativity states that',
                    'def quick_sort(arr):',
-                   '北京最值得游览的三个景点是']:
+                   '鍖椾含鏈€鍊煎緱娓歌鐨勪笁涓櫙鐐规槸']:
         hard_reset()
-        gen, dt, (a, r, mt) = spec_gen(prompt)
+        gen, dt, (ni, hist) = spec_gen(prompt)
         txt = tok.decode(gen)
         print(f'\n[{len(gen)/dt:.2f} tok/s] {prompt!r} '
-              f'(acc {a} rej {r} | mtp drafts {mt})\n'
+              f'(iters {ni}, hist {hist})\n'
               f'  -> {txt[:130]!r}', flush=True)
+
+    # ---- pure pipeline benchmark: 4 replays + 1 sync, no branching ----
+    hard_reset()
+    ids_b = tok('Hello world, this is a benchmark prompt for timing.',
+                return_tensors='pt')['input_ids'][0].tolist()
+    for i, tid in enumerate(ids_b):
+        emb1.copy_(embed1(tid))
+        cos1.copy_(cos_all[i].view(1, 1, -1))
+        sin1.copy_(sin_all[i].view(1, 1, -1))
+        pos1.fill_(i)
+        run(emb1, cos1, sin1, pos1)
+    mtp_h_buf.copy_(out_h1)
+    chain_in[0] = 12345
+    tb = len(ids_b)
+    dec_pin_b = torch.zeros(6, dtype=torch.long, pin_memory=True)
+    chain_in[0] = 12345
+    pend_len[0] = 1
+    torch.cuda.synchronize()
+    t0b = time.time()
+    for _ in range(40):
+        pin_t[0] = tb
+        g_chainprep.replay()
+        g4dec.replay()
+        dec_pin_b.copy_(dec_gpu, non_blocking=True)
+        torch.cuda.synchronize()
+    dtb = (time.time() - t0b) / 40 * 1e3
+    print(f'\n[pipe-bench] 4 replays + sync = {dtb:.1f}ms/iter '
+          f'(no branching, no prefix replays)', flush=True)
 
     print(f'\npeak GPU = {torch.cuda.max_memory_allocated()/1e9:.2f}GB', flush=True)
 
