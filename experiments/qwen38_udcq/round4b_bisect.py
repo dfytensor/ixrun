@@ -454,8 +454,59 @@ def main():
                 if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
                     a.copy_(b)
 
+    # ---- fast snap/rollback: flatten + torch._foreach_copy_ (1 launch) ----
+    _dsts, _srcs = [], []
+
+    def _collect():
+        dsts, srcs = [], []
+        for l in cache.layers:
+            for c in getattr(l, 'conv_states', []) or []:
+                if isinstance(c, torch.Tensor):
+                    dsts.append(c)
+                    srcs.append(torch.empty_like(c))
+            for r in getattr(l, 'recurrent_states', []) or []:
+                if isinstance(r, torch.Tensor):
+                    dsts.append(r)
+                    srcs.append(torch.empty_like(r))
+            cum = getattr(l, 'cumulative_length', None)
+            if cum is not None:
+                dsts.append(cum)
+                srcs.append(torch.empty_like(cum))
+        return dsts, srcs
+
+    _dsts, _srcs = _collect()
+
+    def fast_snap():
+        torch._foreach_copy_(_srcs, _dsts)
+
+    def fast_rollback():
+        torch._foreach_copy_(_dsts, _srcs)
+
     mtp = load_mtp(m)
     print('mtp head loaded (with layer, orig attn)', flush=True)
+
+    # ---- capture g_mtp: MTP head in a graph (kills the ~50ms eager cost) ----
+    print('capturing g_mtp...', flush=True)
+    mtp_emb_buf = torch.zeros(1, 1, H, dtype=torch.bfloat16, device=dev)
+    mtp_h_buf = torch.zeros(1, 1, H, dtype=torch.bfloat16, device=dev)
+    mtp_pos_buf = torch.zeros(1, 1, dtype=torch.long, device=dev)
+    s_m = torch.cuda.Stream()
+    s_m.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s_m):
+        for _ in range(3):
+            mtp(mtp_emb_buf, mtp_h_buf, mtp_pos_buf)
+    torch.cuda.current_stream().wait_stream(s_m)
+    g_mtp = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g_mtp, pool=pool):
+        mtp_logits_s = mtp(mtp_emb_buf, mtp_h_buf, mtp_pos_buf)
+    print('g_mtp captured', flush=True)
+
+    def mtp_draft(t1_tok, h_last_t):
+        mtp_emb_buf.copy_(embed1(t1_tok))
+        mtp_h_buf.copy_(h_last_t)
+        mtp_pos_buf.fill_(0)  # pos value doesn't matter for no-cache attn
+        g_mtp.replay()
+        return mtp_logits_s[:, -1].argmax().item()
 
     # ================= state-diff bisect: g1+g1 vs g2 ===============
     prompt0 = 'The theory of relativity states that'
@@ -620,29 +671,14 @@ def main():
             bigram[(ids[i - 2], ids[i - 1])].append(ids[i])
 
         gen = []
-        # reference: pure g1 decode for the first 6 (from probe)
-        print('  [dbg] first 6 loop tokens:', flush=True)
         n_acc = n_rej = n_ng = n_mtp = 0
+        # timing breakdown
+        t_draft = t_snap = t_verify = t_rb = t_all = 0.0
         t = len(ids)
         t0 = time.time()
-        PURE_G2 = len(sys.argv) > 1 and sys.argv[1] == 'g2only'
         while len(gen) < N and t < MAX_CTX - 4:
+            _t0 = time.time()
             t1 = logits_last[:, -1].argmax().item()
-            if PURE_G2:
-                # diagnostic: state advanced ONLY by g2 ([t1, t1]), logits
-                # from slot 0; no rollback, no g1
-                emb2[:, 0].copy_(embed1(t1).view(1, H))
-                emb2[:, 1].copy_(embed1(t1).view(1, H))
-                cos2[:, 0].copy_(cos_all[t].view(1, -1))
-                cos2[:, 1].copy_(cos_all[t + 1].view(1, -1))
-                sin2[:, 0].copy_(sin_all[t].view(1, -1))
-                sin2[:, 1].copy_(sin_all[t + 1].view(1, -1))
-                pos2[0] = t; pos2[1] = t + 1
-                g2.replay()
-                gen.append(t1)
-                logits_last = log2a_buf.clone()
-                t += 1
-                continue
             hist = (ids + gen)[-2:]
             d = None
             cand = bigram.get(tuple(hist))
@@ -650,24 +686,13 @@ def main():
                 d = cand[-1]
                 n_ng += 1
             if d is None:
-                pos_d = torch.tensor([[t + 1]], device=dev)
-                d = mtp(embed1(t1), h_last, pos_d)[:, -1].argmax().item()
+                d = mtp_draft(t1, h_last)
                 n_mtp += 1
+            _t1 = time.time(); t_draft += _t1 - _t0
 
-            # ORACLE DRAFT: peek the true next token via g1 to isolate the
-            # accept path (100% accept expected). If text degenerates here
-            # -> accept bug; if clean -> reject bug.
-            snap = snap_light()
-            emb1.copy_(embed1(t1))
-            cos1.copy_(cos_all[t].view(1, 1, -1))
-            sin1.copy_(sin_all[t].view(1, 1, -1))
-            pos1.fill_(t)
-            g1.replay()
-            d = log1_s[:, -1].argmax().item()  # true successor of t1
-            n_mtp += 1
-            # restore the g1's state change (we just peeked)
-            roll_back(snap)
-            # now set up g2: pass A = t1 at [t], pass B = d at [t+1]
+            fast_snap()
+            _t2 = time.time(); t_snap += _t2 - _t1
+            # v4b: pass A = t1 at [t] (embA buffer), pass B = d at [t+1] (emb1)
             embA.copy_(embed1(t1))
             cosA.copy_(cos_all[t].view(1, 1, -1))
             sinA.copy_(sin_all[t].view(1, -1).view(1, 1, -1))
@@ -677,8 +702,10 @@ def main():
             sin1.copy_(sin_all[t + 1].view(1, 1, -1))
             pos1.fill_(t + 1)
             g2.replay()
-            torch.cuda.synchronize()
+            _t3 = time.time(); t_verify += _t3 - _t2
             t2 = log2a_buf[:, -1].argmax().item()
+            if len(gen) < 4:
+                pass  # debug print removed for speed
             if len(gen) < 4:
                 print(f'    it{len(gen)}: t1={t1} d={d} t2={t2} '
                       f'log2a_max={log2a_buf.float().abs().max():.1f} '
@@ -695,7 +722,7 @@ def main():
                 if d == tok.eos_token_id:
                     break
             else:
-                roll_back(snap)
+                fast_rollback()
                 emb1.copy_(embed1(t1))
                 cos1.copy_(cos_all[t].view(1, 1, -1))
                 sin1.copy_(sin_all[t].view(1, 1, -1))
@@ -708,17 +735,21 @@ def main():
                 n_rej += 1
                 if t1 == tok.eos_token_id:
                     break
+            t_rb += time.time() - _t3
         torch.cuda.synchronize()
         dt = time.time() - t0
-        # divergence check: g2 (M=2 GEMM numerics) vs g1 (GEMV numerics)
-        # disagree on near-tie argmaxes — trajectories may legitimately fork
-        # at such tokens (both are valid model generations). Coherence of the
-        # TEXT is the real correctness bar; the ref comparison is advisory.
+        # divergence check
         k = min(6, len(gen))
         if gen[:k] != ref[:k]:
             fork = next(i for i in range(k) if gen[i] != ref[i])
             print(f'  [note] trajectory fork at token {fork} '
                   f'(near-tie numerics: g2-GEMM vs g1-GEMV)', flush=True)
+        n_iter = n_acc + n_rej
+        print(f'  [timing] iter={n_iter} draft={t_draft/n_iter*1000:.1f}ms '
+              f'snap={t_snap/n_iter*1000:.1f}ms verify={t_verify/n_iter*1000:.1f}ms '
+              f'commit+rb={t_rb/n_iter*1000:.1f}ms(avg) '
+              f'rb_per_rej={t_rb/max(n_rej,1)*1000:.1f}ms '
+              f'total={dt/n_iter*1000:.1f}ms/iter', flush=True)
         return gen, dt, (n_acc, n_rej, n_ng, n_mtp)
 
     for prompt in ['The theory of relativity states that',
