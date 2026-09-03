@@ -114,8 +114,12 @@ def apply_gdn_sequential_patch(verbose: bool = False) -> bool:
                      * F.softplus(a.float() + self.dt_bias))
             outs = []
             for t in range(seq_len):
+                # NOTE: slices of [B,dim,S] are STRIDED VIEWS — fla kernels
+                # index by raw pointers and silently read wrong memory on
+                # non-contiguous input. .contiguous() is REQUIRED (this
+                # exact bug cost a full session of debugging).
                 qkv_t = conv_update(
-                    mixed_qkv[:, :, t:t + 1], conv_state,
+                    mixed_qkv[:, :, t:t + 1].contiguous(), conv_state,
                     self.conv1d.weight.squeeze(1), self.conv1d.bias,
                     self.activation,
                 ).transpose(1, 2)                 # [B,1,dim]
@@ -131,9 +135,9 @@ def apply_gdn_sequential_patch(verbose: bool = False) -> bool:
                     k_t = k_t.repeat_interleave(
                         self.num_v_heads // self.num_k_heads, dim=2)
                 o_t, state = recurrent(
-                    q_t, k_t, v_t,
-                    g=g_all[:, t:t + 1],
-                    beta=beta_all[:, t:t + 1],
+                    q_t.contiguous(), k_t.contiguous(), v_t.contiguous(),
+                    g=g_all[:, t:t + 1].contiguous(),
+                    beta=beta_all[:, t:t + 1].contiguous(),
                     initial_state=state,
                     output_final_state=True,
                     use_qk_l2norm_in_kernel=True,

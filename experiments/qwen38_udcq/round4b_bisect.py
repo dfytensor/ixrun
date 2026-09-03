@@ -21,6 +21,8 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 
 from ixrun.fla_patch import apply_fla_kernels
 apply_fla_kernels()
+from ixrun.gdn_seq_patch import apply_gdn_sequential_patch
+apply_gdn_sequential_patch()   # exact per-token conv+delta for seeded S<=8
 
 MAX_CTX = 256
 BLOB = r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt'
@@ -28,6 +30,9 @@ BLOB = r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt'
 # save the ORIGINAL attention forward BEFORE patching (MTP head layer needs
 # the past_key_values=None path)
 _ORIG_ATTN_FWD = Qwen3_5Attention.forward
+
+
+_DBG = {}
 
 
 def _attn_forward_static(self, hidden_states, position_embeddings,
@@ -40,18 +45,27 @@ def _attn_forward_static(self, hidden_states, position_embeddings,
     hidden_shape = (*input_shape, -1, self.head_dim)
     q_len = hidden_states.shape[1]
 
+    qproj_out = self.q_proj(hidden_states)
+    if _DBG.get('on') and self.layer_idx == _DBG.get('layer', 3):
+        _DBG.setdefault('qproj', []).append(qproj_out.detach().clone())
     query_states, gate = torch.chunk(
-        self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2),
+        qproj_out.view(*input_shape, -1, self.head_dim * 2),
         2, dim=-1)
     gate = gate.reshape(*input_shape, -1)
     query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    kpre = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = apply_rotary_pos_emb(query_states, kpre, cos, sin)
+    if _DBG.get('on') and self.layer_idx == _DBG.get('layer', 3):
+        _DBG.setdefault('kpost_rope', []).append(key_states.detach().clone())
+        _DBG.setdefault('qpost_rope', []).append(query_states.detach().clone())
 
     k_full, v_full = past_key_values.update(key_states, value_states, self.layer_idx)
+    if _DBG.get('on') and self.layer_idx == _DBG.get('layer', 3):
+        _DBG.setdefault('kv_after_update', []).append(
+            k_full.detach().clone())
 
     cum = past_key_values.layers[self.layer_idx].cumulative_length
     MAX = k_full.shape[-2]
@@ -65,12 +79,36 @@ def _attn_forward_static(self, hidden_states, position_embeddings,
     if n_rep > 1:
         k_full = k_full.repeat_interleave(n_rep, dim=1)
         v_full = v_full.repeat_interleave(n_rep, dim=1)
-    attn_output = F.scaled_dot_product_attention(
-        query_states, k_full, v_full, attn_mask=mask, scale=self.scaling)
+    if q_len > 1:
+        # per-token SDPA: exact same kernel sequence as sequential q_len=1
+        # calls (a batched q_len=2 SDPA picks a different backend/reduction
+        # -> layer-3 divergence dmax 6.0). Projections stay batched (exact).
+        outs = []
+        for t in range(q_len):
+            outs.append(F.scaled_dot_product_attention(
+                query_states[:, :, t:t + 1], k_full, v_full,
+                attn_mask=mask[:, :, t:t + 1], scale=self.scaling))
+        attn_output = torch.cat(outs, dim=2)
+    else:
+        attn_output = F.scaled_dot_product_attention(
+            query_states, k_full, v_full, attn_mask=mask, scale=self.scaling)
+    if _DBG.get('on') and self.layer_idx == _DBG.get('layer', 3):
+        _DBG.setdefault('attn_out', []).append(attn_output.detach().clone())
 
+    if q_len > 1:
+        # [B, heads, S, D] -> [B, S, heads*D]: transpose is REQUIRED before
+        # the flatten — without it head/token dims interleave (q_len=1 was
+        # accidentally fine because S=1; S=2 produced garbled layout ->
+        # layer divergence dmax 6.0)
+        attn_output = attn_output.transpose(1, 2)
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = attn_output * torch.sigmoid(gate)
-    return self.o_proj(attn_output), None
+    if _DBG.get('on') and self.layer_idx == _DBG.get('layer', 3):
+        _DBG.setdefault('gated', []).append(attn_output.detach().clone())
+    out = self.o_proj(attn_output)
+    if _DBG.get('on') and self.layer_idx == _DBG.get('layer', 3):
+        _DBG.setdefault('oproj_out', []).append(out.detach().clone())
+    return out, None
 
 
 Qwen3_5Attention.forward = _attn_forward_static
@@ -301,10 +339,10 @@ def main():
                         hps[k] = False
                 else:
                     lay.has_previous_state = [False] * len(hps)
-            for cs in getattr(lay, 'conv_states', []) or []:
+            for cs in (getattr(lay, 'conv_states', None) or {}).values():
                 if isinstance(cs, torch.Tensor):
                     cs.zero_()
-            for rs in getattr(lay, 'recurrent_states', []) or []:
+            for rs in (getattr(lay, 'recurrent_states', None) or {}).values():
                 if isinstance(rs, torch.Tensor):
                     rs.zero_()
 
@@ -324,22 +362,14 @@ def main():
     pool = torch.cuda.graph_pool_handle()   # BOTH graphs share one pool —
     with torch.cuda.graph(g1, pool=pool):   # separate pools alias corrupt g1
         h1_s, log1_s = run(emb1, cos1, sin1, pos1)
-    # v4b: g2 = two M=1 passes with SEPARATE input buffers (pass1 must not
-    # be clobbered by pass2 setup). log2a copied to a dedicated output so
-    # pass2's allocations can't alias it.
-    embA = torch.zeros(1, 1, H, dtype=torch.bfloat16, device=dev)
-    cosA = torch.zeros(1, 1, cos_all.shape[-1], dtype=cos_all.dtype, device=dev)
-    sinA = torch.zeros_like(cosA)
-    posA = torch.zeros(1, dtype=torch.long, device=dev)
-    log2a_buf = torch.zeros(1, 1, m.lm_head.out_features,
-                             dtype=torch.bfloat16, device=dev)
+    # v5: g2 = TRUE T=2 layer-wise batch (single forward on emb2 buffers).
+    # Exact by construction: projections via multi-token GEMV (bit-exact
+    # vs sequential M=1), GDN core per-token via gdn_seq_patch v3,
+    # attention q_len=2 causal over static cache. log2_s[:, 0] = verify
+    # logits (after t1), log2_s[:, 1] = continuation (after d).
     g2 = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g2, pool=pool):
-        _, log2a_raw = run(embA, cosA, sinA, posA)     # pass 1 at [t] M=1
-        log2a_buf.copy_(log2a_raw)                      # save pass-1 logits
-        h2_s, log2b_s = run(emb1, cos1, sin1, pos1)     # pass 2 at [t+1] M=1
-    # NOTE: log2_s must be computed AFTER each replay (cat of live buffers);
-    # helper below reads the buffers directly
+        h2_s, log2_s = run(emb2, cos2, sin2, pos2)
     hard_reset()
     print('graphs ok', flush=True)
 
@@ -431,14 +461,52 @@ def main():
           f'tok1 max {dB:.4f}', flush=True)
     hard_reset()
 
+    # ---- SEEDED la A/B: v3 spec-block (S=2) vs sequential S=1 x2 ----
+    torch.manual_seed(7)
+    hseed = torch.randn(1, 1, H, dtype=torch.bfloat16, device=dev) * 0.1
+
+    def la_seeded(h1, h2):
+        # sequential
+        hard_reset()
+        l0.linear_attn(hseed, cache_params=cache, attention_mask=None,
+                       position_ids=None)          # prefill -> seeds state
+        o1 = l0.linear_attn(h1, cache_params=cache, attention_mask=None,
+                            position_ids=None)
+        o2 = l0.linear_attn(h2, cache_params=cache, attention_mask=None,
+                            position_ids=None)
+        lay = cache.layers[0]
+        seq = (lay.conv_states[0].clone(), lay.recurrent_states[0].clone())
+        # block (seeded -> v3 spec-block path)
+        hard_reset()
+        l0.linear_attn(hseed, cache_params=cache, attention_mask=None,
+                       position_ids=None)
+        ob = l0.linear_attn(torch.cat([h1, h2], dim=1), cache_params=cache,
+                            attention_mask=None, position_ids=None)
+        blk = (lay.conv_states[0].clone(), lay.recurrent_states[0].clone())
+        return torch.cat([o1, o2], 1), ob, seq, blk
+
+    oseq2, oblk2, seqS, blkS = la_seeded(hh1, hh2)
+    d0 = (oseq2[0, 0].float() - oblk2[0, 0].float()).abs().max().item()
+    d1 = (oseq2[0, 1].float() - oblk2[0, 1].float()).abs().max().item()
+    dc = (seqS[0].float() - blkS[0].float()).abs().max().item()
+    dr = (seqS[1].float() - blkS[1].float()).abs().max().item()
+    print(f'[la seeded A/B] out tok0 {d0:.6f} tok1 {d1:.6f} | '
+          f'conv dmax {dc:.6f} rec dmax {dr:.6f} | '
+          f'|rec| mean {seqS[1].float().abs().mean().item():.5f}', flush=True)
+    hard_reset()
+
 
 
     # =================== full speculative loop ===================
+    # NOTE: conv_states/recurrent_states are DICTS {state_idx: tensor} —
+    # iterating the object yields INT KEYS, not tensors. All snapshot/
+    # restore/collect code MUST iterate .values() (this exact bug silently
+    # disabled GDN rollback = the accept-path corruption root cause).
     def snap_light():
         return [([c.clone() if isinstance(c, torch.Tensor) else c
-                  for c in getattr(l, 'conv_states', []) or []],
+                  for c in (getattr(l, 'conv_states', None) or {}).values()],
                  [r.clone() if isinstance(r, torch.Tensor) else r
-                  for r in getattr(l, 'recurrent_states', []) or []],
+                  for r in (getattr(l, 'recurrent_states', None) or {}).values()],
                  l.cumulative_length.clone()
                  if getattr(l, 'cumulative_length', None) is not None else None)
                 for l in cache.layers]
@@ -447,10 +515,10 @@ def main():
         for l, (cs, rs, cum) in zip(cache.layers, snap):
             if cum is not None:
                 l.cumulative_length.copy_(cum)
-            for a, b in zip(getattr(l, 'conv_states', []) or [], cs):
+            for a, b in zip((getattr(l, 'conv_states', None) or {}).values(), cs):
                 if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
                     a.copy_(b)
-            for a, b in zip(getattr(l, 'recurrent_states', []) or [], rs):
+            for a, b in zip((getattr(l, 'recurrent_states', None) or {}).values(), rs):
                 if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
                     a.copy_(b)
 
@@ -460,11 +528,11 @@ def main():
     def _collect():
         dsts, srcs = [], []
         for l in cache.layers:
-            for c in getattr(l, 'conv_states', []) or []:
+            for c in (getattr(l, 'conv_states', None) or {}).values():
                 if isinstance(c, torch.Tensor):
                     dsts.append(c)
                     srcs.append(torch.empty_like(c))
-            for r in getattr(l, 'recurrent_states', []) or []:
+            for r in (getattr(l, 'recurrent_states', None) or {}).values():
                 if isinstance(r, torch.Tensor):
                     dsts.append(r)
                     srcs.append(torch.empty_like(r))
@@ -550,6 +618,211 @@ def main():
         g1.replay()
     snapA = full_snap()
 
+    # path A2: EAGER T1 twice (isolates T2-vs-seq from graph-vs-eager)
+    full_restore(base)
+    for j, tk in enumerate(tokA):
+        emb1.copy_(embed1(tk))
+        cos1.copy_(cos_all[tA + j].view(1, 1, -1))
+        sin1.copy_(sin_all[tA + j].view(1, 1, -1))
+        pos1.fill_(tA + j)
+        run(emb1, cos1, sin1, pos1)
+    snapA2 = full_snap()
+    # self-consistency: run the SAME eager path again after restore
+    full_restore(base)
+    for j, tk in enumerate(tokA):
+        emb1.copy_(embed1(tk))
+        cos1.copy_(cos_all[tA + j].view(1, 1, -1))
+        sin1.copy_(sin_all[tA + j].view(1, 1, -1))
+        pos1.fill_(tA + j)
+        run(emb1, cos1, sin1, pos1)
+    snapA3 = full_snap()
+    n_bad_self = 0
+    dmax_self = 0.0
+    for i, (kvA, kvB) in enumerate(zip(snapA2[1], snapA3[1])):
+        if kvA is None:
+            continue
+        d = (kvA[0].float() - kvB[0].float()).abs()
+        c = int(snapA2[0][i][2].item())
+        dm = d[:, :, c - 2:c].max().item()
+        dmax_self = max(dmax_self, dm)
+        if dm > 1e-3:
+            n_bad_self += 1
+    print(f'[state-diff] SELF-CONSISTENCY eager 2xT1 (restore ok?): '
+          f'bad {n_bad_self}/16, dK max {dmax_self:.6f}', flush=True)
+
+    # ---- per-layer bisect: A2 vs A3 hidden states at every layer ----
+    caps = {}
+    hooks = []
+
+    def _mk_hook(idx):
+        def _hook(mod, inp, out):
+            o = out[0] if isinstance(out, tuple) else out
+            caps.setdefault(idx, []).append(o.detach().clone())
+        return _hook
+
+    for i, lay in enumerate(layers):
+        hooks.append(lay.register_forward_hook(_mk_hook(i)))
+
+    def _eager2():
+        full_restore(base)
+        lay0 = cache.layers[0]
+        caps.setdefault('state0', []).append(
+            (lay0.conv_states[0].clone(), lay0.recurrent_states[0].clone()))
+        for j, tk in enumerate(tokA):
+            emb1.copy_(embed1(tk))
+            cos1.copy_(cos_all[tA + j].view(1, 1, -1))
+            sin1.copy_(sin_all[tA + j].view(1, 1, -1))
+            pos1.fill_(tA + j)
+            run(emb1, cos1, sin1, pos1)
+
+    # ---- minimal isolation: restore->snap == base? twice ----
+    full_restore(base)
+    r1 = full_snap()
+    full_restore(base)
+    r2 = full_snap()
+    lay0rec_base = base[0][0][1][0]
+    print(f'[isolate dbg] type(lay0rec)={type(lay0rec_base).__name__} '
+          f'type(r1[0][0][1][0])={type(r1[0][0][1][0]).__name__}',
+          flush=True)
+    d_rb1 = (r1[0][0][1][0].float() - lay0rec_base.float()).abs().max().item()
+    d_rb2 = (r2[0][0][1][0].float() - lay0rec_base.float()).abs().max().item()
+    d_r12 = (r1[0][0][1][0].float() - r2[0][0][1][0].float()).abs().max().item()
+    print(f'[isolate] restore->snap vs base: run1 {d_rb1:.6f} run2 {d_rb2:.6f} '
+          f'| run1-vs-run2 {d_r12:.6f} '
+          f'| base |rec| mean {lay0rec_base.float().abs().mean().item():.5f}',
+          flush=True)
+    print(f'[isolate] rec[0] ptr == base-clone ptr? '
+          f'{cache.layers[0].recurrent_states[0].data_ptr() == lay0rec_base.data_ptr()}',
+          flush=True)
+
+    caps.clear()
+    _eager2()
+    cap1 = {k: list(v) for k, v in caps.items()}
+    caps.clear()
+    _eager2()
+    cap2 = {k: list(v) for k, v in caps.items()}
+    caps.clear()
+    _eager2()
+    cap3 = {k: list(v) for k, v in caps.items()}
+    for tag, ca, cb in (('run1-vs-run2', cap1, cap2), ('run2-vs-run3', cap2, cap3)):
+        s0a, s0b = ca['state0'][0], cb['state0'][0]
+        d_conv = (s0a[0].float() - s0b[0].float()).abs().max().item()
+        d_rec = (s0a[1].float() - s0b[1].float()).abs().max().item()
+        print(f'[bisect {tag}] entry-state layer0: d_conv {d_conv:.6f} '
+              f'd_rec {d_rec:.6f}', flush=True)
+        first_bad = None
+        for i in range(len(layers)):
+            for j in range(2):
+                a = ca[i][j][0, 0].float()
+                b = cb[i][j][0, 0].float()
+                dm = (a - b).abs().max().item()
+                if dm > 1e-4 and first_bad is None:
+                    first_bad = (i, j, dm)
+                    ref = a.abs().mean().item()
+                    print(f'[bisect {tag}] FIRST divergence: layer {i} '
+                          f'token {j} dmax {dm:.5f} (|h| mean {ref:.5f})',
+                          flush=True)
+        if first_bad is None:
+            print(f'[bisect {tag}] all 64 layers identical', flush=True)
+
+    # ---- T2-vs-sequential per-layer bisect (the real fork) ----
+    for h in hooks:
+        h.remove()
+    hooks2 = []
+    caps2 = {}
+
+    def _mk_hook2(idx):
+        def _hook(mod, inp, out):
+            o = out[0] if isinstance(out, tuple) else out
+            caps2.setdefault(idx, []).append(o.detach().clone())
+        return _hook
+
+    for i, lay in enumerate(layers):
+        hooks2.append(lay.register_forward_hook(_mk_hook2(i)))
+
+    caps2.clear()
+    _eager2()
+    seq_cap = {k: list(v) for k, v in caps2.items()}
+    caps2.clear()
+    full_restore(base)
+    emb2[:, 0].copy_(embed1(tokA[0]).view(1, H))
+    emb2[:, 1].copy_(embed1(tokA[1]).view(1, H))
+    cos2[:, 0].copy_(cos_all[tA].view(1, -1))
+    cos2[:, 1].copy_(cos_all[tA + 1].view(1, -1))
+    sin2[:, 0].copy_(sin_all[tA].view(1, -1))
+    sin2[:, 1].copy_(sin_all[tA + 1].view(1, -1))
+    pos2[0] = tA; pos2[1] = tA + 1
+    run(emb2, cos2, sin2, pos2)
+    t2_cap = {k: list(v) for k, v in caps2.items()}
+    first_bad = None
+    for i in range(len(layers)):
+        for j in range(2):
+            a = seq_cap[i][j][0, 0].float()
+            b = t2_cap[i][0][0, j].float()
+            dm = (a - b).abs().max().item()
+            if dm > 1e-4 and first_bad is None:
+                first_bad = (i, j, dm)
+                ref = a.abs().mean().item()
+                print(f'[T2-bisect] FIRST divergence: layer {i} ({type(layers[i]).__name__}) '
+                      f'token {j} dmax {dm:.5f} (|h| mean {ref:.5f})', flush=True)
+                for ii in range(max(0, i - 2), min(len(layers), i + 2)):
+                    a2 = seq_cap[ii][j][0, 0].float()
+                    b2 = t2_cap[ii][0][0, j].float()
+                    print(f'   layer {ii}: dmax {(a2 - b2).abs().max().item():.6f}',
+                          flush=True)
+    if first_bad is None:
+        print('[T2-bisect] all 64 layers: T2 == sequential EXACT', flush=True)
+    for h in hooks2:
+        h.remove()
+
+    # ---- op-level diff at layer 3: sequential vs T2 ----
+    _DBG.clear(); _DBG['on'] = True; _DBG['layer'] = 3
+    _eager2()                       # sequential (2x q_len=1 at layer 3)
+    dseq = {k: list(v) for k, v in _DBG.items() if k != 'on' and k != 'layer'}
+    _DBG.clear(); _DBG['on'] = True; _DBG['layer'] = 3
+    full_restore(base)
+    emb2[:, 0].copy_(embed1(tokA[0]).view(1, H))
+    emb2[:, 1].copy_(embed1(tokA[1]).view(1, H))
+    cos2[:, 0].copy_(cos_all[tA].view(1, -1))
+    cos2[:, 1].copy_(cos_all[tA + 1].view(1, -1))
+    sin2[:, 0].copy_(sin_all[tA].view(1, -1))
+    sin2[:, 1].copy_(sin_all[tA + 1].view(1, -1))
+    pos2[0] = tA; pos2[1] = tA + 1
+    run(emb2, cos2, sin2, pos2)     # T2 (one q_len=2 at layer 3)
+    dt2 = {k: list(v) for k, v in _DBG.items() if k != 'on' and k != 'layer'}
+    _DBG.clear()
+    for key in ('qproj', 'kpost_rope', 'qpost_rope', 'kv_after_update',
+                'attn_out', 'gated', 'oproj_out'):
+        if key in ('qproj', 'gated', 'oproj_out'):
+            a = torch.cat(dseq[key], dim=1)      # [1,2,out] seq (2 calls)
+            b = dt2[key][0]
+        elif key == 'kv_after_update':
+            a = dseq[key][-1][:, :, :tA + 2]     # last cache state, seq
+            b = dt2[key][0][:, :, :tA + 2]
+        else:
+            a = torch.cat(dseq[key], dim=2)      # [1,h,2,256] seq
+            b = dt2[key][0]
+        dm = (a.float() - b.float()).abs().max().item()
+        print(f'[opdiff] {key}: dmax {dm:.6f}', flush=True)
+    for h in hooks:
+        h.remove()
+    n_bad_kv_a2 = 0
+    dmax_a2 = 0.0
+    for i, (kvA, kvB) in enumerate(zip(snapA[1], snapA2[1])):
+        if kvA is None:
+            continue
+        d = (kvA[0].float() - kvB[0].float()).abs()
+        c = int(snapA[0][i][2].item())
+        dm = d[:, :, c - 2:c].max().item()
+        dmax_a2 = max(dmax_a2, dm)
+        if dm > 1e-3:
+            n_bad_kv_a2 += 1
+    print(f'[state-diff] g1-graph vs g1-eager: bad {n_bad_kv_a2}/16, '
+          f'dK max {dmax_a2:.4f}', flush=True)
+    # use EAGER A2 as the sequential reference for the T2 comparisons
+    snapSeq = snapA2
+    refCum = snapA2
+
     # path B: g2 once
     full_restore(base)
     emb2[:, 0].copy_(embed1(tokA[0]).view(1, H))
@@ -600,7 +873,7 @@ def main():
               flush=True)
         if i >= 3:
             break
-    # path B2: EAGER M=2 (same inputs, no graph)
+    # path B2: EAGER M=2 (same inputs, no graph) vs EAGER sequential
     full_restore(base)
     emb2[:, 0].copy_(embed1(tokA[0]).view(1, H))
     emb2[:, 1].copy_(embed1(tokA[1]).view(1, H))
@@ -613,17 +886,17 @@ def main():
     snapB2 = full_snap()
     n_bad_kv_eager = 0
     dmax_eager = 0.0
-    for i, (kvA, kvB) in enumerate(zip(snapA[1], snapB2[1])):
+    for i, (kvA, kvB) in enumerate(zip(snapSeq[1], snapB2[1])):
         if kvA is None:
             continue
         d = (kvA[0].float() - kvB[0].float()).abs()
-        c = int(snapA[0][i][2].item())
+        c = int(refCum[0][i][2].item())
         dm = d[:, :, c - 2:c].max().item()
         dmax_eager = max(dmax_eager, dm)
         if dm > 1e-3:
             n_bad_kv_eager += 1
-    print(f'[state-diff] EAGER M=2 vs g1+g1: bad {n_bad_kv_eager}/16, '
-          f'dK max {dmax_eager:.4f} (graph was 4.55)', flush=True)
+    print(f'[state-diff] EAGER T2 vs EAGER 2xT1: bad {n_bad_kv_eager}/16, '
+          f'dK max {dmax_eager:.4f}', flush=True)
     hard_reset()
 
     def spec_gen(prompt, N=40):
@@ -679,30 +952,28 @@ def main():
 
             fast_snap()
             _t2 = time.time(); t_snap += _t2 - _t1
-            # batched buffer fill (one _foreach_copy_ + _foreach_fill_)
-            embA.copy_(embed1(t1))
-            emb1.copy_(embed1(d))
+            # v5: single T=2 batched verify — [t1 @ t, d @ t+1]
+            emb2[:, 0].copy_(embed1(t1).view(1, H))
+            emb2[:, 1].copy_(embed1(d).view(1, H))
             torch._foreach_copy_(
-                [cosA, sinA, cos1, sin1],
-                [cos_all[t].view(1, 1, -1), sin_all[t].view(1, 1, -1),
-                 cos_all[t + 1].view(1, 1, -1), sin_all[t + 1].view(1, 1, -1)])
-            posA.fill_(t)
-            pos1.fill_(t + 1)
+                [cos2[:, 0], sin2[:, 0], cos2[:, 1], sin2[:, 1]],
+                [cos_all[t].view(1, -1), sin_all[t].view(1, -1),
+                 cos_all[t + 1].view(1, -1), sin_all[t + 1].view(1, -1)])
+            pos2[0] = t
+            pos2[1] = t + 1
             g2.replay()
             _t3 = time.time(); t_verify += _t3 - _t2
-            t2 = log2a_buf[:, -1].argmax().item()
-            if len(gen) < 4:
-                pass  # debug print removed for speed
+            t2 = log2_s[:, 0].argmax().item()
             if len(gen) < 4:
                 print(f'    it{len(gen)}: t1={t1} d={d} t2={t2} '
-                      f'log2a_max={log2a_buf.float().abs().max():.1f} '
-                      f'log2b_max={log2b_s.float().abs().max():.1f} '
+                      f'log20_max={log2_s[:, 0].float().abs().max():.1f} '
+                      f'log21_max={log2_s[:, 1].float().abs().max():.1f} '
                       f'{"ACC" if t2 == d else "REJ"}', flush=True)
 
             if t2 == d:
                 gen.extend([t1, d])
-                h_last = h2_s                     # no clone (graph outputs
-                logits_last = log2b_s              # stay valid until next replay)
+                h_last = h2_s[:, 1:2]                # hidden after d
+                logits_last = log2_s[:, 1:2]         # logits after d
                 t += 2
                 n_acc += 1
                 if d == tok.eos_token_id:

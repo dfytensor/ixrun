@@ -35,6 +35,7 @@ __all__ = [
     "udcq_quantize",
     "decode_udcq_triton",
     "udcq_fused_gemv",
+    "udcq_fused_gemv_mt",
     "udcq_fused_gemm",
     "UdcqLinear",
     "deploy_udcq",
@@ -237,6 +238,54 @@ if _HAS_TRITON:
         tl.store(y_ptr + rows, acc.to(tl.bfloat16))
 
     @triton.jit
+    def _udcq_gemv_mt_kernel(
+        x_ptr,            # [T, IN_F] bf16, T tokens
+        y_ptr,            # [T, OUT_F] bf16
+        idx_ptr,          # uint8 [N] byte-aligned LUT indices
+        sign_ptr,         # int32 words, flat 1-bit stream
+        scale_ptr,        # f16 [ng]
+        cb_ptr,           # f16 [16] global codebook
+        IN_F: tl.constexpr,
+        OUT_F: tl.constexpr,
+        GROUP: tl.constexpr,
+        BK: tl.constexpr,
+        R: tl.constexpr,
+        T: tl.constexpr,
+    ):
+        """Multi-token GEMV: y[t] = x[t] @ W.T for T tokens in ONE decode
+        walk. Bit-exact vs T separate _udcq_gemv_kernel calls by
+        construction: same packed-data walk, same BK chunking, and each
+        token accumulates via the IDENTICAL sub-expression
+        tl.sum(w * xv[None, :], axis=1) (guaranteed same reduction tree).
+        Bandwidth-bound -> T<=8 costs ~= a single-token call."""
+        pid = tl.program_id(0)
+        rows = pid * R + tl.arange(0, R)
+        base = rows.to(tl.int64) * IN_F
+        toks = tl.arange(0, T)
+        acc = tl.zeros((R, T), tl.float32)
+
+        for k0 in tl.range(0, IN_F, BK):
+            kidx = k0 + tl.arange(0, BK)
+            offs = base[:, None] + kidx[None, :]           # [R, BK]
+
+            b = tl.load(idx_ptr + offs // 2)
+            i = tl.where(offs % 2 == 0, b & 0x0F,
+                         (b >> 4) & 0x0F).to(tl.int32)
+            val = tl.load(cb_ptr + i).to(tl.float32)       # LUT
+            sc = tl.load(scale_ptr + offs // GROUP).to(tl.float32)
+            sw = tl.load(sign_ptr + offs // 32).to(tl.uint32)
+            sgn = ((sw >> (offs % 32)) & 1).to(tl.float32) * 2 - 1
+
+            w = val * sc * sgn                             # decoded once
+            for t in tl.static_range(T):
+                xv = tl.load(x_ptr + t * IN_F + kidx).to(tl.float32)
+                part = tl.sum(w * xv[None, :], axis=1)     # [R] — same expr
+                acc += part[:, None] * (toks == t).to(tl.float32)[None, :]
+
+        tl.store(y_ptr + toks[None, :] * OUT_F + rows[:, None],
+                 acc.to(tl.bfloat16))
+
+    @triton.jit
     def _udcq_gemm_fused_kernel(
         x_ptr,            # [M, IN_F] bf16 activations
         y_ptr,            # [M, OUT_F] bf16 output
@@ -326,6 +375,26 @@ def udcq_fused_gemv(x, idx, sign, scale, cb, out_f, in_f,
         x.reshape(-1), y,
         idx, sign, scale, cb,
         IN_F=in_f, OUT_F=out_f, GROUP=g, BK=bk, R=r,
+        num_warps=num_warps,
+    )
+    return y
+
+
+def udcq_fused_gemv_mt(x, idx, sign, scale, cb, out_f, in_f,
+                       g=UDCQ_G, r=UDCQ_GEMV_R, bk=UDCQ_GEMV_BK,
+                       num_warps=UDCQ_GEMV_WARPS):
+    """y = x @ W.T for T tokens (x: [T, in_f]), one decode walk.
+    Bit-exact vs T separate udcq_fused_gemv calls (same walk + same
+    per-token accumulation expression). T in {2, 4, 8}."""
+    T, in_f2 = x.shape
+    assert in_f2 == in_f and T in (2, 4, 8), (T, in_f, in_f2)
+    y = torch.empty(T, out_f, dtype=torch.bfloat16, device=x.device)
+    while r > 1 and out_f % r != 0:               # odd out_f fallback
+        r //= 2
+    assert in_f % bk == 0
+    _udcq_gemv_mt_kernel[(out_f // r,)](
+        x, y, idx, sign, scale, cb,
+        IN_F=in_f, OUT_F=out_f, GROUP=g, BK=bk, R=r, T=T,
         num_warps=num_warps,
     )
     return y
@@ -479,6 +548,8 @@ class UdcqLinear(nn.Module):
                 y = y + self._bias.to(x.dtype)
             return y.view(*x.shape[:-1], self.out_features)
         # multi-token dispatch (measured on 4090, see tests):
+        #   M in {2,4,8} -> multi-token GEMV (bit-exact vs sequential M=1
+        #                   calls, ~same cost as one — spec-decode verify)
         #   M <= 256 -> pipelined fused decode+GEMM (reads ~10bpw, wins vs
         #               cublas 0.85-1.56x at M=256, better below — the
         #               Marlin/ZipServ regime; decode redundancy x M/BM is
@@ -486,6 +557,16 @@ class UdcqLinear(nn.Module):
         #   M >  256 -> decode-to-shared-buffer + cublas (each W read once;
         #               fused re-decodes per m-tile and loses ~8x at M=4096)
         M = x.numel() // self.in_features
+        if (M in (2, 4, 8) and x.shape[-1] == self.in_features
+                and self.in_features % UDCQ_GEMV_BK == 0):
+            x2 = x.reshape(M, self.in_features)
+            y = udcq_fused_gemv_mt(
+                x2, self._idx, self._sign, self._scale, self._cb,
+                self.out_features, self.in_features, g=self.packed["g"],
+            ).to(x.dtype)
+            if self._bias is not None:
+                y = y + self._bias.to(x.dtype)
+            return y.view(*x.shape[:-1], self.out_features)
         if (M <= 256 and self.in_features % UDCQ_GEMM_CFG[2] == 0
                 and self.out_features % UDCQ_GEMM_CFG[1] == 0):
             x2 = x.reshape(M, self.in_features)
