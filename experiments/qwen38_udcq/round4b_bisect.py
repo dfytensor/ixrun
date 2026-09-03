@@ -692,14 +692,14 @@ def main():
 
             fast_snap()
             _t2 = time.time(); t_snap += _t2 - _t1
-            # v4b: pass A = t1 at [t] (embA buffer), pass B = d at [t+1] (emb1)
+            # batched buffer fill (one _foreach_copy_ + _foreach_fill_)
             embA.copy_(embed1(t1))
-            cosA.copy_(cos_all[t].view(1, 1, -1))
-            sinA.copy_(sin_all[t].view(1, -1).view(1, 1, -1))
-            posA.fill_(t)
             emb1.copy_(embed1(d))
-            cos1.copy_(cos_all[t + 1].view(1, 1, -1))
-            sin1.copy_(sin_all[t + 1].view(1, 1, -1))
+            torch._foreach_copy_(
+                [cosA, sinA, cos1, sin1],
+                [cos_all[t].view(1, 1, -1), sin_all[t].view(1, 1, -1),
+                 cos_all[t + 1].view(1, 1, -1), sin_all[t + 1].view(1, 1, -1)])
+            posA.fill_(t)
             pos1.fill_(t + 1)
             g2.replay()
             _t3 = time.time(); t_verify += _t3 - _t2
@@ -715,8 +715,8 @@ def main():
             if t2 == d:
                 gen.extend([t1, d])
                 bigram[tuple(hist)].append(d)
-                h_last = h2_s.clone()                    # pass B hidden (d)
-                logits_last = log2b_s.clone()
+                h_last = h2_s                     # no clone (graph outputs
+                logits_last = log2b_s              # stay valid until next replay)
                 t += 2
                 n_acc += 1
                 if d == tok.eos_token_id:
@@ -729,8 +729,8 @@ def main():
                 pos1.fill_(t)
                 g1.replay()
                 gen.append(t1)
-                h_last = h1_s.clone()
-                logits_last = log1_s.clone()
+                h_last = h1_s
+                logits_last = log1_s
                 t += 1
                 n_rej += 1
                 if t1 == tok.eos_token_id:
