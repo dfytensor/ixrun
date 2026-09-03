@@ -654,8 +654,20 @@ def main():
                 d = mtp(embed1(t1), h_last, pos_d)[:, -1].argmax().item()
                 n_mtp += 1
 
+            # ORACLE DRAFT: peek the true next token via g1 to isolate the
+            # accept path (100% accept expected). If text degenerates here
+            # -> accept bug; if clean -> reject bug.
             snap = snap_light()
-            # v4b: pass A = t1 at [t] (embA buffer), pass B = d at [t+1] (emb1)
+            emb1.copy_(embed1(t1))
+            cos1.copy_(cos_all[t].view(1, 1, -1))
+            sin1.copy_(sin_all[t].view(1, 1, -1))
+            pos1.fill_(t)
+            g1.replay()
+            d = log1_s[:, -1].argmax().item()  # true successor of t1
+            n_mtp += 1
+            # restore the g1's state change (we just peeked)
+            roll_back(snap)
+            # now set up g2: pass A = t1 at [t], pass B = d at [t+1]
             embA.copy_(embed1(t1))
             cosA.copy_(cos_all[t].view(1, 1, -1))
             sinA.copy_(sin_all[t].view(1, -1).view(1, 1, -1))
