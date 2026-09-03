@@ -1,0 +1,27 @@
+﻿deploying slim...
+python.exe : 
+所在位置 行:1 字符: 57
++ ... FFLINE='1'; & 'F:\rwkv\.venv\Scripts\python.exe' 'E:\IXRUN\experiment ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Loading weights:   0%|          | 0/851 [00:00<?, ?it/s]
+Loading weights:  16%|█▌        | 132/851 [00:00<00:00, 1314.51it/s]
+Loading weights:  35%|███▍      | 294/851 [00:00<00:00, 1493.84it/s]
+Loading weights:  56%|█████▋    | 479/851 [00:00<00:00, 1633.08it/s]
+Loading weights:  76%|███████▌  | 643/851 [00:00<00:00, 1508.89it/s]
+Loading weights:  94%|█████████▎| 796/851 [00:00<00:00, 1313.00it/s]
+Loading weights: 100%|██████████| 851/851 [00:00<00:00, 1426.63it/s]
+  [100/497] 496s
+  [200/497] 972s
+  [300/497] 1801s
+  [400/497] 2988s
+[slim-27B] 497 packed linears 19.22GB (6.00bpw) | norms 0.01GB | 3797s
+resident GPU = 19.39GB
+
+[eager] 4.21 tok/s
+  -> ' the mass of a moving object is given by the formula $m = \\\\frac{m_0}{\\\\sqrt{1 -'
+
+compiling (reduce-overhead)...
+compile FAILED after 0s: UnicodeDecodeError: 'gbk' codec can't decode byte 0x94 in position 618: illegal multibyte sequence

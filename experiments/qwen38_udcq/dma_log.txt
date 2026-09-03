@@ -1,0 +1,33 @@
+﻿loading Qwen3.8-27B (lazy cpu) + UDCQ-DMA deploy ...
+python.exe : 
+所在位置 行:1 字符: 57
++ ... FFLINE='1'; & 'F:\rwkv\.venv\Scripts\python.exe' 'E:\IXRUN\experiment ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Loading weights:   0%|          | 0/851 [00:00<?, ?it/s]
+Loading weights:  41%|████      | 349/851 [00:00<00:00, 3482.85it/s]
+Loading weights:  98%|█████████▊| 835/851 [00:00<00:00, 4288.78it/s]
+Loading weights: 100%|██████████| 851/851 [00:00<00:00, 4196.10it/s]
+  [100/497] 494s
+  [200/497] 1012s
+  [300/497] 1539s
+  [400/497] 2069s
+Traceback (most recent call last):
+  File "E:\IXRUN\experiments\qwen38_udcq\qwen38_udcq_dma.py", line 209, in <module>
+    main()
+  File "E:\IXRUN\experiments\qwen38_udcq\qwen38_udcq_dma.py", line 175, in main
+    lay = UdcqDmaLinear(mod, cb)
+          ^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\IXRUN\experiments\qwen38_udcq\qwen38_udcq_dma.py", line 86, in __init__
+    self.pin = {k: PIN.add(p[k]) for k in ("idx", "scale", "sign_packed")}
+                   ^^^^^^^^^^^^^
+  File "E:\IXRUN\experiments\qwen38_udcq\qwen38_udcq_dma.py", line 53, in add
+    dtype=torch.uint8).pin_memory()
+                       ^^^^^^^^^^^^
+torch.AcceleratorError: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for m
+ore information.
+For more detailed error information, run with CUDA_LOG_FILE=stderr
+

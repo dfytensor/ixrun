@@ -1,0 +1,305 @@
+﻿deploying slim...
+cmd : 
+所在位置 行:1 字符: 78
++ ... FFLINE='1'; cmd /c "`"C:\Program Files (x86)\Microsoft Visual Studio\ ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Loading weights:   0%|          | 0/851 [00:00<?, ?it/s]
+Loading weights:  13%|鈻堚枎        | 108/851 [00:00<00:00, 1072.79it/s]
+Loading weights:  31%|鈻堚枅鈻?      | 261/851 [00:00<00:00, 1338.35it/s]
+Loading weights:  47%|鈻堚枅鈻堚枅鈻?    | 397/851 [00:00<00:00, 1348.17it/s]
+Loading weights:  63%|鈻堚枅鈻堚枅鈻堚枅鈻?  | 532/851 [00:00<00:00, 1193.18it/s]
+Loading weights:  82%|鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻?| 702/851 [00:00<00:00, 1357.72it/s]
+Loading weights: 100%|鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅| 851/851 [00:00<00:00, 1373.46it/s]
+  [100/497] 651s
+  [200/497] 1778s
+  [300/497] 2943s
+  [400/497] 3685s
+[slim-27B] 497 packed linears 19.22GB (6.00bpw) | norms 0.01GB | 4356s
+resident GPU = 19.39GB
+
+[eager] 4.31 tok/s
+  -> ' the mass of a moving object is given by the formula $m = \\\\frac{m_0}{\\\\sqrt{1 -'
+
+compiling (reduce-overhead)...
+W0902 15:34:39.511000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] skipping cudagraph
+s due to mutated inputs (1 instances). Found from : 
+W0902 15:34:39.511000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]    File "F:\rwkv\.
+venv\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 452, in forward
+W0902 15:34:39.511000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     a = self.in_pr
+oj_a(hidden_states)
+W0902 15:34:39.511000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^
+W0902 15:34:39.511000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 499, in forward
+W0902 15:34:39.511000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     w = self._stre
+am_decode().to(x.dtype)
+W0902 15:34:39.511000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:34:39.511000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 446, in _stream_decode
+W0902 15:34:39.511000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     _udcq_decode_k
+ernel[(triton.cdiv(self.N, 1024),)](
+W0902 15:34:39.511000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] 
+W0902 15:34:46.082000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] skipping cudagraph
+s due to mutated inputs (1 instances). Found from : 
+W0902 15:34:46.082000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]    File "F:\rwkv\.
+venv\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 452, in forward
+W0902 15:34:46.082000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     a = self.in_pr
+oj_a(hidden_states)
+W0902 15:34:46.082000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^
+W0902 15:34:46.082000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 499, in forward
+W0902 15:34:46.082000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     w = self._stre
+am_decode().to(x.dtype)
+W0902 15:34:46.082000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:34:46.082000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 446, in _stream_decode
+W0902 15:34:46.082000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     _udcq_decode_k
+ernel[(triton.cdiv(self.N, 1024),)](
+W0902 15:34:46.082000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] 
+W0902 15:34:47.057000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] skipping cudagraph
+s due to mutated inputs (1 instances). Found from : 
+W0902 15:34:47.057000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]    File "F:\rwkv\.
+venv\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 452, in forward
+W0902 15:34:47.057000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     a = self.in_pr
+oj_a(hidden_states)
+W0902 15:34:47.057000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^
+W0902 15:34:47.057000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 499, in forward
+W0902 15:34:47.057000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     w = self._stre
+am_decode().to(x.dtype)
+W0902 15:34:47.057000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:34:47.057000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 446, in _stream_decode
+W0902 15:34:47.057000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     _udcq_decode_k
+ernel[(triton.cdiv(self.N, 1024),)](
+W0902 15:34:47.057000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] 
+W0902 15:34:56.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] skipping cudagraph
+s due to mutated inputs (1 instances). Found from : 
+W0902 15:34:56.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]    File "F:\rwkv\.
+venv\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 452, in forward
+W0902 15:34:56.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     a = self.in_pr
+oj_a(hidden_states)
+W0902 15:34:56.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^
+W0902 15:34:56.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 499, in forward
+W0902 15:34:56.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     w = self._stre
+am_decode().to(x.dtype)
+W0902 15:34:56.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:34:56.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 446, in _stream_decode
+W0902 15:34:56.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     _udcq_decode_k
+ernel[(triton.cdiv(self.N, 1024),)](
+W0902 15:34:56.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] 
+W0902 15:34:57.372000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] skipping cudagraph
+s due to mutated inputs (1 instances). Found from : 
+W0902 15:34:57.372000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]    File "F:\rwkv\.
+venv\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 452, in forward
+W0902 15:34:57.372000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     a = self.in_pr
+oj_a(hidden_states)
+W0902 15:34:57.372000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^
+W0902 15:34:57.372000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 499, in forward
+W0902 15:34:57.372000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     w = self._stre
+am_decode().to(x.dtype)
+W0902 15:34:57.372000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:34:57.372000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 446, in _stream_decode
+W0902 15:34:57.372000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     _udcq_decode_k
+ernel[(triton.cdiv(self.N, 1024),)](
+W0902 15:34:57.372000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] 
+W0902 15:34:58.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] skipping cudagraph
+s due to mutated inputs (1 instances). Found from : 
+W0902 15:34:58.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]    File "F:\rwkv\.
+venv\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 452, in forward
+W0902 15:34:58.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     a = self.in_pr
+oj_a(hidden_states)
+W0902 15:34:58.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^
+W0902 15:34:58.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 499, in forward
+W0902 15:34:58.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     w = self._stre
+am_decode().to(x.dtype)
+W0902 15:34:58.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:34:58.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 446, in _stream_decode
+W0902 15:34:58.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     _udcq_decode_k
+ernel[(triton.cdiv(self.N, 1024),)](
+W0902 15:34:58.383000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] 
+W0902 15:35:00.843000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] skipping cudagraph
+s due to mutated inputs (1 instances). Found from : 
+W0902 15:35:00.843000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]    File "F:\rwkv\.
+venv\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 452, in forward
+W0902 15:35:00.843000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     a = self.in_pr
+oj_a(hidden_states)
+W0902 15:35:00.843000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^
+W0902 15:35:00.843000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 499, in forward
+W0902 15:35:00.843000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     w = self._stre
+am_decode().to(x.dtype)
+W0902 15:35:00.843000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:35:00.843000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 446, in _stream_decode
+W0902 15:35:00.843000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     _udcq_decode_k
+ernel[(triton.cdiv(self.N, 1024),)](
+W0902 15:35:00.843000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] 
+W0902 15:35:01.917000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] skipping cudagraph
+s due to mutated inputs (1 instances). Found from : 
+W0902 15:35:01.917000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]    File "F:\rwkv\.
+venv\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 452, in forward
+W0902 15:35:01.917000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     a = self.in_pr
+oj_a(hidden_states)
+W0902 15:35:01.917000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^
+W0902 15:35:01.917000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 499, in forward
+W0902 15:35:01.917000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     w = self._stre
+am_decode().to(x.dtype)
+W0902 15:35:01.917000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]         ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:35:01.917000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "E:\IXRUN\i
+xrun\udcq.py", line 446, in _stream_decode
+W0902 15:35:01.917000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     _udcq_decode_k
+ernel[(triton.cdiv(self.N, 1024),)](
+W0902 15:35:01.917000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] 
+W0902 15:35:02.282000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [13/8] torch._dynamo hit config.reco
+mpile_limit (8)
+W0902 15:35:02.282000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [13/8]    function: 'forward' (F:\rw
+kv\.venv\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py:431)
+W0902 15:35:02.282000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [13/8]    last reason: 13/7: cache_p
+arams.layers[9].device is None                    # if self.device is None:  # transformers\cache_utils.py:1007 in lazy
+_initialization
+W0902 15:35:02.282000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [13/8] User stack trace:
+W0902 15:35:02.282000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [13/8]   File "F:\rwkv\.venv\Lib\sit
+e-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 466, in forward
+W0902 15:35:02.282000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [13/8]     mixed_qkv = cache_params.
+update_conv_state(
+W0902 15:35:02.282000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [13/8]   File "F:\rwkv\.venv\Lib\sit
+e-packages\transformers\cache_utils.py", line 1402, in update_conv_state
+W0902 15:35:02.282000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [13/8]     conv_states = self.layers
+[layer_idx].update_conv_state(conv_states, state_idx, **kwargs)
+W0902 15:35:02.282000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [13/8]   File "F:\rwkv\.venv\Lib\sit
+e-packages\transformers\cache_utils.py", line 1046, in update_conv_state
+W0902 15:35:02.282000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [13/8]     self.lazy_initialization(
+conv_states=conv_states, state_idx=state_idx, conv_kernel_size=conv_kernel_size)
+W0902 15:35:02.282000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [13/8]   File "F:\rwkv\.venv\Lib\sit
+e-packages\transformers\cache_utils.py", line 1007, in lazy_initialization
+W0902 15:35:02.282000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [13/8]     if self.device is None:
+W0902 15:35:02.282000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [13/8] To log all recompilation reas
+ons, use TORCH_LOGS="recompiles".
+W0902 15:35:02.282000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [13/8] To diagnose recompilation iss
+ues, see https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.recompilation.html
+W0902 15:35:08.547000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [10/8] torch._dynamo hit config.reco
+mpile_limit (8)
+W0902 15:35:08.547000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [10/8]    function: '__call__' (F:\r
+wkv\.venv\Lib\site-packages\transformers\modeling_layers.py:79)
+W0902 15:35:08.547000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [10/8]    last reason: 10/0: kwargs[
+'attention_mask'] is None                         # return super().__call__(*args, **kwargs)  # transformers\modeling_l
+ayers.py:114 in __call__
+W0902 15:35:08.547000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [10/8] User stack trace:
+W0902 15:35:08.547000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [10/8]   File "F:\rwkv\.venv\Lib\sit
+e-packages\transformers\modeling_layers.py", line 114, in __call__
+W0902 15:35:08.547000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [10/8]     return super().__call__(*
+args, **kwargs)
+W0902 15:35:08.547000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [10/8] To log all recompilation reas
+ons, use TORCH_LOGS="recompiles".
+W0902 15:35:08.547000 26984 Lib\site-packages\torch\_dynamo\convert_frame.py:1994] [10/8] To diagnose recompilation iss
+ues, see https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.recompilation.html
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] skipping cudagraph
+s due to mutated inputs (16 instances). Found from : 
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]    File "F:\rwkv\.
+venv\Lib\site-packages\transformers\utils\generic.py", line 939, in wrapper
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     output = func(
+self, *args, **kwargs)
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]              ^^^^^
+^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "F:\rwkv\.v
+env\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 1624, in forward
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     outputs: BaseM
+odelOutputWithPast = self.model(
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]                   
+                     ^^^^^^^^^^^
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "F:\rwkv\.v
+env\Lib\site-packages\transformers\utils\generic.py", line 1068, in wrapper
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     output = func(
+self, *args, **kwargs)
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]              ^^^^^
+^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "F:\rwkv\.v
+env\Lib\site-packages\transformers\utils\output_capturing.py", line 262, in wrapper
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     outputs = func
+(self, *args, **kwargs)
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]               ^^^^
+^^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "F:\rwkv\.v
+env\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 1199, in forward
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     hidden_states 
+= decoder_layer(
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]                   
+  ^^^^^^^^^^^^^^
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "F:\rwkv\.v
+env\Lib\site-packages\transformers\modeling_layers.py", line 114, in __call__
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     return super()
+.__call__(*args, **kwargs)
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]            ^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "F:\rwkv\.v
+env\Lib\site-packages\torch\nn\modules\module.py", line 1778, in _wrapped_call_impl
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     return self._c
+all_impl(*args, **kwargs)
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]            ^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "F:\rwkv\.v
+env\Lib\site-packages\torch\nn\modules\module.py", line 1789, in _call_impl
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     return forward
+_call(*args, **kwargs)
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]            ^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "F:\rwkv\.v
+env\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 768, in forward
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     hidden_states 
+= self.linear_attn(
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]                   
+  ^^^^^^^^^^^^^^^^^
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "F:\rwkv\.v
+env\Lib\site-packages\transformers\integrations\accelerate.py", line 947, in wrapped
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     output = forwa
+rd_func(self, *args, **kwargs)
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]              ^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "F:\rwkv\.v
+env\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 457, in forward
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     mixed_qkv = ca
+usal_conv1d_update(
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]                 ^^
+^^^^^^^^^^^^^^^^^^^
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "F:\rwkv\.v
+env\Lib\site-packages\transformers\integrations\hub_kernels.py", line 797, in wrapped
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     return impleme
+ntation(*args, **kwargs)
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]            ^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]   File "F:\rwkv\.v
+env\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 211, in causal_conv1d_update
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs]     conv_state.cop
+y_(hidden_states_new[:, :, -state_len:])
+W0902 15:37:33.168000 26984 Lib\site-packages\torch\_inductor\cudagraph_utils.py:380] [__cudagraphs] 
+E0902 15:37:33.642000 26984 Lib\site-packages\torch\_inductor\runtime\triton_heuristics.py:1282] Failed during launch t
+riton_red_fused__to_copy_add_clone_exp_expand_mul_neg_rsqrt_select_silu_slice_softplus_split_with_sizes_sum_transpose_u
+nsqueeze_view_6 with config: XBLOCK: 1, YBLOCK: 64, R0_BLOCK: 4, num_warps: 2, num_ctas: 1, num_stages: 1, maxnreg: Non
+e (num_warps=2, num_stages=1, kwargs={'XBLOCK': 1, 'YBLOCK': 64, 'R0_BLOCK': 4})
+compile FAILED after 201s: TypeError: Pointer argument must be either uint64 or have data_ptr method

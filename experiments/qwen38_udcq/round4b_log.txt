@@ -1,0 +1,23 @@
+﻿loading blob (mmap)...
+  blob 0s
+[fast-deploy] 497 linears from blob | non-linear 0.01GB | 9s | resident 19.39GB
+capturing g1/g2...
+graphs ok
+[probe pre-mtp] [279, 2973, 314, 264, 2407, 6992]
+mtp head loaded (with layer, orig attn)
+[state-diff] bad layers: recurrent 0/48 conv 0/48 kv-full-attn 16/16
+  layer3: |dK| max 4.5469 mean 0.00443 (ref |K| 0.0410) | slot 7: 4.5469 slot 8: 2.7852 | earlier max 0.0000 | dV max 3.4316
+  [note] trajectory fork at token 1 (near-tie numerics: g2-GEMM vs g1-GEMV)
+
+[1.09 tok/s] 'The theory of relativity states that' (acc 0 rej 40 | drafts ng 0 mtp 40)
+  -> ' the speed of light is constant in all inert inert inert inert inert inert inert inert inert inert inert inert inert inert inert i'
+  [note] trajectory fork at token 3 (near-tie numerics: g2-GEMM vs g1-GEMV)
+
+[1.12 tok/s] 'def quick_sort(arr):' (acc 0 rej 40 | drafts ng 0 mtp 40)
+  -> '\n    if if if if if if if if if if if if if if if if if if if if if if if if if if if if if if if if if if if if if if'
+  [note] trajectory fork at token 1 (near-tie numerics: g2-GEMM vs g1-GEMV)
+
+[1.11 tok/s] '鍖椾含鏈€鍊煎緱娓歌鐨勪笁涓櫙鐐规槸' (acc 0 rej 40 | drafts ng 0 mtp 40)
+  -> '鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭鏁呭'
+
+peak GPU = 20.50GB

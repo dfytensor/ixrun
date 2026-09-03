@@ -1,0 +1,21 @@
+﻿loading blob (mmap)...
+  blob 0s
+[fast-deploy] 497 linears from blob | non-linear 0.01GB | 11s | resident 19.39GB
+capturing g1/g2...
+graphs ok
+[probe pre-mtp] [279, 2973, 314, 264, 2407, 6992]
+mtp head loaded (with layer, orig attn)
+  [note] trajectory fork at token 1 (near-tie numerics: g2-GEMM vs g1-GEMV)
+
+[1.30 tok/s] 'The theory of relativity states that' (acc 0 rej 0 | drafts ng 0 mtp 0)
+  -> ' the speed of light is...\n\n# 鍏夊湪鐪?鐪? 绌? 鐪? 鐪? 鐪? 鐪? 鐪? 鐪? 鐪? '
+  [note] trajectory fork at token 3 (near-tie numerics: g2-GEMM vs g1-GEMV)
+
+[1.26 tok/s] 'def quick_sort(arr):' (acc 0 rej 0 | drafts ng 0 mtp 0)
+  -> '\n    if not isinstance(arr, 0,000000000000000001111111111111'
+  [note] trajectory fork at token 1 (near-tie numerics: g2-GEMM vs g1-GEMV)
+
+[1.25 tok/s] '鍖椾含鏈€鍊煎緱娓歌鐨勪笁涓櫙鐐规槸' (acc 0 rej 0 | drafts ng 0 mtp 0)
+  -> '鏁呭鍗氱墿闄€佸叓杈惧箔闀垮煄鍜屾厱\n澶у噷绂廫n瀛n  澶n瀛n瀛n瀛n[\n[\n[\n.\n.\n.\n.\n['
+
+peak GPU = 20.45GB

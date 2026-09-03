@@ -1,0 +1,76 @@
+﻿loading Qwen3.8-27B (lazy cpu) ...
+python.exe : 
+所在位置 行:1 字符: 57
++ ... FFLINE='1'; & 'F:\rwkv\.venv\Scripts\python.exe' 'E:\IXRUN\experiment ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Loading weights:   0%|          | 0/851 [00:00<?, ?it/s]
+Loading weights:  59%|█████▉    | 504/851 [00:00<00:00, 4579.12it/s]
+Loading weights: 100%|██████████| 851/851 [00:00<00:00, 5419.26it/s]
+  meta-loaded 2s; quantizing layer-by-layer ...
+  [60/496] 2.1GB packed, 274s
+  [120/496] 4.3GB packed, 634s
+  [180/496] 6.6GB packed, 944s
+  [240/496] 8.8GB packed, 1212s
+  [300/496] 10.9GB packed, 1474s
+  [360/496] 13.2GB packed, 1755s
+  [420/496] 15.4GB packed, 2029s
+  [480/496] 17.6GB packed, 2310s
+[udcq-27B] 496 layers | 18.26GB packed (6.00 bpw) in 2392s
+[gpu] moved 2.55GB backbone params; kept CPU 2.54GB (vision/embed/lm_head)
+  resident GPU = 33.19GB
+Traceback (most recent call last):
+  File "E:\IXRUN\experiments\qwen38_udcq\qwen38_udcq_infer.py", line 133, in <module>
+    main()
+  File "E:\IXRUN\experiments\qwen38_udcq\qwen38_udcq_infer.py", line 127, in main
+    txt, tps = gen(m, p)
+               ^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\torch\utils\_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\IXRUN\experiments\qwen38_udcq\qwen38_udcq_infer.py", line 42, in gen
+    out = m(ids, use_cache=True)
+          ^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\transformers\utils\generic.py", line 939, in wrapper
+    output = func(self, *args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 1624, in forward
+    outputs: BaseModelOutputWithPast = self.model(
+                                       ^^^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\transformers\utils\generic.py", line 1068, in wrapper
+    output = func(self, *args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\transformers\utils\output_capturing.py", line 262, in wrapper
+    outputs = func(self, *args, **kwargs)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\transformers\models\qwen3_5\modeling_qwen3_5.py", line 1161, in forward
+    inputs_embeds = self.embed_tokens(input_ids)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\torch\nn\modules\sparse.py", line 189, in forward
+    return F.embedding(
+           ^^^^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\torch\nn\functional.py", line 2615, in embedding
+    return torch.embedding(weight, input, padding_idx, scale_grad_by_freq, sparse)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Expected all tensors to be on the same device, but got index is on cuda:0, different from other tensors o
+n cpu (when checking argument in method wrapper_CUDA__index_select)

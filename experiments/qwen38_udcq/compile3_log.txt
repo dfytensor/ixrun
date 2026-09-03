@@ -1,0 +1,9 @@
+﻿cmd : Fatal Python error: preconfig_init_utf8_mode: invalid PYTHONUTF8 environment variable value
+所在位置 行:1 字符: 1
++ cmd /c "`"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTo ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Fatal Python er... variable value:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Python runtime state: preinitializing
+

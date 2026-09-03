@@ -1,0 +1,34 @@
+﻿loading Qwen3.8-27B (lazy cpu) ...
+python.exe : 
+所在位置 行:1 字符: 57
++ ... FFLINE='1'; & 'F:\rwkv\.venv\Scripts\python.exe' 'E:\IXRUN\experiment ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Loading weights:   0%|          | 0/851 [00:00<?, ?it/s]
+Loading weights:  56%|█████▌    | 477/851 [00:00<00:00, 4332.45it/s]
+Loading weights: 100%|██████████| 851/851 [00:00<00:00, 4925.28it/s]
+  meta-loaded 2s; quantizing layer-by-layer ...
+  [60/497] 2.1GB packed, 290s
+  [120/497] 4.3GB packed, 575s
+  [180/497] 6.6GB packed, 886s
+  [240/497] 8.8GB packed, 1198s
+  [300/497] 10.9GB packed, 1503s
+  [360/497] 13.2GB packed, 1830s
+  [420/497] 15.4GB packed, 2148s
+  [480/497] 17.6GB packed, 2462s
+[udcq-27B] 497 layers | 19.22GB packed (6.00 bpw) in 2742s
+[gpu] moved 2.55GB backbone params; kept CPU 0.00GB (vision/embed/lm_head)
+  resident GPU = 34.78GB
+
+[0.82 tok/s] 'The theory of relativity states that'
+  -> ' the mass of a moving object is given by the formula $m = \\\\frac{m_0}{\\\\sqrt{1 - \\\\frac{v^2}{c^2}}}$, where'
+
+[0.85 tok/s] 'def quick_sort(arr):'
+  -> '\n    if len(arr) <= 1:\n        return arr\n    pivot = arr[len(arr) // 2]\n    left = [x for x in arr if x < pivot'
+
+[0.79 tok/s] '北京最值得游览的三个景点是'
+  -> '故宫、颐和园和天坛。\n\n首先，故宫，又称紫禁城，是明清两代的皇家宫殿，也是世界上现存规模最大、保存最为完整的木质结构古建筑之一。故宫不仅'
+
+peak GPU = 37.70GB

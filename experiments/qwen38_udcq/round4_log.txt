@@ -1,0 +1,30 @@
+﻿deploying slim...
+python.exe : 
+所在位置 行:1 字符: 78
++ ... ONUTF8='1'; & 'F:\rwkv\.venv\Scripts\python.exe' 'E:\IXRUN\experiment ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Loading weights:   0%|          | 0/851 [00:00<?, ?it/s]
+Loading weights:  48%|鈻堚枅鈻堚枅鈻?    | 409/851 [00:00<00:00, 4061.53it/s]
+Loading weights: 100%|鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅| 851/851 [00:00<00:00, 4282.82it/s]
+  [100/497] 482s
+  [200/497] 966s
+  [300/497] 1485s
+  [400/497] 2014s
+[slim-27B] 497 packed linears 19.22GB (6.00bpw) | norms 0.01GB | 2704s
+capturing g1/g2...
+graphs captured + reset.
+mtp head loaded (bf16)
+
+[1.11 tok/s] 'def quick_sort(arr):' (acc 0 rej 40 | drafts: ng 1 mtp 39)
+  -> '\n veh铆culos鐟曠柕 genres encourages胁械泄褑邪娓╂煍鐨凴ecovered.Score喔腑喔橲NS tif 靾橃瀳電旂啛鐭ュ湪骞垮窞 lxml Veranstreshape 蟹邪褖械屑褋褟 norme械屑褋褟_decl 讗转纬维 Unido Unido Unido '
+
+[1.11 tok/s] 'The theory of relativity states that' (acc 0 rej 40 | drafts: ng 3 mtp 37)
+  -> ' the Prepar 谐芯褉械 tron h茅r h茅r喈侧瘝喈?h茅r h茅r h茅r h茅r.setChecked绀煎搧 tif Radiation 锌褉褟/graph 屑薪械薪懈械 丕賱乇賵爻賷\tlp丕賰褋褋懈芯薪邪-fluid涔嬪穮 亘乇賵賱賷賳鐨勪汉閮藉湪骞垮窞 脗mIV_sam'
+
+[1.10 tok/s] '鍖椾含鏈€鍊煎緱娓歌鐨勪笁涓櫙鐐规槸' (acc 0 rej 40 | drafts: ng 4 mtp 36)
+  -> '鏁呭 锌褉懈薪懈屑邪械褌 Showcase dikatakanilereodin 丕賱賵爻胤.prevent銈掍竴 espaces胁械泄褑邪 espaces espaces espaces espaces espaces 泻芯薪泻褍褉褋邪 Conservation takich B'
+
+peak GPU = 20.45GB

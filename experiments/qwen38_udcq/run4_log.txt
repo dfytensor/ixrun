@@ -1,0 +1,39 @@
+﻿loading Qwen3.8-27B (lazy cpu) ...
+python.exe : 
+所在位置 行:1 字符: 57
++ ... FFLINE='1'; & 'F:\rwkv\.venv\Scripts\python.exe' 'E:\IXRUN\experiment ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Loading weights:   0%|          | 0/851 [00:00<?, ?it/s]
+Loading weights:  61%|██████    | 521/851 [00:00<00:00, 4757.58it/s]
+Loading weights: 100%|██████████| 851/851 [00:00<00:00, 5438.07it/s]
+  meta-loaded 2s; quantizing layer-by-layer ...
+  [60/497] 2.1GB packed, 281s
+  [120/497] 4.3GB packed, 553s
+  [180/497] 6.6GB packed, 837s
+  [240/497] 8.8GB packed, 1104s
+  [300/497] 10.9GB packed, 1366s
+  [360/497] 13.2GB packed, 1647s
+  [420/497] 15.4GB packed, 1925s
+  [480/497] 17.6GB packed, 2207s
+Traceback (most recent call last):
+  File "E:\IXRUN\experiments\qwen38_udcq\qwen38_udcq_infer.py", line 144, in <module>
+    main()
+  File "E:\IXRUN\experiments\qwen38_udcq\qwen38_udcq_infer.py", line 132, in main
+    deploy_stream_lazy(m)
+  File "F:\rwkv\.venv\Lib\site-packages\torch\utils\_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\IXRUN\experiments\qwen38_udcq\qwen38_udcq_infer.py", line 82, in deploy_stream_lazy
+    packed = udcq_quantize(w.to(torch.bfloat16) if w.dtype != torch.bfloat16 else w,
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\rwkv\.venv\Lib\site-packages\torch\utils\_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "E:\IXRUN\ixrun\udcq.py", line 117, in udcq_quantize
+    d = (x.reshape(-1, 1) - CB[None, :]).abs()
+         ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: not enough memory: you tried to allocate 8
+1369497600 bytes.

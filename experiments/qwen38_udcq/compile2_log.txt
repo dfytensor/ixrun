@@ -1,0 +1,26 @@
+﻿deploying slim...
+python.exe : 
+所在位置 行:1 字符: 78
++ ... ONUTF8='1'; & 'F:\rwkv\.venv\Scripts\python.exe' 'E:\IXRUN\experiment ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Loading weights:   0%|          | 0/851 [00:00<?, ?it/s]
+Loading weights:  50%|鈻堚枅鈻堚枅鈻?    | 423/851 [00:00<00:00, 4208.42it/s]
+Loading weights: 100%|鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅| 851/851 [00:00<00:00, 4412.13it/s]
+  [100/497] 549s
+  [200/497] 1051s
+  [300/497] 2008s
+  [400/497] 3191s
+[slim-27B] 497 packed linears 19.22GB (6.00bpw) | norms 0.01GB | 4700s
+resident GPU = 19.39GB
+
+[eager] 1.57 tok/s
+  -> ' the mass of a body moving with velocity $v$ is $m = \\frac{m_0}{\\sqrt{1 - v^2'
+
+compiling (reduce-overhead)...
+compile FAILED after 24s: InductorError: CppCompileError: C++ compile error
+
+Command:
+cl /I C:/Users/Administrator/AppData/Roaming/uv/python/cpython-3.12.11-windows-x86_64-none/Include /I F:/rwkv/.venv/Lib/site-packages/torch/include /I F:/rwkv/.venv/Lib/site-packages/torch/include/torch/csrc/api/include /D NOMINMAX /D TORCH_INDUCTOR_CPP_W

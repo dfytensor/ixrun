@@ -1,0 +1,30 @@
+﻿deploying slim...
+python.exe : 
+所在位置 行:1 字符: 78
++ ... ONUTF8='1'; & 'F:\rwkv\.venv\Scripts\python.exe' 'E:\IXRUN\experiment ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Loading weights:   0%|          | 0/851 [00:00<?, ?it/s]
+Loading weights:  46%|鈻堚枅鈻堚枅鈻?    | 395/851 [00:00<00:00, 3949.08it/s]
+Loading weights:  99%|鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枆| 841/851 [00:00<00:00, 4238.79it/s]
+Loading weights: 100%|鈻堚枅鈻堚枅鈻堚枅鈻堚枅鈻堚枅| 851/851 [00:00<00:00, 4224.17it/s]
+  [100/497] 639s
+  [200/497] 1807s
+  [300/497] 2984s
+  [400/497] 4161s
+[slim-27B] 497 packed linears 19.22GB (6.00bpw) | norms 0.01GB | 5675s
+capturing graph on fresh cache...
+captured + reset.
+eager decode: 674 ms/tok (1.48 tok/s)
+  -> ' the mass of a body moving with velocity $v$ is given by the formula $m = \\frac{m_'
+graph decode: 70.6 ms/tok (14.16 tok/s)
+  -> ' the speed of light is constant. If the speed of light is constant, how can it be that the light from a'
+agreement (first 10): False
+graph self-consistency: True
+[14.58 tok/s] 'def quick_sort(arr):'
+  -> '\n    if len(arr) <= 1:\n        return arr\n    pivot = arr[len(arr) // 2]\n    left = [x for x in arr if x < pivot'
+[14.51 tok/s] '鍖椾含鏈€鍊煎緱娓歌鐨勪笁涓櫙鐐规槸'
+  -> '鏁呭銆侀鍜屽洯鍜屽ぉ鍧涖€俓n\n鏁呭锛屽張绉扮传绂佸煄锛屾槸鏄庢竻涓や唬鐨勭殗瀹跺娈匡紝涔熸槸涓栫晫涓婄幇瀛樿妯℃渶澶с€佷繚瀛樻渶瀹屾暣鐨勬湪璐ㄧ粨鏋勫彜寤虹瓚缇や箣涓€銆傚畠浣嶄簬鍖椾含甯?
+peak GPU = 19.58GB
