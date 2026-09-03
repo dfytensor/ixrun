@@ -324,9 +324,22 @@ def main():
     pool = torch.cuda.graph_pool_handle()   # BOTH graphs share one pool —
     with torch.cuda.graph(g1, pool=pool):   # separate pools alias corrupt g1
         h1_s, log1_s = run(emb1, cos1, sin1, pos1)
+    # v4b: g2 = two M=1 passes with SEPARATE input buffers (pass1 must not
+    # be clobbered by pass2 setup). log2a copied to a dedicated output so
+    # pass2's allocations can't alias it.
+    embA = torch.zeros(1, 1, H, dtype=torch.bfloat16, device=dev)
+    cosA = torch.zeros(1, 1, cos_all.shape[-1], dtype=cos_all.dtype, device=dev)
+    sinA = torch.zeros_like(cosA)
+    posA = torch.zeros(1, dtype=torch.long, device=dev)
+    log2a_buf = torch.zeros(1, 1, m.lm_head.out_features,
+                             dtype=torch.bfloat16, device=dev)
     g2 = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g2, pool=pool):
-        h2_s, log2_s = run(emb2, cos2, sin2, pos2)
+        _, log2a_raw = run(embA, cosA, sinA, posA)     # pass 1 at [t] M=1
+        log2a_buf.copy_(log2a_raw)                      # save pass-1 logits
+        h2_s, log2b_s = run(emb1, cos1, sin1, pos1)     # pass 2 at [t+1] M=1
+    # NOTE: log2_s must be computed AFTER each replay (cat of live buffers);
+    # helper below reads the buffers directly
     hard_reset()
     print('graphs ok', flush=True)
 
@@ -627,7 +640,7 @@ def main():
                 pos2[0] = t; pos2[1] = t + 1
                 g2.replay()
                 gen.append(t1)
-                logits_last = log2_s[:, 0:1].clone()
+                logits_last = log2a_buf.clone()
                 t += 1
                 continue
             hist = (ids + gen)[-2:]
@@ -637,33 +650,34 @@ def main():
                 d = cand[-1]
                 n_ng += 1
             if d is None:
-                if False:  # MTP disabled for isolation (eager cost + suspect)
-                    pos_d = torch.tensor([[t]], device=dev)
-                    d = mtp(embed1(t1), h_last, pos_d)[:, -1].argmax().item()
-                    n_mtp += 1
-                else:
-                    d = t1          # naive repeat-draft (tests machinery)
-                    n_mtp += 1
+                pos_d = torch.tensor([[t + 1]], device=dev)
+                d = mtp(embed1(t1), h_last, pos_d)[:, -1].argmax().item()
+                n_mtp += 1
 
             snap = snap_light()
-            emb2[:, 0].copy_(embed1(t1).view(1, H))
-            emb2[:, 1].copy_(embed1(d).view(1, H))
-            cos2[:, 0].copy_(cos_all[t].view(1, -1))
-            cos2[:, 1].copy_(cos_all[t + 1].view(1, -1))
-            sin2[:, 0].copy_(sin_all[t].view(1, -1))
-            sin2[:, 1].copy_(sin_all[t + 1].view(1, -1))
-            pos2[0] = t; pos2[1] = t + 1
+            # v4b: pass A = t1 at [t] (embA buffer), pass B = d at [t+1] (emb1)
+            embA.copy_(embed1(t1))
+            cosA.copy_(cos_all[t].view(1, 1, -1))
+            sinA.copy_(sin_all[t].view(1, -1).view(1, 1, -1))
+            posA.fill_(t)
+            emb1.copy_(embed1(d))
+            cos1.copy_(cos_all[t + 1].view(1, 1, -1))
+            sin1.copy_(sin_all[t + 1].view(1, 1, -1))
+            pos1.fill_(t + 1)
             g2.replay()
-            t2 = log2_s[:, 0].argmax().item()
-            if len(gen) < 8:
+            torch.cuda.synchronize()
+            t2 = log2a_buf[:, -1].argmax().item()
+            if len(gen) < 4:
                 print(f'    it{len(gen)}: t1={t1} d={d} t2={t2} '
+                      f'log2a_max={log2a_buf.float().abs().max():.1f} '
+                      f'log2b_max={log2b_s.float().abs().max():.1f} '
                       f'{"ACC" if t2 == d else "REJ"}', flush=True)
 
             if t2 == d:
                 gen.extend([t1, d])
                 bigram[tuple(hist)].append(d)
-                h_last = h2_s[:, 1:2].clone()
-                logits_last = log2_s[:, 1:2].clone()
+                h_last = h2_s.clone()                    # pass B hidden (d)
+                logits_last = log2b_s.clone()
                 t += 2
                 n_acc += 1
                 if d == tok.eos_token_id:

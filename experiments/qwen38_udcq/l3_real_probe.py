@@ -17,9 +17,9 @@ from transformers.cache_utils import StaticCache
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Attention, apply_rotary_pos_emb)
 from ixrun.fla_patch import apply_fla_kernels
-from ixrun.gdn_seq_patch import apply_gdn_sequential_patch
+from ixrun.gdn_seq_patch import apply_gdn_sequential_patch, _dbg_spec_hits
 apply_fla_kernels()
-apply_gdn_sequential_patch(verbose=False)
+apply_gdn_sequential_patch(verbose=True)
 _ORIG = Qwen3_5Attention.forward
 MAX_CTX = 256
 BLOB = r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt'
@@ -265,6 +265,7 @@ def main():
     din1 = (hB_in[0, 1].float() - hA[0, 0].float()).abs().max().item()
     print(f'[bisect] layer3 INPUT hidden: tok0 {din0:.5f} tok1 {din1:.5f}',
           flush=True)
+    print(f'[v3 hits] spec_block entered {_dbg_spec_hits()} times', flush=True)
 
     # ---- per-layer input scan (upto=1,2,3) ----
     for upto in (1, 2, 3):
