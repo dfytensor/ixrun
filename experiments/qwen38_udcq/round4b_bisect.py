@@ -626,8 +626,6 @@ def main():
           f'dK max {dmax_eager:.4f} (graph was 4.55)', flush=True)
     hard_reset()
 
-    from collections import defaultdict
-
     def spec_gen(prompt, N=40):
         ids = tok(prompt, return_tensors='pt')['input_ids'][0].tolist()
         # prefill
@@ -666,12 +664,8 @@ def main():
             h_last, logits_last = run(emb1, cos1, sin1, pos1)
         h_last, logits_last = h_last.clone(), logits_last.clone()
 
-        bigram = defaultdict(list)
-        for i in range(2, len(ids)):
-            bigram[(ids[i - 2], ids[i - 1])].append(ids[i])
-
         gen = []
-        n_acc = n_rej = n_ng = n_mtp = 0
+        n_acc = n_rej = n_mtp = 0
         # timing breakdown
         t_draft = t_snap = t_verify = t_rb = t_all = 0.0
         t = len(ids)
@@ -679,15 +673,8 @@ def main():
         while len(gen) < N and t < MAX_CTX - 4:
             _t0 = time.time()
             t1 = logits_last[:, -1].argmax().item()
-            hist = (ids + gen)[-2:]
-            d = None
-            cand = bigram.get(tuple(hist))
-            if cand:
-                d = cand[-1]
-                n_ng += 1
-            if d is None:
-                d = mtp_draft(t1, h_last)
-                n_mtp += 1
+            d = mtp_draft(t1, h_last)
+            n_mtp += 1
             _t1 = time.time(); t_draft += _t1 - _t0
 
             fast_snap()
@@ -714,7 +701,6 @@ def main():
 
             if t2 == d:
                 gen.extend([t1, d])
-                bigram[tuple(hist)].append(d)
                 h_last = h2_s                     # no clone (graph outputs
                 logits_last = log2b_s              # stay valid until next replay)
                 t += 2
@@ -750,16 +736,16 @@ def main():
               f'commit+rb={t_rb/n_iter*1000:.1f}ms(avg) '
               f'rb_per_rej={t_rb/max(n_rej,1)*1000:.1f}ms '
               f'total={dt/n_iter*1000:.1f}ms/iter', flush=True)
-        return gen, dt, (n_acc, n_rej, n_ng, n_mtp)
+        return gen, dt, (n_acc, n_rej, n_mtp)
 
     for prompt in ['The theory of relativity states that',
                    'def quick_sort(arr):',
                    '北京最值得游览的三个景点是']:
         hard_reset()
-        gen, dt, (a, r, ng, mt) = spec_gen(prompt)
+        gen, dt, (a, r, mt) = spec_gen(prompt)
         txt = tok.decode(gen)
         print(f'\n[{len(gen)/dt:.2f} tok/s] {prompt!r} '
-              f'(acc {a} rej {r} | drafts ng {ng} mtp {mt})\n'
+              f'(acc {a} rej {r} | mtp drafts {mt})\n'
               f'  -> {txt[:130]!r}', flush=True)
 
     print(f'\npeak GPU = {torch.cuda.max_memory_allocated()/1e9:.2f}GB', flush=True)
