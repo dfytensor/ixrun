@@ -92,6 +92,35 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   directly by index).
 - Decode correctness verified bit-exact (max_err=0.0) for both Triton and scatter paths.
 
+## Speculative decoding on Qwen3.8-27B (round4b_bisect.py) — hard-won pitfalls
+- **transformers 5.15 cache `conv_states`/`recurrent_states` are DICTS** `{state_idx: tensor}`;
+  iterating the layer object yields INT KEYS — `isinstance(r, Tensor)` guards silently
+  disable ALL snapshot/rollback. Iterate `.values()`. This bug masqueraded as "accept-path
+  corruption after 10-30 tokens" AND as "graph vs eager numerics differ" (both folklore
+  died: g1-graph == g1-eager bit-exact once fixed).
+- **Attention output reshape**: `[B,H,S,D]` needs `.transpose(1,2)` before
+  `.reshape(B,S,-1)` — q_len=1 is accidentally fine without it, q_len>=2 garbles
+  head/token layout (dmax 6.0 divergence).
+- **CUDA graph pool aliasing**: tensors returned from a capture live in the shared pool;
+  a LATER graph's replay (same pool) clobbers them. Copy outputs to pre-allocated static
+  buffers INSIDE each capture. Symptom: garbage token ids (float bit patterns).
+- **WDDM VRAM oversubscription** (>24GB on the 4090) silently pages to sysmem — the whole
+  pipeline crawls at ~130GB/s. Keep peak < 24GB (int8+per-row-scale emb table = 1.27GB
+  vs 2.54GB bf16).
+- **Multi-token GEMV** (`udcq_fused_gemv_mt`, T∈{2,4,8}): same decode walk + per-token
+  accumulators using the IDENTICAL `tl.sum` sub-expression => bit-exact vs sequential
+  M=1 calls; bandwidth-bound so T=2/4 costs ~= one call. Makes layer-wise T-batched
+  verify exact (GDN core per-token via gdn_seq_patch v3 S<=8; per-token SDPA).
+- **Queue-architecture spec decode**: partial accepts roll back and RE-QUEUE the accepted
+  prefix as the next block's known tokens (auto-reverified deterministically) — zero
+  prefix-recompute replays, one sync per iteration. Commit only tokens BEYOND the known
+  prefix (root position = pend_len-1) or text doubles.
+- WDDM bottom line: per-iteration sync tax ~85ms — k=1 (16.5-18 tok/s) beats queue-k3
+  (10-15.6 tok/s, chain-draft quality decays: MTP recursion state drifts vs true h).
+  Queue arch wins on low-sync platforms (Linux/TCC est. 17 at k=3, 27+ at k=7).
+- mt-GEMV config: warps=4 WORSE than warps=2 in-context (g4 154 vs 105ms) — R4/BK256/W2
+  is optimal; reconfirmed: always verify kernel configs with deployed-model timing.
+
 ## ixgs (Group-Scale, v3) — future direction
 - `ixgs/` is a self-contained package: per-group scale (`group_max/15`, group=64)
   + the same (3,5,8) lossless encoding. Validated on MiniMax-H3 video DiT where
