@@ -607,6 +607,8 @@ def main():
             bigram[(ids[i - 2], ids[i - 1])].append(ids[i])
 
         gen = []
+        # reference: pure g1 decode for the first 6 (from probe)
+        print('  [dbg] first 6 loop tokens:', flush=True)
         n_acc = n_rej = n_ng = n_mtp = 0
         t = len(ids)
         t0 = time.time()
@@ -653,6 +655,9 @@ def main():
             pos2[0] = t; pos2[1] = t + 1
             g2.replay()
             t2 = log2_s[:, 0].argmax().item()
+            if len(gen) < 8:
+                print(f'    it{len(gen)}: t1={t1} d={d} t2={t2} '
+                      f'{"ACC" if t2 == d else "REJ"}', flush=True)
 
             if t2 == d:
                 gen.extend([t1, d])

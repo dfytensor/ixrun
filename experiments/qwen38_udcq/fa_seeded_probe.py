@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Full-attn SEEDED-KV S=2 vs 2xS=1 — single layer, 7 prefilled tokens.
 This is the exact configuration the earlier fresh-cache probe missed."""
+import pandas  # MUST be before torch (DLL order, env quirk)
 import sys
 sys.setrecursionlimit(20000)
 sys.path.insert(0, r'E:\IXRUN')
