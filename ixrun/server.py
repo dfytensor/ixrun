@@ -295,13 +295,22 @@ def serve(
     min_batch: int = 8,
     max_batch: int = 16,
 ):
-    """Load engine + run uvicorn (blocking)."""
+    """Load engine + run uvicorn (blocking).
+
+    mode='udcq-graph' + cache_path=<q38_blob.pt> serves the Qwen3.8-27B
+    UDCQ 6bpw StaticCache + CUDA-Graph engine (~15 tok/s, 24GB card).
+    """
     import uvicorn
 
-    eng = Int8XEngine.from_pretrained(
-        model_path, mode=mode, level_bits=tuple(level_bits),
-        cache_path=cache_path, verbose=True,
-    )
+    if mode == "udcq-graph":
+        from .q38_graph import Q38GraphEngine
+
+        eng = Q38GraphEngine.from_blob(cache_path, model_path)
+    else:
+        eng = Int8XEngine.from_pretrained(
+            model_path, mode=mode, level_bits=tuple(level_bits),
+            cache_path=cache_path, verbose=True,
+        )
     if model_id is None:
         model_id = (model_path.rstrip("/\\").replace("\\", "/").split("/")[-1]
                     .lower().replace(".", "-"))

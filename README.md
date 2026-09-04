@@ -43,8 +43,12 @@ for chunk in eng.stream("Once upon a time", max_new_tokens=64):
 python -m ixrun.cli search                  # 穷举最优位图组合
 python -m ixrun.cli generate "Hello" --stream
 python -m ixrun.cli bench                   # bf16 vs INT8-X
-python -m ixrun.cli chat --model E:\models\Qwen3.8-27B --cache E:\models\qwen38_packed.pt
-python -m ixrun.cli serve --model E:\models\Qwen3.8-27B --port 8000 --model-id qwen3.8-27b
+
+# 27B UDCQ 6bpw + CUDA Graph (~15 tok/s, blob 9s 快载)
+python -m ixrun.cli chat --model E:\models\Qwen3.8-27B --mode udcq-graph \
+    --cache experiments/qwen38_udcq/q38_blob.pt
+python -m ixrun.cli serve --model E:\models\Qwen3.8-27B --mode udcq-graph \
+    --cache experiments/qwen38_udcq/q38_blob.pt --port 8000   # OpenAI 兼容
 ```
 
 ## MiniCPM5-1B 基准（今日实测）
@@ -92,6 +96,15 @@ vs 55min 重量化）。
 4. **"同步税"不存在** — event 门铃轮询证明 wall==GPU 时间；真凶是诊断克隆泄漏
    3.5GB 显存 → WDDM sysmem 换页（GPU 时间翻倍）。计时前必须释放诊断 + 查
    `mem_get_info`。
+
+| 格式/能力 | 库级 API | CLI（chat/generate）| serve（OpenAI 兼容）|
+|---|---|---|---|
+| **INT8-X**（cached/streaming/graph）| ✅ `Int8XEngine` | ✅ | ✅ |
+| **UDCQ 27B 图解码**（blob + 15 tok/s）| ✅ `Q38GraphEngine.from_blob` | ✅ `--mode udcq-graph` | ✅ 同左 |
+| **PEAK-Q** | ✅ `deploy_peakq` + bench | — | — |
+
+`Q38GraphEngine`（`ixrun/q38_graph.py`）与 `Int8XEngine` 同接口（tokenizer/generate/stream），
+blob 9s 快载、S=8 分块 prefill、逐 token 图回放，chat/serve 无缝继承（`<think>` 隐藏、SSE 流式均可用）。
 
 ## API Server（OpenAI 兼容）
 

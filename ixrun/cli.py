@@ -36,13 +36,25 @@ def _cmd_search(args):
         )
 
 
-def _cmd_generate(args):
+def _build_engine(args):
+    """Engine factory shared by generate/chat (mode='udcq-graph' serves
+    the Qwen3.8-27B UDCQ blob + CUDA-Graph path)."""
+    if getattr(args, "mode", None) == "udcq-graph":
+        from .q38_graph import Q38GraphEngine
+
+        if not args.cache:
+            raise SystemExit("udcq-graph requires --cache <q38_blob.pt>")
+        return Q38GraphEngine.from_blob(args.cache, args.model)
     from .engine import Int8XEngine
 
-    eng = Int8XEngine.from_pretrained(
+    return Int8XEngine.from_pretrained(
         args.model, mode=args.mode, level_bits=tuple(args.levels),
         cache_path=args.cache, verbose=True,
     )
+
+
+def _cmd_generate(args):
+    eng = _build_engine(args)
     print(f"\n[prompt] {args.prompt}\n", flush=True)
     if args.stream:
         for chunk in eng.stream(args.prompt, max_new_tokens=args.max_new_tokens,
@@ -57,13 +69,9 @@ def _cmd_generate(args):
 
 
 def _cmd_chat(args):
-    from .engine import Int8XEngine
     from .chat import chat_repl
 
-    eng = Int8XEngine.from_pretrained(
-        args.model, mode=args.mode, level_bits=tuple(args.levels),
-        cache_path=args.cache, verbose=True,
-    )
+    eng = _build_engine(args)
     chat_repl(eng, max_new_tokens=args.max_new_tokens,
               temperature=args.temperature, do_sample=args.do_sample)
 
@@ -156,31 +164,34 @@ def main():
     pg = sub.add_parser("generate", help="generate text")
     pg.add_argument("prompt")
     pg.add_argument("--model", default=MODEL_PATH)
-    pg.add_argument("--mode", default="cached", choices=["cached", "streaming", "graph"])
+    pg.add_argument("--mode", default="cached",
+                    choices=["cached", "streaming", "graph", "udcq-graph"])
     pg.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pg.add_argument("--max-new-tokens", type=int, default=128)
     pg.add_argument("--temperature", type=float, default=0.7)
     pg.add_argument("--do-sample", action="store_true", default=True)
     pg.add_argument("--no-sample", dest="do_sample", action="store_false")
     pg.add_argument("--stream", action="store_true")
-    pg.add_argument("--cache", default=None, help="packed-weight cache file (streaming mode)")
+    pg.add_argument("--cache", default=None, help="packed-weight cache file / UDCQ blob")
     pg.set_defaults(func=_cmd_generate)
 
     pc = sub.add_parser("chat", help="interactive chat REPL")
     pc.add_argument("--model", default=MODEL_PATH)
-    pc.add_argument("--mode", default="streaming", choices=["cached", "streaming"])
+    pc.add_argument("--mode", default="streaming",
+                    choices=["cached", "streaming", "udcq-graph"])
     pc.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pc.add_argument("--max-new-tokens", type=int, default=256)
     pc.add_argument("--temperature", type=float, default=0.7)
     pc.add_argument("--no-sample", dest="do_sample", action="store_false")
-    pc.add_argument("--cache", default=None, help="packed-weight cache file (streaming mode)")
+    pc.add_argument("--cache", default=None, help="packed-weight cache file / UDCQ blob")
     pc.set_defaults(func=_cmd_chat, do_sample=True)
 
     pv = sub.add_parser("serve", help="OpenAI-compatible API server")
     pv.add_argument("--model", default=MODEL_PATH)
-    pv.add_argument("--mode", default="streaming", choices=["cached", "streaming"])
+    pv.add_argument("--mode", default="streaming",
+                    choices=["cached", "streaming", "udcq-graph"])
     pv.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
-    pv.add_argument("--cache", default=None, help="packed-weight cache file (streaming mode)")
+    pv.add_argument("--cache", default=None, help="packed-weight cache file / UDCQ blob")
     pv.add_argument("--host", default="127.0.0.1")
     pv.add_argument("--port", type=int, default=8000)
     pv.add_argument("--model-id", default=None, help="model id advertised via /v1/models")
