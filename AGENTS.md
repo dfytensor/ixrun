@@ -115,9 +115,16 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   prefix as the next block's known tokens (auto-reverified deterministically) — zero
   prefix-recompute replays, one sync per iteration. Commit only tokens BEYOND the known
   prefix (root position = pend_len-1) or text doubles.
-- WDDM bottom line: per-iteration sync tax ~85ms — k=1 (16.5-18 tok/s) beats queue-k3
-  (10-15.6 tok/s, chain-draft quality decays: MTP recursion state drifts vs true h).
-  Queue arch wins on low-sync platforms (Linux/TCC est. 17 at k=3, 27+ at k=7).
+- WDDM bottom line: there is NO sync tax. CUDA-event doorbell polling
+  (ev.record + spin ev.query, no blocking synchronize) proved wall == GPU time;
+  the earlier "~85ms sync tax" was VRAM exhaustion (leaked diagnostic clones,
+  ~3.5GB of snapshot tensors) pushing into WDDM sysmem paging — in-context GPU
+  time doubled (g4dec 105 -> 177ms, mem_get_info free=0.00GB). ALWAYS free
+  diagnostics + empty_cache before timed runs; check torch.cuda.mem_get_info().
+  Clean state: queue-k3 = 2 graph replays/iter, 120ms/iter GPU-bound, 2.22
+  tok/iter (chain-draft quality decays: MTP recursion state drifts vs true h;
+  zh worst at 1.25). k=1 (1.82 tok/iter, ~110ms) is at parity on WDDM; queue
+  arch wins on low-sync platforms (Linux/TCC est. 17 at k=3, 27+ at k=7).
 - mt-GEMV config: warps=4 WORSE than warps=2 in-context (g4 154 vs 105ms) — R4/BK256/W2
   is optimal; reconfirmed: always verify kernel configs with deployed-model timing.
 
