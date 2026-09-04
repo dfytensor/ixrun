@@ -294,11 +294,13 @@ def serve(
     batched: bool = False,
     min_batch: int = 8,
     max_batch: int = 16,
+    codec: str = "int8x",
 ):
     """Load engine + run uvicorn (blocking).
 
-    mode='udcq-graph' + cache_path=<q38_blob.pt> serves the Qwen3.8-27B
-    UDCQ 6bpw StaticCache + CUDA-Graph engine (~15 tok/s, 24GB card).
+    mode='udcq-graph' + cache_path=<q38_blob.pt>: Qwen3.8-27B UDCQ 6bpw
+    StaticCache + CUDA-Graph engine (~15 tok/s, 24GB card).
+    codec='peakq': near-lossless 10.6bpw engine.
     """
     import uvicorn
 
@@ -306,6 +308,10 @@ def serve(
         from .q38_graph import Q38GraphEngine
 
         eng = Q38GraphEngine.from_blob(cache_path, model_path)
+    elif codec == "peakq":
+        from .peakq_engine import PeakQEngine
+
+        eng = PeakQEngine.from_pretrained(model_path, mode=mode)
     else:
         eng = Int8XEngine.from_pretrained(
             model_path, mode=mode, level_bits=tuple(level_bits),

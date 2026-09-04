@@ -37,14 +37,22 @@ def _cmd_search(args):
 
 
 def _build_engine(args):
-    """Engine factory shared by generate/chat (mode='udcq-graph' serves
-    the Qwen3.8-27B UDCQ blob + CUDA-Graph path)."""
+    """Engine factory shared by generate/chat.
+
+    --codec int8x   Int8XEngine (cached/streaming/graph)
+    --codec peakq   PeakQEngine (cached/streaming, 10.6bpw 54dB)
+    --mode udcq-graph + --cache <blob>  Q38GraphEngine (27B 6bpw, 15 tok/s)
+    """
     if getattr(args, "mode", None) == "udcq-graph":
         from .q38_graph import Q38GraphEngine
 
         if not args.cache:
             raise SystemExit("udcq-graph requires --cache <q38_blob.pt>")
         return Q38GraphEngine.from_blob(args.cache, args.model)
+    if getattr(args, "codec", "int8x") == "peakq":
+        from .peakq_engine import PeakQEngine
+
+        return PeakQEngine.from_pretrained(args.model, mode=args.mode)
     from .engine import Int8XEngine
 
     return Int8XEngine.from_pretrained(
@@ -148,6 +156,7 @@ def _cmd_serve(args):
         model_id=args.model_id,
         enable_thinking=args.think,
         batched=args.batched,
+        codec=args.codec,
     )
 
 
@@ -166,6 +175,7 @@ def main():
     pg.add_argument("--model", default=MODEL_PATH)
     pg.add_argument("--mode", default="cached",
                     choices=["cached", "streaming", "graph", "udcq-graph"])
+    pg.add_argument("--codec", default="int8x", choices=["int8x", "peakq"])
     pg.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pg.add_argument("--max-new-tokens", type=int, default=128)
     pg.add_argument("--temperature", type=float, default=0.7)
@@ -179,6 +189,7 @@ def main():
     pc.add_argument("--model", default=MODEL_PATH)
     pc.add_argument("--mode", default="streaming",
                     choices=["cached", "streaming", "udcq-graph"])
+    pc.add_argument("--codec", default="int8x", choices=["int8x", "peakq"])
     pc.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pc.add_argument("--max-new-tokens", type=int, default=256)
     pc.add_argument("--temperature", type=float, default=0.7)
@@ -190,6 +201,7 @@ def main():
     pv.add_argument("--model", default=MODEL_PATH)
     pv.add_argument("--mode", default="streaming",
                     choices=["cached", "streaming", "udcq-graph"])
+    pv.add_argument("--codec", default="int8x", choices=["int8x", "peakq"])
     pv.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pv.add_argument("--cache", default=None, help="packed-weight cache file / UDCQ blob")
     pv.add_argument("--host", default="127.0.0.1")

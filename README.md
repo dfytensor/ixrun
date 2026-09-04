@@ -99,12 +99,18 @@ vs 55min 重量化）。
 
 | 格式/能力 | 库级 API | CLI（chat/generate）| serve（OpenAI 兼容）|
 |---|---|---|---|
-| **INT8-X**（cached/streaming/graph）| ✅ `Int8XEngine` | ✅ | ✅ |
+| **INT8-X**（cached/streaming/graph）| ✅ `Int8XEngine` | ✅ 默认 | ✅ |
+| **PEAK-Q** 10.6bpw 54dB | ✅ `deploy_peakq` | ✅ `--codec peakq` | ✅ 同左 |
 | **UDCQ 27B 图解码**（blob + 15 tok/s）| ✅ `Q38GraphEngine.from_blob` | ✅ `--mode udcq-graph` | ✅ 同左 |
-| **PEAK-Q** | ✅ `deploy_peakq` + bench | — | — |
 
-`Q38GraphEngine`（`ixrun/q38_graph.py`）与 `Int8XEngine` 同接口（tokenizer/generate/stream），
-blob 9s 快载、S=8 分块 prefill、逐 token 图回放，chat/serve 无缝继承（`<think>` 隐藏、SSE 流式均可用）。
+`Q38GraphEngine`（`ixrun/q38_graph.py`）与 `Int8XEngine` / `PeakQEngine`（`ixrun/peakq_engine.py`）
+同接口（tokenizer/generate/stream），chat/serve 无缝继承（`<think>` 隐藏、SSE 流式均可用）：
+
+```bash
+# INT8-X（默认）          python -m ixrun.cli chat
+# PEAK-Q 近无损           python -m ixrun.cli chat --codec peakq
+# 27B UDCQ 图解码         python -m ixrun.cli chat --mode udcq-graph --cache q38_blob.pt
+```
 
 ## API Server（OpenAI 兼容）
 
