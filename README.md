@@ -1,31 +1,30 @@
-# IXRUN — INT8-X 推理引擎
+# IXRUN — 单卡 24GB LLM 压缩推理引擎
 
-> Block-INT8 + nested-bitmap (3,5,8) 无损权重编码 + Triton GPU 解码 + 流式推理，
-> 面向 LLM 文本生成。整理自 `F:\dg_minicpm5` 的 int8x 研究代码，重构成完整推理引擎。
+> 三代权重编码（INT8-X / PEAK-Q / UDCQ）+ Triton 融合 kernel + CUDA Graph 解码 +
+> MTP 投机解码。目标：RTX 4090 24GB 上跑 Qwen3.8-27B（51.75GB bf16 → 20GB 压缩）。
 
 ## 核心能力
 
-| 模块 | 功能 |
-|---|---|
-| **bfloat16_to_int8x** (`quantize.py`) | bf16 权重 → int8 → (3,5,8) 嵌套位图打包，~5.5 bit/w，2.9× 压缩 |
-| **分析搜索** (`search.py`) | 穷举 2~5 级位图组合，按 bit/w 排序找最优方案 |
-| **Triton 解码** (`triton_kernels.py`) | 融合单 kernel：cumsum + 位图查询 + 跨字位提取，并行解码 |
-| **流推理** (`engine.py`) | GPU常驻packed + 共享decode buf + Triton实时解码 (3模式: cached/streaming/graph) |
-| **资源调度** (`ResourceScheduler`) | 估算 bf16/packed/peak 显存，按 GPU 预算选 cached/streaming 模式 |
-| **文本生成** (`generate.py`) | greedy/sampling + token 流式输出 |
+| 模块 | 文件 | 说明 |
+|---|---|---|
+| **INT8-X** 无损位图编码 | `quantize.py` | bf16→int8→(3,5,8) 嵌套位图，5.5 bpw，对 int8 逐位无损 |
+| **PEAK-Q** 近无损指数分组 | `peakq.py` | 10.6 bpw，54dB SNR，ppl +0.14；v2 rows 布局免前缀表 |
+| **UDCQ** 4-bit 码本量化 | `udcq.py` | 6.0 bpw，ppl ±0；nibble idx + 融合 GEMV/GEMM |
+| **多 token GEMV** | `udcq.py` | `udcq_fused_gemv_mt` T∈{2,4,8}：同走带+同累加式 ⇒ 与 M=1 **逐位一致**，带宽受限 ⇒ T=4 成本≈单 token（投机解码免费验证） |
+| **融合 kernel** | `fused.py` `tpab_gemv*.py` | decode+GEMV 单 kernel，bf16 权重永不落地（3× 流量→1×） |
+| **CUDA mma kernel** | `experiments/udcq_mma/` | m16n8k16 手写 mma.sync + cp.async 双缓冲，M=256 时 1.06-2.26× vs cublas |
+| **27B 投机解码** | `experiments/qwen38_udcq/round4b_bisect.py` | 队列架构 k=3：MTP 链式草稿 + T=4 单图验证 + 单同步 + **零前缀重放** |
+| **流式引擎** | `engine.py` | cached / streaming / graph 三模式 + ResourceScheduler |
+| **OpenAI 兼容 server** | `cli.py serve` | fastapi，SSE 流式，`<think>` 自动隐藏 |
 
-## (3,5,8) 原理
+## 三代编码格式
 
 ```
-bf16 权重 (16 bit/w)
-  ↓  per-tensor scale = max_abs / 127
-int8 (8 bit/w, 有微小量化误差)
-  ↓  按幅值分三级，嵌套位图无损重编码
-  L1: |v| ≤ 3   (~55%) → 3 bit
-  L2: 3 < |v| ≤ 15 (~40%) → 5 bit
-  L3: |v| > 15  (~4%)  → 8 bit
-  + 嵌套位图开销 ~1.49 bit/w
-  ≈ 5.5 bit/w → 2.9× vs bf16
+INT8-X  5.5 bpw  对 int8 无损（ppl 差全部来自 int8 量化本身）— 基础设施
+PEAK-Q  10.6 bpw 54dB SNR，69% 元素 bit-exact — 近无损档
+UDCQ    6.0 bpw  4-bit 码本 + per-group scale，ppl ±0 — 27B 单卡落地的主力
+ixgs    4.2 bpw  per-group scale（group=64），25.4dB — 重尾权重/视频 DiT 方向
+TPAB    2-6 bit  64×64 tile 定长布局 — 小模型 8.9×，27B 不敌 UDCQ
 ```
 
 ## 快速使用
@@ -34,288 +33,107 @@ int8 (8 bit/w, 有微小量化误差)
 from ixrun import Int8XEngine
 from ixrun.config import MODEL_PATH
 
-# 加载 + 量化 + 部署 (cached 模式：解码一次，极速推理)
 eng = Int8XEngine.from_pretrained(MODEL_PATH, mode="cached")
-
-# 文本生成
 print(eng.generate("The theory of relativity states that", max_new_tokens=64))
-
-# 流式输出
 for chunk in eng.stream("Once upon a time", max_new_tokens=64):
     print(chunk, end="", flush=True)
 ```
 
-### 搜索最优编码方案
-
-```python
-from transformers import AutoModelForCausalLM
-from ixrun.search import search_optimal_levels
-
-model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, dtype="bfloat16")
-for r in search_optimal_levels(model, topk=10):
-    print(r["level_bits"], f"bpw={r['bpw']:.2f}", f"comp={r['compression']:.2f}x")
-```
-
-### 流式推理 (省显存)
-
-```python
-eng = Int8XEngine.from_pretrained(MODEL_PATH, mode="streaming")
-# packed 数据在 pinned host RAM，GPU 仅需 ~22MB 共享 decode buffer
-```
-
-## 命令行
-
 ```bash
-# 分析最优位图组合
-python -m ixrun.cli search --topk 12
-
-# 生成文本
-python -m ixrun.cli generate "Hello, my name is" --stream --max-new-tokens 64
-
-# 基准测试 (bf16 vs INT8-X)
-python -m ixrun.cli bench
-python -m ixrun.cli bench --mode streaming
+python -m ixrun.cli search                  # 穷举最优位图组合
+python -m ixrun.cli generate "Hello" --stream
+python -m ixrun.cli bench                   # bf16 vs INT8-X
+python -m ixrun.cli chat --model E:\models\Qwen3.8-27B --cache E:\models\qwen38_packed.pt
+python -m ixrun.cli serve --model E:\models\Qwen3.8-27B --port 8000 --model-id qwen3.8-27b
 ```
 
-## MiniCPM5-1B 实测结果
+## MiniCPM5-1B 基准（今日实测）
 
-| 模式 | 前向 | GPU 显存 | ppl | 存储 | 压缩比 | 说明 |
-|---|---|---|---|---|---|---|
-| bf16 基线 | 38ms | 2.2GB | 55.90 | 2161MB | 1.0× | 原始精度 |
-| 纯 int8 | — | — | 62.15 | 1080MB | 2.0× | 参照 |
-| INT8-X cached | 38ms | 2.2GB | 62.15 | 463MB | 4.66× | 解码一次,极速 |
-| INT8-X streaming | 46ms | 1.3GB | — | 463MB* | 4.66× | GPU常驻packed+共享buf,实时解码 |
-| INT8-X graph | 41ms | 4.3GB | — | 463MB* | 4.66× | CUDA Graph融合168层解码 |
+| 模式 | 前向 | GPU 显存 | ppl | 存储 | 压缩比 |
+|---|---|---|---|---|---|
+| bf16 基线 | 37ms | 2.2GB | 56.02 | 2161MB | 1.0× |
+| INT8-X cached | 38ms | 2.2GB | 62.15 | 463MB | 4.66× |
+| INT8-X streaming | 49ms | 1.3GB | — | 463MB* | 4.66× |
+| INT8-X graph | 44ms | 4.3GB | — | 463MB* | 4.66× |
+| UDCQ (4-bit) | ≡bf16 | — | ±0 | ~390MB | ~5.5× |
 
-### 精度等价性验证 (tests/test_int8_equivalence.py)
+无损等价性：INT8-X == 纯 int8 逐位相等（ppl 62.1496 完全相同，10 层 bit-exact，
+greedy 一致率 100%）。多 token GEMV bit-exact 测试：
+`python -X utf8 experiments/qwen38_udcq/test_mt_gemv.py`（全部形状 × T∈{2,4,8} 零差异）。
 
-INT8-X 是 int8 的**无损编解码器**，实测与纯 int8 完全等价：
+## Qwen3.8-27B 单卡推理（UDCQ 6bpw）
 
-```
-层级验证:  10 层 bit-exact (max_diff = 0.0), SNR 相同 (30.25dB)
-模型验证:  ppl 纯int8=62.1496  INT8-X=62.1496 (完全相同)
-          logits max|diff| = 0.000e+00 (逐位相等)
-          greedy next-token 一致率 = 100.00%
-```
+64 层混合架构（48 GatedDeltaNet 线性注意力 + 16 全注意力），27B bf16 51.75GB
+无法进 24GB；UDCQ 压到 ~20GB（blob 快速部署 `q38_blob.pt` 21.76GB，18s 加载
+vs 55min 重量化）。
 
-ppl 55.90→62.15 的差距**全部来自 bf16→int8 量化本身**（任何 int8 量化器相同），
-(3,5,8) 位图重编码零额外损失。
+### 性能阶梯（全部文本连贯）
 
-\* streaming: packed数据GPU常驻(463MB)+共享decode buf(14MB),总GPU权重≈1.3GB
-\* graph: packed+per-layer decode buf,CUDA Graph replay消除168次kernel launch
+| 阶段 | 速度 | 说明 |
+|---|---|---|
+| INT8-X streaming 基线 | 310→138 ms/tok | cumsum 削减 + fused GEMV + fla 绑定 + split-K |
+| UDCQ 静态 KV + CUDA Graph 贪心 | **15 tok/s** | `round3_graph.py`，生产级稳定 |
+| 队列架构投机解码 k=3 | **14.8-16.4 tok/s**（英/码）| `round4b_bisect.py`，E=2.22 tok/迭代 |
+| 同上 pipe-bench | 120.8ms/迭代 | GPU 纯bound：MTP链 14.6 + T=4验证 106.9 + 提交间隔 0.2 |
 
-搜索最优方案（实测）：`(3,4,5,6,8)` bpw=5.33 comp=3.00×，默认 `(3,5,8)` bpw=5.46 comp=2.93×。
+投机解码当前受限于两件事：① 权重读取地板（20GB@220GB/s≈106ms/前向，T=4 已摊薄
+到 26ms/token）；② MTP 链式草稿质量衰减（d1 用真 h ~75% 接受，d2/d3 用递归近似
+递减 → E=2.22；中文最弱 1.25）。加深到 k=7（T=8）预估 22-25 tok/s。
 
-## API Server 模式（OpenAI 兼容）
+### 调试中钉死的四个暗坑（详见 AGENTS.md）
+
+1. **transformers 5.15 缓存 `conv_states`/`recurrent_states` 是 dict** — 迭代对象
+   得到 int key，`isinstance(Tensor)` 守卫静默失效 → 快照/回滚从未生效（曾伪装成
+   "10-30 token 后文本退化"+"图 vs eager 数值不同"两个玄学）。
+2. **注意力输出 `[B,H,S,D]` reshape 前必须 transpose(1,2)** — q_len=1 碰巧无害，
+   q_len≥2 head/token 布局乱码（dmax 6.0）。
+3. **CUDA Graph 共享池混叠** — 捕获返回的张量在后续图回放中被覆盖，输出必须在
+   图内拷入静态 buffer（症状：token id 变 float 位模式）。
+4. **"同步税"不存在** — event 门铃轮询证明 wall==GPU 时间；真凶是诊断克隆泄漏
+   3.5GB 显存 → WDDM sysmem 换页（GPU 时间翻倍）。计时前必须释放诊断 + 查
+   `mem_get_info`。
+
+## API Server（OpenAI 兼容）
 
 ```powershell
-# 启动 server (Qwen3.8-27B, 缓存启动 ~30s)
 $env:HF_HUB_OFFLINE='1'; $env:PYTHONPATH='E:\IXRUN'
 & 'F:\rwkv\.venv\Scripts\python.exe' -m ixrun.cli serve --model E:\models\Qwen3.8-27B --cache E:\models\qwen38_packed.pt --port 8000 --model-id qwen3.8-27b
-# 加 --think 开启思考模式 (默认直答, 更适合编码客户端)
 ```
 
-端点：`GET /v1/models` · `POST /v1/chat/completions`（支持 `stream=true` SSE）· `GET /health`
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"hi"}],"stream":true}'
-```
-
-`<think>` 推理块自动隐藏（模板侧探测），非流式响应中放在 `reasoning_content` 字段。
-
-### opencode 接入
-
-项目根或 `~/.config/opencode/opencode.json`：
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "ixrun": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "IXRUN Local",
-      "options": { "baseURL": "http://127.0.0.1:8000/v1" },
-      "models": {
-        "qwen3.8-27b": { "name": "Qwen3.8-27B INT8-X (local)" }
-      }
-    }
-  }
-}
-```
-
-然后在 opencode 里 `/models` 选 `IXRUN Local → qwen3.8-27b` 即可。
-
-## 启动体验
-
-```powershell
-# ── Qwen3.8-27B 交互式聊天 (24GB 单卡) ────────────────────────────
-# 首次: 量化 606 层并缓存 (~13 min); 之后启动 ~1 min
-$env:HF_HUB_OFFLINE='1'; $env:PYTHONPATH='E:\IXRUN'
-& 'F:\rwkv\.venv\Scripts\python.exe' -m ixrun.cli chat --model E:\models\Qwen3.8-27B --cache E:\models\qwen38_packed.pt
-
-# 聊天内命令: /exit 退出 · /new 清空历史 · /len N 改长度 · /think off 关闭思考
-# (Qwen3.8 思考模型的 <think> 块实时隐藏, 只显示答案)
-
-# ── 单次生成 ──────────────────────────────────────────────────────
-& 'F:\rwkv\.venv\Scripts\python.exe' -m ixrun.cli generate "介绍一下你自己" --model E:\models\Qwen3.8-27B --mode streaming --cache E:\models\qwen38_packed.pt --stream
-
-# ── MiniCPM5-1B (快速体验, 无需大显存) ────────────────────────────
-& 'F:\rwkv\.venv\Scripts\python.exe' -m ixrun.cli chat --cache E:\models\minicpm5_packed.pt   # 二次启动 2s
-```
-
-`--cache` 指定打包权重落盘文件：首次运行量化并保存，之后启动直接加载
-（跳过量化与 bf16 磁盘读取，MiniCPM5 实测 19× 加速）。
-
-## 推理速度优化
-
-多轮优化把 27B 生成速度从 **310 → 138 ms/tok（累计 2.25×）**：
-
-1. **decode kernel cumsum 削减（4→2）**（bit-exact 不变）：310→199 ms/tok
-2. **融合 decode+GEMV kernel**（`ixrun/fused.py`）：KV-cache 生成时 GEMM 退化 GEMV，
-   kernel 内解码+乘累加，bf16 权重永不落地。孤立 0.31ms/89M 权重层（287G elem/s）。
-   199→165 ms/tok
-3. **fla Triton kernels 绑定**（`ixrun/fla_patch.py`）：transformers 5.15 期望的
-   `recurrent_gated_delta_rule` 在 fla 0.5.2 中名为 `fused_recurrent_gdn`，HF 的
-   hub-kernel fallback 因 API 不匹配**静默退回 fp32 Python 循环**（48 层 delta rule）。
-   patch 显式绑定 recurrent+chunk 两个 kernel。165→153 ms/tok
-4. **split-K wide GEMV**：down_proj (5120×17408) 单 kernel 只有 94G elem/s（行少
-   并行度低），按 in_f 切 2 块 + chunk 边界 rank 前缀 + fp32 atomic 累加 →
-   233G elem/s。153→138 ms/tok
-
-```
-Qwen3.8-27B streaming:  310 → 199 → 165 → 153 → 138 ms/tok
-实测 per-hook 分解 (138ms):  MLP 75ms · linear-attn 37ms · full-attn 14ms · glue 12ms
-```
-
-已试弃用：torch.compile 子模块（graph-break 导致 0.95×）；全模型 CUDA Graph
-（qwen3_5 硬编码 DynamicCache 不可行）。
-
-## MTP（Multi-Token Prediction，实验特性）
-
-Qwen3.8-27B 自带 MTP 模块（`mtp_num_hidden_layers: 1`），transformers 加载时
-**直接忽略**（`_keys_to_ignore_on_load_unexpected`）。`ixrun/mtp.py` 从权重
-逆向重建了 MTP 头并接入投机解码：
-
-- 结构（teacher-forcing 变体搜索验证）：`z = fc(cat(norm_e(emb), norm_h(h)))`
-  **无残差** → 1 层 full-attn decoder → 共享 lm_head；norm 均为 Qwen3.5 的
-  `(1+w)` 变体
-- MTP 头 9 个 Linear 全部 INT8-X 量化（StreamingLinear + 融合 GEMV）
-- 实测：teacher-forcing t+2 准确率 62.5%，投机接受率 63.9%，输出与贪心一致
-
-**净收益为负**（213 vs 181 ms/tok）：拒绝路径需在干净 cache 上重跑（qwen3_5
-混合线性注意力的 recurrent state 无法回退，只能 clone），64% 接受率低于盈亏
-平衡点 ~72%。业界 MTP 2-4× 收益依赖 paged-KV 原地回退 + CUDA graph 批量验证。
-因此**默认不启用**；待 KV 架构升级后可重估。
-
-```python
-from ixrun.mtp import build_mtp_head, spec_generate
-mtp = build_mtp_head(eng.model, MODEL_PATH)   # None if checkpoint has no MTP
-out = spec_generate(eng.model, eng.tokenizer, ids, mtp, max_new_tokens=200)
-```
-
-## Qwen3.8-27B 适配（多模态 + 混合线性/全注意力）
-
-ixrun 的量化/解码对架构完全透明（任何 `nn.Linear` 都适用）。Qwen3.8-27B
-（64 层 = 48 GatedDeltaNet 线性注意力 + 16 全注意力 + 27 层 ViT 视觉塔）：
-
-```
-[deploy] 606 layers | packed=16.91GB GPU | shared decode buf=178.3MB
-[vram]   allocated=22.45GB (含 bf16 embeddings ~5GB) — 单张 24GB 卡
-[verify] 5 层 bit-exact vs 纯 int8 (INT8-X == plain int8 同样成立)
-[gen]    "The capital of France is" → "Paris" ✓ / 中文相对论问题 ✓ (310 ms/tok)
-```
-
-27B bf16 (51.75GB) 无法放进 24GB GPU；INT8-X streaming 把权重压到 16.91GB
-实现单卡推理。大模型路径：CPU 懒加载 → 逐层量化 → packed 逐层上 GPU →
-bf16 原权重即时释放（64GB RAM 峰值安全，分块打包限制临时内存 <100MB/层）。
-
-```bash
-# 运行 (benchmarks/bench_qwen38.py)
-$env:HF_HUB_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts\python.exe' -m benchmarks.bench_qwen38
-```
-
-环境要求：transformers>=5.8 (qwen3_5 架构)，模型路径见 `ixrun/config.py:QWEN38_PATH`。
-
-## TPAB：Tile-并行自适应位宽编码（INT8-X 后继原型）
-
-64×64 tile 独立编码（fp16 scale + 自适应位宽 2-6bit + 离群值逃逸表），
-**定长位布局** — 解码零 rank/cumsum、任意 tile 任意顺序（INT8-X 做不到）。
-逐 tile 联合搜索 (离群数 k × 位宽 b) 的最便宜达标组合；SNR 目标 22/24/26/28dB
-四档可调（INT8-X 锁死 int8 精度）。
-
-### 按模型规模的实测结论
-
-| 规模 | 最优后端 | 实测 |
-|---|---|---|
-| 1B（MiniCPM5） | **TPAB@28dB** | 生成 35 vs 312 ms/tok（**8.9×**），Δppl +0.94 vs +6.13（**6.5×** 质量） |
-| 27B（Qwen3.8） | **INT8-X streaming** | 136 vs 145-152 ms/tok — TPAB 反慢 6-12% |
-
-**27B 上 TPAB 不赢的原因**（架构级认识）：fused GEMV 已把线性层压到不再是
-瓶颈（down_proj kernel 级 4.7× 优势被 attention/glue/launch 稀释）。TPAB 的
-e2e 优势在小模型（kernel 占比高）充分兑现；27B 剩余瓶颈在 48 层 GatedDeltaNet
-+ 16 层 full attention 与 Python 开销 — 已接近 eager HF 地板。
-
-```
-kernel 级 GEMV 吞吐（4090D, 真实重尾权重）:
-  5120x17408 (down):    TPAB 203G/s vs INT8-X  44G/s  → 4.66x
-  10240x5120 (qkvz):    TPAB 220G/s vs INT8-X  58G/s  → 3.83x
-  5120x5120  (o_proj):  TPAB 214G/s vs INT8-X 654G/s  → 0.33x (int8x wins)
-  17408x5120 (gate/up): TPAB 220G/s vs INT8-X 250G/s  → 0.88x (int8x wins)
-解码 kernel（全矩阵）:  TPAB 72-192G/s vs INT8-X 4-5G/s = 15-47×
-随机 tile 访问:         TPAB 1000/1000 bit-exact vs INT8-X 不可能
-```
-
-混合后端 `ixrun/hybrid.py`（按形状实测查表选编码）保留供中等规模实验。
-模块：`ixrun/tpab.py`（编码/解码）· `tpab_gemv.py`（融合 GEMV）·
-`tpab_linear.py`（部署层）· `hybrid.py`（混合策略）。
+端点：`GET /v1/models` · `POST /v1/chat/completions`（`stream=true` SSE）· `GET /health`。
+opencode 接入：provider baseURL `http://127.0.0.1:8000/v1`，模型 `qwen3.8-27b`。
 
 ## 项目结构
 
 ```
 ixrun/
-├── config.py            # 路径、常量、默认 (3,5,8) 方案
-├── bitpack.py           # 比特流打包/解包
-├── quantize.py          # bf16→int8→嵌套位图量化 (bfloat16_to_int8x)
-├── search.py            # 穷举搜索最优编码组合 (分析工具)
-├── triton_kernels.py    # Triton 融合解码 kernel + PyTorch 后备
-├── linear.py            # Int8XLinear 部署层 (cached/live 解码)
-├── engine.py            # 流式推理引擎 + ResourceScheduler
-├── generate.py          # 文本生成 (greedy/sampling/streaming)
-├── eval_utils.py        # 前向测速 + 困惑度评估
-└── cli.py               # 命令行入口
-ixgs/                    # ★ v3 方案: Group-Scale INT8-X (见 ixgs/README.md)
-├── quantize.py          #   per-group scale (max/15) + (3,5,8) 无损编码
-├── kernels.py           #   Triton kernel + per-group scale 查表
-├── linear.py            #   Int8GSLinear + deploy_model_gs
-└── test_gs.py           #   无损/SNR/kernel 等价性测试
-benchmarks/
-└── bench_minicpm5.py    # MiniCPM5-1B 全流程基准
-tests/
-├── test_core.py               # 核心正确性测试 (无损验证)
-└── test_int8_equivalence.py   # INT8-X == 纯int8 精度等价验证
+├── config.py            # 路径与常量
+├── quantize.py          # INT8-X: bf16→int8→(3,5,8) 位图
+├── peakq.py             # PEAK-Q v2: 指数分组近无损 + 融合 GEMV
+├── udcq.py              # UDCQ: 4-bit 码本 + 融合 GEMV/GEMM/多token GEMV
+├── triton_kernels.py    # INT8-X 解码 kernel
+├── fused.py             # INT8-X 融合 decode+GEMV
+├── tpab*.py hybrid.py   # TPAB tile 编码与混合后端
+├── linear.py            # 部署层（Int8XLinear / UdcqLinear / PeakQLinear）
+├── engine.py            # 三模式引擎 + ResourceScheduler
+├── fla_patch.py         # fla Triton kernel 绑定（否则 HF 回退 120ms/tok Python 循环）
+├── gdn_seq_patch.py     # GDN 种子块逐 token 精确路径 (S≤8，投机验证用)
+├── generate.py eval_utils.py cli.py mtp.py
+ixgs/                    # Group-Scale v3（视频 DiT 方向，见 ixgs/README.md）
+experiments/
+├── qwen38_udcq/         # 27B 全链路：blob 部署/静态KV图解码/投机解码/test_mt_gemv
+├── udcq_mma/            # CUDA mma.sync 批量 kernel
+benchmarks/              # bench_minicpm5 / bench_qwen38 / bench_peakq
+tests/                   # test_core（无损验证）
 ```
 
-## 未来方向：Group-Scale INT8-X (`ixgs/`)
+## 环境与铁律
 
-**per-tensor scale 的量化误差是系统性相关的**，在深层模型上相干累积导致输出崩坏。
-在 MiniMax-H3 视频 DiT（50 层 × 10 步去噪）上实测：
-
-| 方案 | scale | bpw | 逐层 SNR | H3 视频 |
-|---|---|---|---|---|
-| INT8-X per-tensor | `max/127` | 3.29 | 20.1 dB | 方块伪影 |
-| NF4 | per-64 非线性 | 4.0 | 20.5 dB | 好 |
-| **ixgs (3,5,8) per-group** | **`group_max/15`** | **4.16** | **25.4 dB** | **好** |
-
-ixgs 保留 (3,5,8) 无损编码层，把量化层升级为 per-group scale（group_size=64），
-SNR 同时超过 per-tensor 和 NF4。编码层 100% 无损（数值相等），
-Triton 与 scatter 解码 bit-exact。适用于重尾权重分布（真实 LLM/DiT 均是）；
-纯高斯合成数据上 per-tensor 反而更优（无离群值时全局步长更细）。
-
-详见 [`ixgs/README.md`](ixgs/README.md)，测试：`python -m ixgs.test_gs`
-
-## 环境
-
-- Python: `F:\rwkv\.venv\Scripts\python.exe` (3.12)
-- torch 2.13+cu126, triton 3.7.1, transformers 4.57.6, RTX 4090 D
-- 离线运行：`HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1`
+- Python `F:\rwkv\.venv\Scripts\python.exe` (3.12)，torch 2.13+cu126，triton 3.7.1，
+  transformers 5.15（qwen3_5 需 ≥5.8），RTX 4090 24GB / WDDM
+- 离线：`HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`；中文/特殊字符加 `PYTHONUTF8=1`
+- **`import pandas` 必须在 `import torch` 之前**（反序会堆损坏 0xC0000374）
+- kernel 配置**必须用部署模型实测**校验（孤立计时在此 WDDM 机器不可靠，
+  warps=4 孤立更快、在模型中慢 15-60%）
+- 计时基准前：释放诊断张量 + `torch.cuda.empty_cache()` + 检查
+  `torch.cuda.mem_get_info()`（free=0 ⇒ 已进换页区，数字全废）
