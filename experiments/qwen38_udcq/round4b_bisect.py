@@ -1051,6 +1051,24 @@ def main():
           f'dK max {dmax_eager:.4f}', flush=True)
     hard_reset()
 
+    # ---- release ALL diagnostic clones before timed generation ----
+    # The bisect harness above leaks ~3.5GB (7x full_snap with 48-layer
+    # rec/conv clones + hook captures). With VRAM exhausted, WDDM pages
+    # to sysmem and in-context GPU bandwidth collapses (g4dec 105 ->
+    # 177ms). Freeing restores the fast path.
+    _DBG.clear()
+    snapA = snapB = snapA2 = snapA3 = snapB2 = None
+    base = r1 = r2 = None
+    cap1 = cap2 = cap3 = caps = caps2 = seq_cap = t2_cap = None
+    dseq = dt2 = snapSeq = refCum = None
+    cosB1 = sinB1 = cosB2 = sinB2 = None
+    gc.collect()
+    torch.cuda.empty_cache()
+    _f, _t = torch.cuda.mem_get_info()
+    print(f'[cleanup] VRAM free {_f/1e9:.2f} / {_t/1e9:.2f}GB '
+          f'(allocated {torch.cuda.memory_allocated()/1e9:.2f}GB)',
+          flush=True)
+
     def spec_gen(prompt, N=40):
         ids = tok(prompt, return_tensors='pt')['input_ids'][0].tolist()
         # prefill
@@ -1101,6 +1119,7 @@ def main():
 
         gen = []
         n_iter = 0
+        ev = torch.cuda.Event()        # doorbell event (reused)
         acc_hist = [0, 0, 0, 0]        # committed-tokens-per-iter (1..4)
         t_draft = t_verify = t_commit = 0.0
         t = len(ids)
@@ -1112,10 +1131,16 @@ def main():
             g_chainprep.replay()       # -> tok_out, emb4/cos4/sin4/pos4
             _t1 = time.time(); t_draft += _t1 - _t0
 
-            # -- 2. T=4 verify + decisions (ONE replay) + THE sync --
+            # -- 2. T=4 verify + decisions (ONE replay) + doorbell poll --
             g4dec.replay()             # -> dec_gpu, a_buf, out_h4/out_l4
             dec_pin.copy_(dec_gpu, non_blocking=True)
-            torch.cuda.synchronize()   # THE sync
+            # DOORBELL instead of torch.cuda.synchronize(): the blocking
+            # device sync forces a WDDM driver round-trip (~60-85ms);
+            # polling a recorded event reads a GPU-written mapped flag
+            # in user space (~us). CPU spin, no kernel transition.
+            ev.record()
+            while not ev.query():
+                pass
             _t2 = time.time(); t_verify += _t2 - _t1
             L = int(dec_pin[0])
             tv = [int(dec_pin[1]), int(dec_pin[2]),
@@ -1192,17 +1217,34 @@ def main():
     dec_pin_b = torch.zeros(6, dtype=torch.long, pin_memory=True)
     chain_in[0] = 12345
     pend_len[0] = 1
+    ev_b = torch.cuda.Event(enable_timing=True)
+    e0, e1 = (torch.cuda.Event(enable_timing=True),
+              torch.cuda.Event(enable_timing=True))
+    # warm
+    g_chainprep.replay(); g4dec.replay()
     torch.cuda.synchronize()
+    # variant A: chainprep + g4dec alternating, GPU-side event timing
+    t_cp = t_g4 = 0.0
     t0b = time.time()
     for _ in range(40):
         pin_t[0] = tb
+        e0.record()
         g_chainprep.replay()
+        e1.record()
         g4dec.replay()
-        dec_pin_b.copy_(dec_gpu, non_blocking=True)
-        torch.cuda.synchronize()
+        ev_b.record()
+        while not ev_b.query():
+            pass
+        t_cp += e0.elapsed_time(e1)
+        t_g4 += e1.elapsed_time(ev_b)
     dtb = (time.time() - t0b) / 40 * 1e3
-    print(f'\n[pipe-bench] 4 replays + sync = {dtb:.1f}ms/iter '
-          f'(no branching, no prefix replays)', flush=True)
+    print(f'\n[pipe-bench] alternating 2 graphs: wall {dtb:.1f}ms/iter '
+          f'| GPU-side: chainprep {t_cp/40:.1f}ms + g4dec {t_g4/40:.1f}ms '
+          f'+ submit-gap {dtb - t_cp/40 - t_g4/40:.1f}ms', flush=True)
+    free_b, total_b = torch.cuda.mem_get_info()
+    print(f'[pipe-bench] VRAM free {free_b/1e9:.2f} / {total_b/1e9:.2f}GB '
+          f'(allocated {torch.cuda.max_memory_allocated()/1e9:.2f}GB)',
+          flush=True)
 
     print(f'\npeak GPU = {torch.cuda.max_memory_allocated()/1e9:.2f}GB', flush=True)
 
