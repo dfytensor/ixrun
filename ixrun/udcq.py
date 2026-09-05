@@ -561,10 +561,45 @@ class UdcqLinear(nn.Module):
         # vs decode-then-GEMM and removes the buffer round-trip)
         w = None
         if x.numel() == self.in_features:
-            y = udcq_fused_gemv(
-                x, self._idx, self._sign, self._scale, self._cb,
-                self.out_features, self.in_features, g=self.packed["g"],
-            ).to(x.dtype)
+            if _os.environ.get("UDCQ_CUDA_GEMV") and \
+                    self.in_features % 256 == 0:
+                try:
+                    # experimental hand-written CUDA GEMV (higher ILP):
+                    # built lazily on first use; same codebook across all
+                    # layers -> the constant-memory copy happens once
+                    import importlib.util as _ilu
+                    import sys as _sys
+                    _cg = _sys.modules.get("udcq_gemv_cuda_ext")
+                    if _cg is None:
+                        _p = _os.environ.get(
+                            "UDCQ_CUDA_GEMV_PATH",
+                            r"E:\IXRUN\experiments\udcq_gemv_cuda"
+                            r"\udcq_gemv_cuda.py")
+                        _spec = _ilu.spec_from_file_location(
+                            "udcq_gemv_cuda_ext", _p)
+                        _cg = _ilu.module_from_spec(_spec)
+                        _sys.modules["udcq_gemv_cuda_ext"] = _cg
+                        _spec.loader.exec_module(_cg)
+                        # codebook is model-wide: upload to __constant__
+                        # once, OUTSIDE any graph capture
+                        _cg.install_codebook(self._cb.float())
+                    elif not getattr(_cg, "_cb_installed", False):
+                        _cg.install_codebook(self._cb.float())
+                        _cg._cb_installed = True
+                    y = _cg.cuda_gemv(x, self._idx, self._sign,
+                                      self._scale, self._cb.float(),
+                                      self.out_features,
+                                      self.in_features).to(x.dtype)
+                except Exception:
+                    y = udcq_fused_gemv(
+                        x, self._idx, self._sign, self._scale, self._cb,
+                        self.out_features, self.in_features,
+                        g=self.packed["g"]).to(x.dtype)
+            else:
+                y = udcq_fused_gemv(
+                    x, self._idx, self._sign, self._scale, self._cb,
+                    self.out_features, self.in_features, g=self.packed["g"],
+                ).to(x.dtype)
             if self._bias is not None:
                 y = y + self._bias.to(x.dtype)
             return y.view(*x.shape[:-1], self.out_features)
