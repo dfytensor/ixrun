@@ -76,10 +76,10 @@ vs 55min 重量化）。
 | 阶段 | 速度 | 说明 |
 |---|---|---|
 | INT8-X streaming 基线 | 310→138 ms/tok | cumsum 削减 + fused GEMV + fla 绑定 + split-K |
-| **MiniCPM5 整步图解码** | **~50 tok/s**（19ms/tok，2.6×）| `StepGraphEngine`（`--mode step-graph`），eager 单步 77% 是 Python/launch |
-| UDCQ 静态 KV + CUDA Graph 贪心 | **15 tok/s** | `round3_graph.py`，生产级稳定 |
-| 队列架构投机解码 k=3 | **14.8-16.4 tok/s**（英/码）| `round4b_bisect.py`，E=2.22 tok/迭代 |
-| 同上 pipe-bench | 120.8ms/迭代 | GPU 纯bound：MTP链 14.6 + T=4验证 106.9 + 提交间隔 0.2 |
+| **MiniCPM5 整步图解码** | **~50-130 tok/s** | `StepGraphEngine`（`--mode step-graph`），延迟同步后 134 tok/s |
+| UDCQ 静态 KV + CUDA Graph 贪心 | **15.4→33.7 tok/s** | 手写 CUDA GEMV（`UDCQ_CUDA_GEMV=1`，~700GB/s）|
+| **队列架构投机解码 k=3 + CUDA** | **35.3/35.3/25.3 tok/s**（英/码/中）| 手写 CUDA M=1+M=4，50-60ms/迭代 |
+| 队列架构投机解码（Triton 版对照）| 14.8-16.4 tok/s | 同上 kernel 换 Triton |
 
 投机解码当前受限于两件事：① 权重读取地板（20GB@220GB/s≈106ms/前向，T=4 已摊薄
 到 26ms/token）；② MTP 链式草稿质量衰减（d1 用真 h ~75% 接受，d2/d3 用递归近似
