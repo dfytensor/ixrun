@@ -146,10 +146,37 @@ class StepGraphEngine:
     # ------------------------------------------------------------------ #
     @torch.no_grad()
     def _gen_tokens(self, ids, max_new_tokens, temperature=0.0,
-                    sync_period=16):
-        """Deferred-sync decode: argmax stays on GPU; token ids accumulate
-        in a GPU buffer and are read back every sync_period tokens (one
-        WDDM device sync per period instead of per token)."""
+                    do_sample=False, top_p=1.0, top_k=0,
+                    repetition_penalty=1.0, sync_period=16):
+        from .sampling import needs_sampling, sample_token
+
+        knobs = needs_sampling(do_sample, temperature, top_p, top_k,
+                               repetition_penalty)
+        if knobs:
+            # CPU-side sampling needs per-token decisions: fall back to the
+            # synchronous loop (MiniCPM5 steps are ~7ms, fine)
+            self.hard_reset()
+            first = self._first_token(ids)
+            eos = self.tokenizer.eos_token_id
+            out = [first]
+            t = len(ids)
+            while len(out) < max_new_tokens and t < self.max_ctx - 1:
+                self.in_ids.fill_(out[-1])
+                self.pos.fill_(t)
+                self.graph.replay()
+                nxt = sample_token(
+                    self.logits[0, 0].float().cpu(),
+                    temperature=temperature if do_sample else 0.0,
+                    top_p=top_p, top_k=top_k,
+                    repetition_penalty=repetition_penalty, past_ids=out)
+                if nxt == eos:
+                    break
+                out.append(nxt)
+                t += 1
+            return out
+        # deferred-sync decode: argmax stays on GPU; token ids accumulate
+        # in a GPU buffer and are read back every sync_period tokens (one
+        # WDDM device sync per period instead of per token).
         self.hard_reset()
         first = self._first_token(ids)          # single sync (prefill)
         eos = self.tokenizer.eos_token_id
@@ -193,22 +220,34 @@ class StepGraphEngine:
         return out
 
     def generate(self, prompt, max_new_tokens=64, temperature=0.0,
-                 do_sample=False, **kw):
+                 do_sample=False, top_p=1.0, top_k=0,
+                 repetition_penalty=1.0, **kw):
         if not do_sample:
             temperature = 0.0
+        top_p = float(kw.pop('top_p', top_p))
+        top_k = int(kw.pop('top_k', top_k))
+        repetition_penalty = float(kw.pop('repetition_penalty',
+                                          repetition_penalty))
         ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
             .tolist()
-        out = self._gen_tokens(ids, max_new_tokens, temperature)
+        out = self._gen_tokens(ids, max_new_tokens, temperature, do_sample,
+                               top_p, top_k, repetition_penalty)
         return self.tokenizer.decode(out)
 
     def stream(self, prompt, max_new_tokens=64, temperature=0.0,
-               do_sample=False, **kw):
+               do_sample=False, top_p=1.0, top_k=0,
+               repetition_penalty=1.0, **kw):
         if not do_sample:
             temperature = 0.0
+        top_p = float(kw.pop('top_p', top_p))
+        top_k = int(kw.pop('top_k', top_k))
+        repetition_penalty = float(kw.pop('repetition_penalty',
+                                          repetition_penalty))
         ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
             .tolist()
         for v in self._gen_tokens(ids, max_new_tokens, temperature,
-                                  sync_period=8):
+                                  do_sample, top_p, top_k,
+                                  repetition_penalty, sync_period=8):
             yield self.tokenizer.decode([v])
 
 

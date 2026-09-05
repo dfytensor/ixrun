@@ -93,7 +93,9 @@ def _cmd_chat(args):
 
     eng = _build_engine(args)
     chat_repl(eng, max_new_tokens=args.max_new_tokens,
-              temperature=args.temperature, do_sample=args.do_sample)
+              temperature=args.temperature, do_sample=args.do_sample,
+              top_p=args.top_p, top_k=args.top_k,
+              repetition_penalty=args.repetition_penalty)
 
 
 def _cmd_bench(args):
@@ -193,6 +195,12 @@ def main():
     pg.add_argument("--temperature", type=float, default=0.7)
     pg.add_argument("--do-sample", action="store_true", default=True)
     pg.add_argument("--no-sample", dest="do_sample", action="store_false")
+    pg.add_argument("--top-p", type=float, default=1.0,
+                    help="nucleus sampling (0-1)")
+    pg.add_argument("--top-k", type=int, default=0,
+                    help="top-k sampling (0=off)")
+    pg.add_argument("--repetition-penalty", type=float, default=1.0,
+                    help="repetition penalty (1.0=off)")
     pg.add_argument("--stream", action="store_true")
     pg.add_argument("--cache", default=None, help="packed-weight cache file / UDCQ blob")
     pg.set_defaults(func=_cmd_generate)
@@ -206,6 +214,12 @@ def main():
     pc.add_argument("--max-new-tokens", type=int, default=256)
     pc.add_argument("--temperature", type=float, default=0.7)
     pc.add_argument("--no-sample", dest="do_sample", action="store_false")
+    pc.add_argument("--top-p", type=float, default=1.0,
+                    help="nucleus sampling (0-1)")
+    pc.add_argument("--top-k", type=int, default=0,
+                    help="top-k sampling (0=off)")
+    pc.add_argument("--repetition-penalty", type=float, default=1.0,
+                    help="repetition penalty (1.0=off)")
     pc.add_argument("--cache", default=None, help="packed-weight cache file / UDCQ blob")
     pc.set_defaults(func=_cmd_chat, do_sample=True)
 

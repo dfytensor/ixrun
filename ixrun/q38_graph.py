@@ -372,7 +372,23 @@ class Q38GraphEngine:
                 ids.add(t)
         return ids
 
-    def _gen_tokens(self, ids, max_new_tokens, temperature=0.0):
+    def _pick(self, logits1, do_sample, temperature, top_p, top_k,
+              repetition_penalty, past):
+        """GPU argmax when greedy, else CPU-side sampled token."""
+        from .sampling import needs_sampling, sample_token
+
+        if needs_sampling(do_sample, temperature, top_p, top_k,
+                          repetition_penalty):
+            return sample_token(logits1.float().cpu()[0, 0],
+                                temperature=temperature if do_sample else 0.0,
+                                top_p=top_p, top_k=top_k,
+                                repetition_penalty=repetition_penalty,
+                                past_ids=past)
+        return int(logits1[:, -1].argmax(-1).item())
+
+    def _gen_tokens(self, ids, max_new_tokens, temperature=0.0,
+                    do_sample=False, top_p=1.0, top_k=0,
+                    repetition_penalty=1.0):
         self.hard_reset()
         logits = self.prefill(ids)
         nxt = int(logits[:, -1].argmax(-1).item())
@@ -382,12 +398,8 @@ class Q38GraphEngine:
         while len(out) < max_new_tokens and t < self.max_ctx - 1:
             self._set_token(nxt, t)
             self.graph.replay()
-            if temperature and temperature > 0:
-                probs = F.softmax(
-                    self.log1[:, -1].float() / temperature, dim=-1)
-                nxt = int(torch.multinomial(probs, 1).item())
-            else:
-                nxt = int(self.log1[:, -1].argmax(-1).item())
+            nxt = self._pick(self.log1, do_sample, temperature, top_p,
+                             top_k, repetition_penalty, out)
             if nxt in stops:
                 break
             out.append(nxt)
@@ -395,37 +407,46 @@ class Q38GraphEngine:
         return out
 
     def generate(self, prompt, max_new_tokens=64, temperature=0.0,
-                 do_sample=False, **kw):
+                 do_sample=False, top_p=1.0, top_k=0,
+                 repetition_penalty=1.0, **kw):
         if not do_sample:
             temperature = 0.0
+        top_p = float(kw.pop('top_p', top_p))
+        top_k = int(kw.pop('top_k', top_k))
+        repetition_penalty = float(kw.pop('repetition_penalty',
+                                          repetition_penalty))
         ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
             .tolist()
-        out = self._gen_tokens(ids, max_new_tokens, temperature)
+        out = self._gen_tokens(ids, max_new_tokens, temperature, do_sample,
+                               top_p, top_k, repetition_penalty)
         return self.tokenizer.decode(out)
 
     def stream(self, prompt, max_new_tokens=64, temperature=0.0,
-               do_sample=False, **kw):
+               do_sample=False, top_p=1.0, top_k=0,
+               repetition_penalty=1.0, **kw):
         if not do_sample:
             temperature = 0.0
+        top_p = float(kw.pop('top_p', top_p))
+        top_k = int(kw.pop('top_k', top_k))
+        repetition_penalty = float(kw.pop('repetition_penalty',
+                                          repetition_penalty))
         ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
             .tolist()
         self.hard_reset()
         logits = self.prefill(ids)
         nxt = int(logits[:, -1].argmax(-1).item())
         stops = self._stop_ids()
+        past = [nxt]
         t = len(ids)
         n = 0
         while n < max_new_tokens and t < self.max_ctx - 1:
             self._set_token(nxt, t)
             self.graph.replay()
-            if temperature and temperature > 0:
-                probs = F.softmax(
-                    self.log1[:, -1].float() / temperature, dim=-1)
-                nxt = int(torch.multinomial(probs, 1).item())
-            else:
-                nxt = int(self.log1[:, -1].argmax(-1).item())
+            nxt = self._pick(self.log1, do_sample, temperature, top_p,
+                             top_k, repetition_penalty, past)
             if nxt in stops:
                 break
             yield self.tokenizer.decode([nxt])
+            past.append(nxt)
             n += 1
             t += 1

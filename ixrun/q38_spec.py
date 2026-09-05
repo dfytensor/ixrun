@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 
 import torch
 import torch.nn as nn
@@ -164,6 +165,14 @@ class Q38SpecEngine:
         self.cos4 = torch.zeros(1, 4, cd, dtype=cos_all.dtype, device=dev)
         self.sin4 = torch.zeros_like(self.cos4)
         self.pos4 = torch.zeros(4, dtype=torch.long, device=dev)
+        # greedy-graph buffers (sampling fallback when knobs are active)
+        self.emb1 = torch.zeros(1, 1, self.H, dtype=torch.bfloat16,
+                                device=dev)
+        self.cos1 = torch.zeros(1, 1, cd, dtype=cos_all.dtype, device=dev)
+        self.sin1 = torch.zeros_like(self.cos1)
+        self.pos1 = torch.zeros(1, dtype=torch.long, device=dev)
+        self.log1 = torch.zeros(1, 1, self.V, dtype=torch.bfloat16,
+                                device=dev)
 
         # int8 GPU embedding table for in-graph gathers (~1.27GB)
         emb_f = self._emb_weight().float()
@@ -358,7 +367,7 @@ class Q38SpecEngine:
 
         bodies = {p: make_chain_body(p) for p in (1, 2, 3, 4)}
         if verbose:
-            print('[q38-spec] capturing g_cp[1..4]/g4dec...', flush=True)
+            print('[q38-spec] capturing g1/g_cp[1..4]/g4dec...', flush=True)
         # CRITICAL: seed the cache FIRST so the T=4 verify captures the
         # seeded per-token GDN branch. Capturing on a fresh cache fixes
         # the PREFILL branch (chunk kernel) into the graph — replays then
@@ -372,6 +381,23 @@ class Q38SpecEngine:
             self.pos1.fill_(i)
             self._step(self.emb1, self.cos1, self.sin1, self.pos1)
         self._collect_snap()        # conv/rec now materialized as tensors
+
+        # greedy single-token graph first (sampling fallback; capture
+        # ORDER matters — capturing it after the T=4 graphs hung WDDM)
+        def g1_body():
+            h, lg = self._step(self.emb1, self.cos1, self.sin1, self.pos1)
+            self.log1.copy_(lg)
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                g1_body()
+        torch.cuda.current_stream().wait_stream(s)
+        self.g1 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.g1, pool=pool):
+            g1_body()
+
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -454,17 +480,79 @@ class Q38SpecEngine:
                 break
 
     def generate(self, prompt, max_new_tokens=64, temperature=0.0,
-                 do_sample=False, **kw):
+                 do_sample=False, top_p=1.0, top_k=0,
+                 repetition_penalty=1.0, **kw):
+        from .sampling import needs_sampling
+
+        if not do_sample:
+            temperature = 0.0
+        top_p = float(kw.pop('top_p', top_p))
+        top_k = int(kw.pop('top_k', top_k))
+        repetition_penalty = float(kw.pop('repetition_penalty',
+                                          repetition_penalty))
         ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
             .tolist()
-        out = []
-        for batch in self._spec_iter(ids, max_new_tokens):
-            out.extend(batch)
+        if needs_sampling(do_sample, temperature, top_p, top_k,
+                          repetition_penalty):
+            out = self._sample_tokens(ids, max_new_tokens, temperature,
+                                      top_p, top_k, repetition_penalty)
+        else:
+            out = []
+            for batch in self._spec_iter(ids, max_new_tokens):
+                out.extend(batch)
         return self.tokenizer.decode(out)
 
     def stream(self, prompt, max_new_tokens=64, temperature=0.0,
-               do_sample=False, **kw):
+               do_sample=False, top_p=1.0, top_k=0,
+               repetition_penalty=1.0, **kw):
+        from .sampling import needs_sampling
+
+        if not do_sample:
+            temperature = 0.0
+        top_p = float(kw.pop('top_p', top_p))
+        top_k = int(kw.pop('top_k', top_k))
+        repetition_penalty = float(kw.pop('repetition_penalty',
+                                          repetition_penalty))
         ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
             .tolist()
+        if needs_sampling(do_sample, temperature, top_p, top_k,
+                          repetition_penalty):
+            toks = self._sample_tokens(ids, max_new_tokens, temperature,
+                                       top_p, top_k, repetition_penalty)
+            for v in toks:
+                yield self.tokenizer.decode([v])
+            return
         for batch in self._spec_iter(ids, max_new_tokens):
             yield self.tokenizer.decode(batch)
+
+    @torch.no_grad()
+    def _sample_tokens(self, ids, max_new_tokens, temperature, top_p,
+                       top_k, repetition_penalty):
+        """Greedy-graph decode with CPU-side sampling (no speculation —
+        verification requires argmax)."""
+        from .sampling import sample_token
+
+        self.hard_reset()
+        h_last, logits_last = self._prefill(ids)
+        nxt = int(logits_last[:, -1].argmax(-1).item())
+        stops = self._stop_ids()
+        out = [nxt]
+        emb_w = self._emb_weight()
+        t = len(ids)
+        while len(out) < max_new_tokens and t < self.max_ctx - 1:
+            self.emb1.copy_(emb_w[nxt].view(1, 1, self.H).to(
+                self.dev, torch.bfloat16))
+            self.cos1.copy_(self._cos_all[t].view(1, 1, -1))
+            self.sin1.copy_(self._sin_all[t].view(1, 1, -1))
+            self.pos1.fill_(t)
+            self.g1.replay()
+            nxt = sample_token(self.log1[0, 0].float().cpu(),
+                               temperature=temperature,
+                               top_p=top_p, top_k=top_k,
+                               repetition_penalty=repetition_penalty,
+                               past_ids=out)
+            if nxt in stops:
+                break
+            out.append(nxt)
+            t += 1
+        return out

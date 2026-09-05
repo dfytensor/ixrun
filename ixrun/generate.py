@@ -1,4 +1,4 @@
-"""Text generation on INT8-X deployed models.
+﻿"""Text generation on INT8-X deployed models.
 
 Works with any HuggingFace causal LM (LlamaForCausalLM and friends) whose
 Linear layers have been replaced by Int8XLinear. Supports greedy / sampling
@@ -12,7 +12,7 @@ import torch
 __all__ = ["generate_text", "stream_generate", "wait_quiescent"]
 
 # Registry of live generation threads. The engine decodes weights into SHARED
-# buffers, so two concurrent generate() calls corrupt each other — every new
+# buffers, so two concurrent generate() calls corrupt each other 鈥?every new
 # generation must wait for all previously started threads to be gone, no
 # matter which code path (server abort, GC on the worker thread, ...) ended
 # the previous one.
@@ -44,6 +44,7 @@ def generate_text(
     temperature: float = 0.7,
     top_p: float = 0.9,
     do_sample: bool = True,
+    top_k: int = 50,
     repetition_penalty: float = 1.1,
     device=None,
 ) -> str:
@@ -61,6 +62,7 @@ def generate_text(
         do_sample=do_sample,
         temperature=temperature if do_sample else 1.0,
         top_p=top_p if do_sample else 1.0,
+        top_k=top_k if do_sample else 0,
         repetition_penalty=repetition_penalty,
         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
     )
@@ -77,14 +79,14 @@ def stream_generate(
     temperature: float = 0.7,
     top_p: float = 0.9,
     do_sample: bool = True,
+    top_k: int = 50,
     repetition_penalty: float = 1.1,
     device=None,
 ):
     """Yield decoded text chunks as they are produced (generator).
 
     Cancellation-safe: closing this generator stops the background generation
-    thread at the next decode step (StoppingCriteria flag) and joins it —
-    required by the API server when a client disconnects mid-stream, since a
+    thread at the next decode step (StoppingCriteria flag) and joins it 鈥?    required by the API server when a client disconnects mid-stream, since a
     stray generation would otherwise corrupt the shared decode buffers of a
     concurrently-started request.
     """
@@ -122,6 +124,7 @@ def stream_generate(
         do_sample=do_sample,
         temperature=temperature if do_sample else 1.0,
         top_p=top_p if do_sample else 1.0,
+        top_k=top_k if do_sample else 0,
         repetition_penalty=repetition_penalty,
         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         streamer=streamer,
@@ -140,7 +143,7 @@ def stream_generate(
         cur = threading.current_thread()
         if thread is not cur:
             # normal deterministic close (server finally / exhausted loop):
-            # join, THEN discard — no next generation can overlap.
+            # join, THEN discard 鈥?no next generation can overlap.
             thread.join(timeout=60)
             with _ACTIVE_LOCK:
                 _ACTIVE.discard(thread)

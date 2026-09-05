@@ -34,7 +34,8 @@ def _strip_think(text: str) -> str:
     return text
 
 
-def chat_repl(eng, max_new_tokens=256, temperature=0.7, do_sample=True):
+def chat_repl(eng, max_new_tokens=256, temperature=0.7, do_sample=True,
+              top_p=1.0, top_k=0, repetition_penalty=1.0):
     tok = eng.tokenizer
     history = []
     enable_thinking = None  # model default
@@ -88,6 +89,9 @@ def chat_repl(eng, max_new_tokens=256, temperature=0.7, do_sample=True):
                 max_new_tokens=max_new,
                 temperature=temperature,
                 do_sample=do_sample,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
             ):
                 full += chunk
                 buf += chunk
