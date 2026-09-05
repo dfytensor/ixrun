@@ -1,11 +1,11 @@
-"""OpenAI-compatible HTTP API server for Int8XEngine.
+﻿"""OpenAI-compatible HTTP API server for Int8XEngine.
 
 Endpoints:
   GET  /v1/models
   POST /v1/chat/completions   (stream=true SSE / stream=false JSON)
   GET  /health
 
-Works with any OpenAI-compatible client — including opencode, which can be
+Works with any OpenAI-compatible client 鈥?including opencode, which can be
 pointed at this server via an openai-compatible provider config.
 
 Run:
@@ -139,7 +139,9 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
         if rep is None and req.frequency_penalty is not None:
             rep = 1.0 + max(req.frequency_penalty, 0.0)
         if rep is not None and rep != 1.0:
-            kw["repetition_penalty"] = rep
+            kw['repetition_penalty'] = rep
+        if req.presence_penalty is not None and req.presence_penalty != 0.0:
+            kw['presence_penalty'] = req.presence_penalty
         return kw
 
     @app.get("/health")
@@ -192,7 +194,7 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
         # ---- streaming (SSE) ----
         if _bgen is not None:
             # continuous-batching path: coalesces concurrent requests into
-            # batch>=8 forwards — ~3-5x aggregate throughput; supports
+            # batch>=8 forwards 鈥?~3-5x aggregate throughput; supports
             # temperature / top_p / top_k / repetition_penalty per row
             def sse_batched():
                 rep = req.repetition_penalty
@@ -245,7 +247,7 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
                 finally:
                     # deterministic cleanup even if we're being closed:
                     # it.close() cancels the generation thread (StoppingCriteria
-                    # flag) and joins it, all while we still hold gen_lock —
+                    # flag) and joins it, all while we still hold gen_lock 鈥?
                     # prevents a stray generation from corrupting the shared
                     # decode buffers of the next request
                     it.close()

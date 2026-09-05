@@ -78,13 +78,19 @@ def _cmd_generate(args):
     print(f"\n[prompt] {args.prompt}\n", flush=True)
     if args.stream:
         for chunk in eng.stream(args.prompt, max_new_tokens=args.max_new_tokens,
-                                temperature=args.temperature, do_sample=args.do_sample):
+                                temperature=args.temperature, do_sample=args.do_sample,
+                                top_p=args.top_p, top_k=args.top_k,
+                                repetition_penalty=args.repetition_penalty,
+                                presence_penalty=args.presence_penalty):
             sys.stdout.write(chunk)
             sys.stdout.flush()
         print()
     else:
         out = eng.generate(args.prompt, max_new_tokens=args.max_new_tokens,
-                           temperature=args.temperature, do_sample=args.do_sample)
+                           temperature=args.temperature, do_sample=args.do_sample,
+                           top_p=args.top_p, top_k=args.top_k,
+                           repetition_penalty=args.repetition_penalty,
+                           presence_penalty=args.presence_penalty)
         print(out)
 
 
@@ -95,7 +101,8 @@ def _cmd_chat(args):
     chat_repl(eng, max_new_tokens=args.max_new_tokens,
               temperature=args.temperature, do_sample=args.do_sample,
               top_p=args.top_p, top_k=args.top_k,
-              repetition_penalty=args.repetition_penalty)
+              repetition_penalty=args.repetition_penalty,
+              presence_penalty=args.presence_penalty)
 
 
 def _cmd_bench(args):
@@ -199,8 +206,10 @@ def main():
                     help="nucleus sampling (0-1)")
     pg.add_argument("--top-k", type=int, default=0,
                     help="top-k sampling (0=off)")
-    pg.add_argument("--repetition-penalty", type=float, default=1.0,
-                    help="repetition penalty (1.0=off)")
+    pg.add_argument('--repetition-penalty', type=float, default=1.0,
+                    help='repetition penalty (1.0=off)')
+    pg.add_argument('--presence-penalty', type=float, default=0.0,
+                    help='presence penalty (0.0=off)')
     pg.add_argument("--stream", action="store_true")
     pg.add_argument("--cache", default=None, help="packed-weight cache file / UDCQ blob")
     pg.set_defaults(func=_cmd_generate)
@@ -218,8 +227,10 @@ def main():
                     help="nucleus sampling (0-1)")
     pc.add_argument("--top-k", type=int, default=0,
                     help="top-k sampling (0=off)")
-    pc.add_argument("--repetition-penalty", type=float, default=1.0,
-                    help="repetition penalty (1.0=off)")
+    pc.add_argument('--repetition-penalty', type=float, default=1.0,
+                    help='repetition penalty (1.0=off)')
+    pc.add_argument('--presence-penalty', type=float, default=0.0,
+                    help='presence penalty (0.0=off)')
     pc.add_argument("--cache", default=None, help="packed-weight cache file / UDCQ blob")
     pc.set_defaults(func=_cmd_chat, do_sample=True)
 

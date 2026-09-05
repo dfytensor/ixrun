@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Q38SpecEngine: Qwen3.8-27B speculative decoding with the engine
 interface (tokenizer / generate / stream) so CLI chat/generate and the
 OpenAI-compatible server work unchanged:
@@ -184,10 +184,9 @@ class Q38SpecEngine:
         gc.collect()
         torch.cuda.empty_cache()
 
-        # snap/rollback streams (conv/rec are DICTS — iterate .values()).
+        # snap/rollback streams (conv/rec are DICTS 鈥?iterate .values()).
         # COLLECTED LAZILY after the cache has been used: the dict values
-        # start as None and only become tensors after the first forward —
-        # collecting earlier silently yields empty streams and rollback
+        # start as None and only become tensors after the first forward 鈥?        # collecting earlier silently yields empty streams and rollback
         # becomes a no-op (state drift -> text degeneration).
         self._dsts, self._srcs = [], []
         self._static_buffers()
@@ -363,7 +362,7 @@ class Q38SpecEngine:
             print('[q38-spec] capturing g1/g_cp[1..4]/g4dec...', flush=True)
         # CRITICAL: seed the cache FIRST so the T=4 verify captures the
         # seeded per-token GDN branch. Capturing on a fresh cache fixes
-        # the PREFILL branch (chunk kernel) into the graph — replays then
+        # the PREFILL branch (chunk kernel) into the graph 鈥?replays then
         # corrupt state (text degenerates after ~10-20 tokens).
         emb_w = self._emb_weight()
         for i in range(12):
@@ -376,7 +375,7 @@ class Q38SpecEngine:
         self._collect_snap()        # conv/rec now materialized as tensors
 
         # greedy single-token graph first (sampling fallback; capture
-        # ORDER matters — capturing it after the T=4 graphs hung WDDM)
+        # ORDER matters 鈥?capturing it after the T=4 graphs hung WDDM)
         def g1_body():
             h, lg = self._step(self.emb1, self.cos1, self.sin1, self.pos1)
             self.log1.copy_(lg)
@@ -587,10 +586,13 @@ class Q38SpecEngine:
         top_k = int(kw.pop('top_k', top_k))
         repetition_penalty = float(kw.pop('repetition_penalty',
                                           repetition_penalty))
+        presence_penalty = float(kw.pop('presence_penalty', 0.0))
+        frequency_penalty = float(kw.pop('frequency_penalty', 0.0))
         ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
             .tolist()
         if (temperature > 0 and top_p >= 1.0 and top_k <= 0
-                and repetition_penalty == 1.0):
+                and repetition_penalty == 1.0 and presence_penalty == 0.0
+                and frequency_penalty == 0.0):
             # probabilistic acceptance keeps speculation active under
             # temperature (drafts sampled from the SAME scaled
             # distribution -> accept prob min(1, q/p) stays high)
@@ -599,9 +601,11 @@ class Q38SpecEngine:
                                          temperature=temperature):
                 out.extend(batch)
         elif repetition_penalty != 1.0 or top_p < 1.0 or top_k > 0 \
-                or temperature > 0:
+                or temperature > 0 or presence_penalty != 0.0 \
+                or frequency_penalty != 0.0:
             out = self._sample_tokens(ids, max_new_tokens, temperature,
-                                      top_p, top_k, repetition_penalty)
+                                      top_p, top_k, repetition_penalty,
+                                      presence_penalty, frequency_penalty)
         else:
             out = []
             for batch in self._spec_iter(ids, max_new_tokens):
@@ -617,18 +621,23 @@ class Q38SpecEngine:
         top_k = int(kw.pop('top_k', top_k))
         repetition_penalty = float(kw.pop('repetition_penalty',
                                           repetition_penalty))
+        presence_penalty = float(kw.pop('presence_penalty', 0.0))
+        frequency_penalty = float(kw.pop('frequency_penalty', 0.0))
         ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
             .tolist()
         if (temperature > 0 and top_p >= 1.0 and top_k <= 0
-                and repetition_penalty == 1.0):
+                and repetition_penalty == 1.0 and presence_penalty == 0.0
+                and frequency_penalty == 0.0):
             for batch in self._spec_iter(ids, max_new_tokens,
                                          temperature=temperature):
                 yield self.tokenizer.decode(batch)
             return
         if repetition_penalty != 1.0 or top_p < 1.0 or top_k > 0 \
-                or temperature > 0:
+                or temperature > 0 or presence_penalty != 0.0 \
+                or frequency_penalty != 0.0:
             toks = self._sample_tokens(ids, max_new_tokens, temperature,
-                                       top_p, top_k, repetition_penalty)
+                                       top_p, top_k, repetition_penalty,
+                                       presence_penalty, frequency_penalty)
             for v in toks:
                 yield self.tokenizer.decode([v])
             return
@@ -637,9 +646,9 @@ class Q38SpecEngine:
 
     @torch.no_grad()
     def _sample_tokens(self, ids, max_new_tokens, temperature, top_p,
-                       top_k, repetition_penalty):
-        """Greedy-graph decode with CPU-side sampling (no speculation —
-        verification requires argmax)."""
+                       top_k, repetition_penalty, presence_penalty=0.0,
+                       frequency_penalty=0.0):
+        """Greedy-graph decode with CPU-side sampling (no speculation 鈥?        verification requires argmax)."""
         from .sampling import sample_token
 
         self.hard_reset()
@@ -660,6 +669,8 @@ class Q38SpecEngine:
                                temperature=temperature,
                                top_p=top_p, top_k=top_k,
                                repetition_penalty=repetition_penalty,
+                               presence_penalty=presence_penalty,
+                               frequency_penalty=frequency_penalty,
                                past_ids=out)
             if nxt in stops:
                 break

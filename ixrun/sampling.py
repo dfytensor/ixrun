@@ -16,9 +16,12 @@ __all__ = ["needs_sampling", "sample_token"]
 
 
 def needs_sampling(do_sample: bool, temperature: float, top_p: float,
-                   top_k: int, repetition_penalty: float) -> bool:
+                   top_k: int, repetition_penalty: float,
+                   presence_penalty: float = 0.0,
+                   frequency_penalty: float = 0.0) -> bool:
     return bool(do_sample and temperature > 0) or top_p < 1.0 \
-        or top_k > 0 or repetition_penalty != 1.0
+        or top_k > 0 or repetition_penalty != 1.0 \
+        or presence_penalty != 0.0 or frequency_penalty != 0.0
 
 
 def gpu_sample_token(logits1, temperature: float = 0.0, top_p: float = 1.0,
@@ -51,21 +54,33 @@ def gpu_sample_token(logits1, temperature: float = 0.0, top_p: float = 1.0,
 
 def sample_token(logits_v, temperature: float = 0.0, top_p: float = 1.0,
                  top_k: int = 0, repetition_penalty: float = 1.0,
-                 past_ids=()) -> int:
+                 presence_penalty: float = 0.0,
+                 frequency_penalty: float = 0.0, past_ids=()) -> int:
     """logits_v: 1-D CPU tensor (fp32/bf16) over the vocab.
 
     Returns the sampled token id (or argmax when no knob is active).
+    Penalties follow HF semantics: repetition scales by sign; presence
+    subtracts once per distinct id; frequency subtracts per occurrence.
     """
     logits = logits_v.float().clone()
-    if repetition_penalty != 1.0 and past_ids:
-        penalize = set(int(t) for t in past_ids)
-        penalize.discard(-1)
-        if penalize:
-            idx = torch.tensor(sorted(penalize), dtype=torch.long)
+    if (repetition_penalty != 1.0 or presence_penalty != 0.0
+            or frequency_penalty != 0.0) and past_ids:
+        ids = [int(t) for t in past_ids if int(t) >= 0]
+        if ids:
+            import collections
+            counts = collections.Counter(ids)
+            idx = torch.tensor(sorted(counts), dtype=torch.long)
             g = logits[idx]
-            # HF semantics: score / penalty when positive else score * p
-            logits[idx] = torch.where(
-                g > 0, g / repetition_penalty, g * repetition_penalty)
+            if repetition_penalty != 1.0:
+                g = torch.where(g > 0, g / repetition_penalty,
+                                g * repetition_penalty)
+            if presence_penalty != 0.0:
+                g = g - presence_penalty
+            if frequency_penalty != 0.0:
+                f = torch.tensor([counts[int(i)] for i in idx],
+                                 dtype=torch.float32)
+                g = g - frequency_penalty * f
+            logits[idx] = g
     if top_k and top_k > 0:
         k = min(top_k, logits.numel())
         thr = torch.topk(logits, k).values.min()

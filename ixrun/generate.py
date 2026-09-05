@@ -45,6 +45,8 @@ def generate_text(
     top_p: float = 0.9,
     do_sample: bool = True,
     top_k: int = 50,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
     repetition_penalty: float = 1.1,
     device=None,
 ) -> str:
@@ -64,6 +66,8 @@ def generate_text(
         top_p=top_p if do_sample else 1.0,
         top_k=top_k if do_sample else 0,
         repetition_penalty=repetition_penalty,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
     )
     new_tokens = out[0][ids["input_ids"].shape[1]:]
@@ -80,6 +84,8 @@ def stream_generate(
     top_p: float = 0.9,
     do_sample: bool = True,
     top_k: int = 50,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
     repetition_penalty: float = 1.1,
     device=None,
 ):
@@ -126,6 +132,8 @@ def stream_generate(
         top_p=top_p if do_sample else 1.0,
         top_k=top_k if do_sample else 0,
         repetition_penalty=repetition_penalty,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         streamer=streamer,
         stopping_criteria=[stopper],
