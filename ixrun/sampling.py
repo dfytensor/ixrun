@@ -21,6 +21,34 @@ def needs_sampling(do_sample: bool, temperature: float, top_p: float,
         or top_k > 0 or repetition_penalty != 1.0
 
 
+def gpu_sample_token(logits1, temperature: float = 0.0, top_p: float = 1.0,
+                     top_k: int = 0) -> torch.Tensor:
+    """Sample one token from a GPU logits row [V] (spec-verify stage).
+
+    top-p/top-k are applied ONLY here (verification); the draft stays a
+    full-vocab argmax. temperature scales before the softmax. Returns a
+    0-dim int64 GPU tensor.
+    """
+    lg = logits1.float()
+    if top_k and top_k > 0:
+        k = min(top_k, lg.numel())
+        vals = torch.topk(lg, k).values
+        lg = torch.where(lg >= vals.min(), lg,
+                         torch.tensor(float('-inf'), device=lg.device))
+    if top_p < 1.0:
+        sorted_l, order = torch.sort(lg, descending=True)
+        cum = torch.cumsum(torch.softmax(sorted_l, dim=0), dim=0)
+        keep = cum <= top_p
+        keep[0] = True
+        mask = torch.zeros_like(lg, dtype=torch.bool)
+        mask[order[keep]] = True
+        lg = torch.where(mask, lg,
+                         torch.tensor(float('-inf'), device=lg.device))
+    if temperature and temperature > 0:
+        lg = lg / temperature
+    return torch.multinomial(torch.softmax(lg, dim=0), 1).squeeze()
+
+
 def sample_token(logits_v, temperature: float = 0.0, top_p: float = 1.0,
                  top_k: int = 0, repetition_penalty: float = 1.0,
                  past_ids=()) -> int:

@@ -346,24 +346,6 @@ class Q38SpecEngine:
             h, lg = self._forward4()
             self.out_h4.copy_(h)
             self.out_l4.copy_(lg)
-            a0 = self.out_l4[0, 0].argmax()
-            a1 = self.out_l4[0, 1].argmax()
-            a2 = self.out_l4[0, 2].argmax()
-            a3 = self.out_l4[0, 3].argmax()
-            m1 = a0 == self.tok_out[1]
-            m2 = (a1 == self.tok_out[2]) & m1
-            m3 = (a2 == self.tok_out[3]) & m2
-            L = 1 + m1.to(torch.long) + m2.to(torch.long) \
-                + m3.to(torch.long)
-            self.dec_gpu[0] = L
-            self.dec_gpu[1] = self.tok_out[0]
-            self.dec_gpu[2] = self.tok_out[1]
-            self.dec_gpu[3] = self.tok_out[2]
-            self.dec_gpu[4] = self.tok_out[3]
-            self.a_buf[0].copy_(a0)
-            self.a_buf[1].copy_(a1)
-            self.a_buf[2].copy_(a2)
-            self.a_buf[3].copy_(a3)
 
         bodies = {p: make_chain_body(p) for p in (1, 2, 3, 4)}
         if verbose:
@@ -443,8 +425,59 @@ class Q38SpecEngine:
                 ids.add(t)
         return ids
 
-    def _spec_iter(self, ids, max_new_tokens):
-        """Generator: yields batches of newly committed tokens."""
+    @torch.no_grad()
+    def _verify(self, temperature, top_p, top_k):
+        """Eager GPU verification: per-slot token from the target
+        distribution (argmax when greedy; sampled with top-k/top-p/
+        temperature when sampling) matched against the draft sequence.
+        Writes dec_gpu [L, tok_out...] + a_buf (next root source);
+        the caller reads dec_gpu via the pinned buffer (one sync)."""
+        from .sampling import gpu_sample_token
+
+        sampling = bool(temperature > 0) or top_p < 1.0 or top_k > 0
+        if not sampling:
+            for j in range(4):
+                self.a_buf[j] = self.out_l4[0, j].argmax()
+        else:
+            # batched: one temperature-scaled softmax over all 4 rows
+            lg = self.out_l4[0].float()          # [4, V]
+            if top_k and top_k > 0:
+                k = min(top_k, lg.shape[-1])
+                vals = torch.topk(lg, k, dim=-1).values
+                lg = torch.where(lg >= vals[..., -1:],
+                                 lg, torch.tensor(float('-inf'),
+                                                  device=lg.device))
+            if top_p < 1.0:
+                for j in range(4):
+                    s, order = torch.sort(lg[j], descending=True)
+                    cum = torch.cumsum(torch.softmax(s, dim=0), dim=0)
+                    keep = cum <= top_p
+                    keep[0] = True
+                    mask = torch.zeros_like(lg[j], dtype=torch.bool)
+                    mask[order[keep]] = True
+                    lg[j] = torch.where(
+                        mask, lg[j],
+                        torch.tensor(float('-inf'), device=lg.device))
+            if temperature and temperature > 0:
+                lg = lg / temperature
+            probs = torch.softmax(lg, dim=-1)
+            for j in range(4):
+                self.a_buf[j] = torch.multinomial(probs[j], 1).squeeze()
+        m1 = self.a_buf[0] == self.tok_out[1]
+        m2 = (self.a_buf[1] == self.tok_out[2]) & m1
+        m3 = (self.a_buf[2] == self.tok_out[3]) & m2
+        L = 1 + m1.to(torch.long) + m2.to(torch.long) + m3.to(torch.long)
+        self.dec_gpu[0] = L
+        self.dec_gpu[1] = self.tok_out[0]
+        self.dec_gpu[2] = self.tok_out[1]
+        self.dec_gpu[3] = self.tok_out[2]
+        self.dec_gpu[4] = self.tok_out[3]
+
+    def _spec_iter(self, ids, max_new_tokens, temperature=0.0,
+                   top_p=1.0, top_k=0):
+        """Generator: yields batches of newly committed tokens. Sampling
+        happens at VERIFICATION only (drafts stay argmax) so speculation
+        stays fully active under temperature/top_p/top_k."""
         dec_pin = torch.zeros(6, dtype=torch.long, pin_memory=True)
         self.hard_reset()
         h_last, logits_last = self._prefill(ids)
@@ -459,6 +492,7 @@ class Q38SpecEngine:
             self.pin_t[0] = t - (pend_cpu - 1)
             self.g_cp[pend_cpu].replay()
             self.g4dec.replay()
+            self._verify(temperature, top_p, top_k)
             dec_pin.copy_(self.dec_gpu, non_blocking=True)
             self._ev.record()
             while not self._ev.query():
@@ -494,6 +528,11 @@ class Q38SpecEngine:
             .tolist()
         if needs_sampling(do_sample, temperature, top_p, top_k,
                           repetition_penalty):
+            # sampling disables speculation: measured on the 27B,
+            # temperature flattens the target distribution so draft
+            # acceptance collapses (E~1.0-1.3, ~18 tok/s verify-side
+            # sampling) — the greedy graph + CPU sampling (~33 tok/s,
+            # full HF semantics incl. penalties) is strictly faster.
             out = self._sample_tokens(ids, max_new_tokens, temperature,
                                       top_p, top_k, repetition_penalty)
         else:
