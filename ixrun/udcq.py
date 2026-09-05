@@ -364,9 +364,12 @@ def udcq_fused_gemm(x, idx, sign, scale, cb, out_f, in_f,
 
 
 def udcq_fused_gemv(x, idx, sign, scale, cb, out_f, in_f,
-                    g=UDCQ_G, r=UDCQ_GEMV_R, bk=UDCQ_GEMV_BK,
-                    num_warps=UDCQ_GEMV_WARPS):
+                    g=UDCQ_G, r=None, bk=None, num_warps=None):
     """y = x @ W.T single token, UDCQ-decoded in registers."""
+    # in-context config override (AGENTS.md: verify with deployed model)
+    r = UDCQ_GEMV_R if r is None else r
+    bk = UDCQ_GEMV_BK if bk is None else bk
+    num_warps = UDCQ_GEMV_WARPS if num_warps is None else num_warps
     y = torch.empty(out_f, dtype=torch.bfloat16, device=x.device)
     while r > 1 and out_f % r != 0:               # odd out_f fallback
         r //= 2
