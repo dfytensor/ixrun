@@ -308,6 +308,10 @@ def serve(
         from .q38_graph import Q38GraphEngine
 
         eng = Q38GraphEngine.from_blob(cache_path, model_path)
+    elif mode == "udcq-spec":
+        from .q38_spec import Q38SpecEngine
+
+        eng = Q38SpecEngine.from_blob(cache_path, model_path)
     elif mode == "step-graph":
         from .step_graph import StepGraphEngine
 

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Q38GraphEngine: Qwen3.8-27B UDCQ 6bpw + StaticCache + CUDA-Graph
 greedy/sampling decode, blob fast-deploy.
 
@@ -18,7 +18,7 @@ Design (proven in experiments/qwen38_udcq/round3_graph.py + round4b_bisect.py):
 - prefill: blocked S=8 chunks (mt-GEMV M=8, ~8x faster than per-token)
 
 Known hard-won pitfalls baked in (see AGENTS.md):
-- cache conv_states/recurrent_states are DICTS — iterate .values()
+- cache conv_states/recurrent_states are DICTS 鈥?iterate .values()
 - graph outputs must be copied to static buffers inside the capture
 - keep VRAM < 24GB or WDDM sysmem paging collapses bandwidth
 """
@@ -316,7 +316,7 @@ class Q38GraphEngine:
                         hps[k] = False
                 else:
                     lay.has_previous_state = [False] * len(hps)
-            # NOTE: conv/rec states are DICTS — iterate .values()
+            # NOTE: conv/rec states are DICTS 鈥?iterate .values()
             for cs in (getattr(lay, 'conv_states', None) or {}).values():
                 if isinstance(cs, torch.Tensor):
                     cs.zero_()
@@ -364,12 +364,20 @@ class Q38GraphEngine:
 
     # ------------------------------------------------------------------ #
     @torch.no_grad()
+    def _stop_ids(self):
+        ids = {self.tokenizer.eos_token_id}
+        for sym in ('<|im_end|>', '<|endoftext|>'):
+            t = self.tokenizer.convert_tokens_to_ids(sym)
+            if t is not None and t != self.tokenizer.unk_token_id:
+                ids.add(t)
+        return ids
+
     def _gen_tokens(self, ids, max_new_tokens, temperature=0.0):
         self.hard_reset()
         logits = self.prefill(ids)
         nxt = int(logits[:, -1].argmax(-1).item())
         out = [nxt]
-        eos = self.tokenizer.eos_token_id
+        stops = self._stop_ids()
         t = len(ids)
         while len(out) < max_new_tokens and t < self.max_ctx - 1:
             self._set_token(nxt, t)
@@ -380,7 +388,7 @@ class Q38GraphEngine:
                 nxt = int(torch.multinomial(probs, 1).item())
             else:
                 nxt = int(self.log1[:, -1].argmax(-1).item())
-            if nxt == eos:
+            if nxt in stops:
                 break
             out.append(nxt)
             t += 1
@@ -404,7 +412,7 @@ class Q38GraphEngine:
         self.hard_reset()
         logits = self.prefill(ids)
         nxt = int(logits[:, -1].argmax(-1).item())
-        eos = self.tokenizer.eos_token_id
+        stops = self._stop_ids()
         t = len(ids)
         n = 0
         while n < max_new_tokens and t < self.max_ctx - 1:
@@ -416,7 +424,7 @@ class Q38GraphEngine:
                 nxt = int(torch.multinomial(probs, 1).item())
             else:
                 nxt = int(self.log1[:, -1].argmax(-1).item())
-            if nxt == eos:
+            if nxt in stops:
                 break
             yield self.tokenizer.decode([nxt])
             n += 1
