@@ -612,59 +612,25 @@ def main():
     mtp = load_mtp(m)
     print('mtp head loaded (with layer, orig attn)', flush=True)
 
-    # ---- capture g_mtp4: 4-step MTP chain with known-token selection ----
-    # Inputs: mtp_h_buf (h after last PROCESSED token), chain_in[4]
-    # (known-token queue: pending committed-but-unprocessed tokens + new
-    # root; tail slots are garbage), pend_len (GPU [1]).
-    # Step j: predict p_j = argmax(MTP(emb(tok_j), u_j)); the block's
-    # next token is chain_in[j+1] when inside the known prefix, else the
-    # prediction itself (data-dependent select, capture-safe where()).
-    # tok_out[4] = the verify block (known prefix + fresh drafts).
-    print('capturing g_mtp4...', flush=True)
+    # ---- true-h-seed chain graphs (per pending length p = 1..4) ----
+    # Refactor: drafts seeded from REAL main-model hidden states instead of
+    # chain-feeding pending tokens through the MTP recursion (which drifted).
+    # Block slots: p-1 pending tokens (kept in tok_out from last verify,
+    # their h still live in out_h4) + root' at slot p-1 + drafts to slot 3.
+    #   p=1 (fresh, after L=4): slots [root', d1, d2, d3]
+    #       root <- a_buf[3]; seed = mtp_h_buf (loop keeps = h after slot 3)
+    #   p=2..4 (after partial accept L=p-1): seed = out_h4[p-2] (REAL h
+    #       after the last pending slot); root <- a_buf[p-2]; 4-p drafts.
+    print('capturing g_cp[1..4]/g4dec (true-h seed)...', flush=True)
     mtp_h_buf = torch.zeros(1, 1, H, dtype=torch.bfloat16, device=dev)
     mtp_pos_buf = torch.zeros(1, 1, dtype=torch.long, device=dev)
-    chain_in = torch.zeros(4, dtype=torch.long, device=dev)
-    pend_len = torch.zeros(1, dtype=torch.long, device=dev)
     tok_out = torch.zeros(4, dtype=torch.long, device=dev)
-    ar4c = torch.arange(4, device=dev)
-
-    def mtp_chain():
-        h = mtp_h_buf
-        tok = chain_in[0]
-        tok_out[0].copy_(tok)
-        # 3 MTP forwards produce tok_out[1..3]; measured optimum for
-        # en/code (2-step: en E 1.60 vs 3-step 2.11, -22% tok/s; zh gains
-        # +10% because d3 never hits there — but en/code dominate)
-        for j in range(3):
-            e = emb_rows(tok.view(1)).view(1, 1, H)
-            lg, h = mtp.forward2(e, h, mtp_pos_buf)
-            p = lg[:, -1].argmax()
-            nxt = torch.where(ar4c[j + 1] < pend_len[0],
-                              chain_in[j + 1], p)
-            tok_out[j + 1].copy_(nxt)
-            tok = nxt
-        return tok_out
-
-    s_m = torch.cuda.Stream()
-    s_m.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s_m):
-        for _ in range(3):
-            mtp_chain()
-    torch.cuda.current_stream().wait_stream(s_m)
-    g_mtp4 = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g_mtp4, pool=pool):
-        mtp_chain()
-    print('g_mtp4 captured', flush=True)
-
-    # ---- buffers + merged graph bodies ----
     pin_t = torch.zeros(1, dtype=torch.long, pin_memory=True)
     t_gpu = torch.zeros(1, dtype=torch.long, device=dev)
     ar4 = torch.arange(4, device=dev)
 
-    # chainprep: MTP chain -> tok_out, then fill emb4/cos4/sin4/pos4
-    # (pinned->device async copy, capture-safe) + fast_snap. One replay.
-    def chainprep_fn():
-        mtp_chain()
+    def prep_body():
+        # shared: embed block tokens + positions + snap (runs after chain)
         t_gpu.copy_(pin_t, non_blocking=True)
         idx = t_gpu + ar4
         emb4.copy_(emb_rows(tok_out).view(1, 4, H))
@@ -673,8 +639,27 @@ def main():
         pos4.copy_(idx)
         torch._foreach_copy_(_srcs, _dsts)                     # fast_snap
 
-    # decisions: L = accepted prefix length (1..4); known-prefix
-    # positions auto-match (deterministic re-verification).
+    def make_chain_body(p):
+        n_drafts = 4 - p
+        root_slot = p - 1
+
+        def body():
+            if p == 1:
+                tok_out[0].copy_(a_buf[3])     # fresh root
+                h = mtp_h_buf                 # loop-maintained real h
+            else:
+                tok_out[root_slot].copy_(a_buf[p - 2])   # new root
+                mtp_h_buf.copy_(out_h4[:, p - 2:p - 1])  # REAL h seed
+                h = mtp_h_buf
+            tok = tok_out[root_slot]
+            for s in range(n_drafts):
+                e = emb_rows(tok.view(1)).view(1, 1, H)
+                lg, h = mtp.forward2(e, h, mtp_pos_buf)
+                tok = lg[:, -1].argmax()
+                tok_out[root_slot + 1 + s].copy_(tok)
+            prep_body()
+        return body
+
     def dec_fn():
         a0 = out_l4[0, 0].argmax()
         a1 = out_l4[0, 1].argmax()
@@ -701,25 +686,30 @@ def main():
         out_l4.copy_(log4_s)
         dec_fn()
 
-    print('capturing g_chainprep/g4dec...', flush=True)
+    bodies = {p: make_chain_body(p) for p in (1, 2, 3, 4)}
     s_p = torch.cuda.Stream()
     s_p.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s_p):
         for _ in range(3):
-            chainprep_fn()
-            g4dec_fn()
+            for p in (1, 2, 3, 4):
+                bodies[p]()
+                g4dec_fn()
     torch.cuda.current_stream().wait_stream(s_p)
-    g_chainprep = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g_chainprep, pool=pool):
-        chainprep_fn()
+    g_cp = {}
+    for p in (1, 2, 3, 4):
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, pool=pool):
+            bodies[p]()
+        g_cp[p] = g
     g4dec = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g4dec, pool=pool):
         g4dec_fn()
-    print('g_chainprep/g4dec captured', flush=True)
+    print('g_cp[1..4]/g4dec captured', flush=True)
 
     # ---- per-graph GPU cost (20 reps, one sync) ----
     if os.environ.get('IXGRAPHTIME'):
-        for gname, gg in [('g_mtp4', g_mtp4), ('g_chainprep', g_chainprep),
+        for gname, gg in [('g_cp1', g_cp[1]), ('g_cp2', g_cp[2]),
+                          ('g_cp3', g_cp[3]), ('g_cp4', g_cp[4]),
                           ('g4dec', g4dec), ('g4', g4), ('g2', g2),
                           ('g1', g1)]:
             gg.replay(); torch.cuda.synchronize()
@@ -1108,16 +1098,17 @@ def main():
         h_last, logits_last = h_last.clone(), logits_last.clone()
 
         # ---- queue-architecture spec loop: ONE sync, ZERO replays ----
-        # Every iteration: 4-step MTP chain (known-prefix advance +
-        # drafts) -> T=4 verify -> decisions. Partial accepts roll back
-        # and RE-QUEUE the accepted prefix as the next block's known
-        # tokens (auto-reverified) — no prefix-recompute replays.
+        # Every iteration: true-h-seeded MTP chain (graph selected by the
+        # pending length) -> T=4 verify -> decisions. Partial accepts roll
+        # back and RE-QUEUE the accepted prefix as the next block's known
+        # tokens (their hidden states stay live in out_h4 -> the next
+        # drafts seed from REAL main-model h, no recursion drift).
         dec_pin = torch.zeros(6, dtype=torch.long, device='cpu',
                               pin_memory=True)
-        chain_in[0] = int(logits_last[:, -1].argmax().item())
-        pend_len[0] = 1
-        pend_cpu = 1                  # known-prefix length incl. root
+        root0 = int(logits_last[:, -1].argmax().item())
+        a_buf[3] = root0               # g_cp[1] reads tok_out[0] <- a_buf[3]
         mtp_h_buf.copy_(h_last)
+        pend_cpu = 1
 
         gen = []
         n_iter = 0
@@ -1127,21 +1118,17 @@ def main():
         t = len(ids)
         t0 = time.time()
         while len(gen) < N and t < MAX_CTX - 6:
-            # -- 1. chain + prep fills + snap (ONE replay) --
+            # -- 1. chain (per pending length) + prep fills + snap --
             _t0 = time.time()
             # slot j's TRUE position: the block replays pend_cpu-1 pending
             # tokens (positions t-(pend_cpu-1)..t-1) before the new root
             pin_t[0] = t - (pend_cpu - 1)
-            g_chainprep.replay()       # -> tok_out, emb4/cos4/sin4/pos4
+            g_cp[pend_cpu].replay()    # -> tok_out, emb4/cos4/sin4/pos4
             _t1 = time.time(); t_draft += _t1 - _t0
 
             # -- 2. T=4 verify + decisions (ONE replay) + doorbell poll --
             g4dec.replay()             # -> dec_gpu, a_buf, out_h4/out_l4
             dec_pin.copy_(dec_gpu, non_blocking=True)
-            # DOORBELL instead of torch.cuda.synchronize(): the blocking
-            # device sync forces a WDDM driver round-trip (~60-85ms);
-            # polling a recorded event reads a GPU-written mapped flag
-            # in user space (~us). CPU spin, no kernel transition.
             ev.record()
             while not ev.query():
                 pass
@@ -1154,28 +1141,21 @@ def main():
 
             # -- 3. commit ONLY newly-processed tokens; queue setup --
             # block = [known prefix (pend_cpu-1, already committed),
-            #          root + drafts (new)]. L >= pend_cpu always
-            # (known positions auto-match).
-            committed = tv[pend_cpu - 1: L]
+            #          root + drafts (new)]. Known slots auto-match so
+            # L >= pend_cpu-1 always (deterministic re-verification).
+            committed = tv[pend_cpu - 1: max(L, pend_cpu - 1)]
             gen.extend(committed)
             acc_hist[len(committed) - 1] += 1
             n_iter += 1
             t += len(committed)      # frontier advances ONLY by new tokens
-            # next chain: known prefix = this block's accepted tokens +
-            # the new root a_{L-1} (all GPU-resident)
             if L == 4:
-                chain_in[0].copy_(a_buf[3])
-                pend_len[0] = 1
-                pend_cpu = 1
-                mtp_h_buf.copy_(out_h4[:, 3:4])
+                pend_cpu = 1         # all slots processed, no pending
+                mtp_h_buf.copy_(out_h4[:, 3:4])   # real h for g_cp[1]
             else:
                 fast_rollback()        # GDN/cum state -> pre-block
-                chain_in[:L].copy_(tok_out[:L])
-                chain_in[L].copy_(a_buf[L - 1])
-                pend_len[0] = L + 1
-                pend_cpu = L + 1
-                # mtp_h_buf untouched: it still holds the pre-block h
-                # (the chain reads it, nothing writes it) = correct seed
+                pend_cpu = L + 1       # pending = accepted slots + root
+                # tok_out slots 0..L-1 stay (pending); chain p=L+1 writes
+                # slot L..3 from a_buf[L-1] and seeds out_h4[L-1]
             t_commit += time.time() - _t2
             if tok.eos_token_id in committed:
                 break
@@ -1216,24 +1196,22 @@ def main():
         pos1.fill_(i)
         run(emb1, cos1, sin1, pos1)
     mtp_h_buf.copy_(out_h1)
-    chain_in[0] = 12345
     tb = len(ids_b)
+    a_buf[3] = 12345
     dec_pin_b = torch.zeros(6, dtype=torch.long, pin_memory=True)
-    chain_in[0] = 12345
-    pend_len[0] = 1
     ev_b = torch.cuda.Event(enable_timing=True)
     e0, e1 = (torch.cuda.Event(enable_timing=True),
               torch.cuda.Event(enable_timing=True))
     # warm
-    g_chainprep.replay(); g4dec.replay()
+    g_cp[1].replay(); g4dec.replay()
     torch.cuda.synchronize()
-    # variant A: chainprep + g4dec alternating, GPU-side event timing
+    # variant A: chain(p=1) + g4dec alternating, GPU-side event timing
     t_cp = t_g4 = 0.0
     t0b = time.time()
     for _ in range(40):
         pin_t[0] = tb
         e0.record()
-        g_chainprep.replay()
+        g_cp[1].replay()
         e1.record()
         g4dec.replay()
         ev_b.record()
@@ -1243,7 +1221,7 @@ def main():
         t_g4 += e1.elapsed_time(ev_b)
     dtb = (time.time() - t0b) / 40 * 1e3
     print(f'\n[pipe-bench] alternating 2 graphs: wall {dtb:.1f}ms/iter '
-          f'| GPU-side: chainprep {t_cp/40:.1f}ms + g4dec {t_g4/40:.1f}ms '
+          f'| GPU-side: chain(p=1) {t_cp/40:.1f}ms + g4dec {t_g4/40:.1f}ms '
           f'+ submit-gap {dtb - t_cp/40 - t_g4/40:.1f}ms', flush=True)
     free_b, total_b = torch.cuda.mem_get_info()
     print(f'[pipe-bench] VRAM free {free_b/1e9:.2f} / {total_b/1e9:.2f}GB '
