@@ -127,6 +127,14 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   arch wins on low-sync platforms (Linux/TCC est. 17 at k=3, 27+ at k=7).
 - mt-GEMV config: warps=4 WORSE than warps=2 in-context (g4 154 vs 105ms) — R4/BK256/W2
   is optimal; reconfirmed: always verify kernel configs with deployed-model timing.
+- WDDM CUDA-graph CAPTURE ORDER: in Q38SpecEngine the S=1 greedy graph must be
+  captured BEFORE the T=4 graphs — capturing it after several T=4 graphs HANGS
+  the process silently at capture. (round4b always captured S=1 graphs first.)
+- Speculative decoding vs sampling: temperature is compatible (scale both
+  sides); top-p/top-k conceptually belong at verification only; repetition/
+  frequency/min-p penalties are mutually exclusive with MTP — any sampling
+  knob currently falls back to the greedy graph + CPU-side sampling
+  (ixrun/sampling.py: HF-semantics penalty -> top-k -> nucleus -> temp).
 
 ## ixgs (Group-Scale, v3) — future direction
 - `ixgs/` is a self-contained package: per-group scale (`group_max/15`, group=64)
