@@ -632,15 +632,16 @@ def main():
         h = mtp_h_buf
         tok = chain_in[0]
         tok_out[0].copy_(tok)
-        for j in range(4):
+        # 3 MTP forwards produce tok_out[1..3] (predictions beyond the
+        # known prefix; the 4th forward's prediction had no consumer)
+        for j in range(3):
             e = emb_rows(tok.view(1)).view(1, 1, H)
             lg, h = mtp.forward2(e, h, mtp_pos_buf)
             p = lg[:, -1].argmax()
-            if j < 3:
-                nxt = torch.where(ar4c[j + 1] < pend_len[0],
-                                  chain_in[j + 1], p)
-                tok_out[j + 1].copy_(nxt)
-                tok = nxt
+            nxt = torch.where(ar4c[j + 1] < pend_len[0],
+                              chain_in[j + 1], p)
+            tok_out[j + 1].copy_(nxt)
+            tok = nxt
         return tok_out
 
     s_m = torch.cuda.Stream()
