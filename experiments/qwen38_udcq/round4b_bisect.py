@@ -632,8 +632,9 @@ def main():
         h = mtp_h_buf
         tok = chain_in[0]
         tok_out[0].copy_(tok)
-        # 3 MTP forwards produce tok_out[1..3] (predictions beyond the
-        # known prefix; the 4th forward's prediction had no consumer)
+        # 3 MTP forwards produce tok_out[1..3]; measured optimum for
+        # en/code (2-step: en E 1.60 vs 3-step 2.11, -22% tok/s; zh gains
+        # +10% because d3 never hits there — but en/code dominate)
         for j in range(3):
             e = emb_rows(tok.view(1)).view(1, 1, H)
             lg, h = mtp.forward2(e, h, mtp_pos_buf)
