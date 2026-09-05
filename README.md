@@ -78,8 +78,8 @@ vs 55min 重量化）。
 | INT8-X streaming 基线 | 310→138 ms/tok | cumsum 削减 + fused GEMV + fla 绑定 + split-K |
 | **MiniCPM5 整步图解码** | **~50-130 tok/s** | `StepGraphEngine`（`--mode step-graph`），延迟同步后 134 tok/s |
 | UDCQ 静态 KV + CUDA Graph 贪心 | **15.4→33.7 tok/s** | 手写 CUDA GEMV（`UDCQ_CUDA_GEMV=1`，~700GB/s）|
-| **队列架构投机解码 k=3 + CUDA** | **35.3/35.3/25.3 tok/s**（英/码/中）| 手写 CUDA M=1+M=4，50-60ms/迭代 |
-| 队列架构投机解码（Triton 版对照）| 14.8-16.4 tok/s | 同上 kernel 换 Triton |
+| **队列投机 k=3 + CUDA + 真-h seed** | **53.4/45.4/32.3 tok/s**（英/码/中）| 草稿从 `out_h4` 真主模型 h 起拟（递归漂移消除），43-50ms/迭代 |
+| 队列投机（递归 seed 对照）| 39.9/35.8/25.2 tok/s | 同架构，seed 为 MTP 递归近似 |
 
 投机解码当前受限于两件事：① 权重读取地板（20GB@220GB/s≈106ms/前向，T=4 已摊薄
 到 26ms/token）；② MTP 链式草稿质量衰减（d1 用真 h ~75% 接受，d2/d3 用递归近似
