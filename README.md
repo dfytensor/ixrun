@@ -76,6 +76,7 @@ vs 55min 重量化）。
 | 阶段 | 速度 | 说明 |
 |---|---|---|
 | INT8-X streaming 基线 | 310→138 ms/tok | cumsum 削减 + fused GEMV + fla 绑定 + split-K |
+| **MiniCPM5 整步图解码** | **~50 tok/s**（19ms/tok，2.6×）| `StepGraphEngine`（`--mode step-graph`），eager 单步 77% 是 Python/launch |
 | UDCQ 静态 KV + CUDA Graph 贪心 | **15 tok/s** | `round3_graph.py`，生产级稳定 |
 | 队列架构投机解码 k=3 | **14.8-16.4 tok/s**（英/码）| `round4b_bisect.py`，E=2.22 tok/迭代 |
 | 同上 pipe-bench | 120.8ms/迭代 | GPU 纯bound：MTP链 14.6 + T=4验证 106.9 + 提交间隔 0.2 |
@@ -104,11 +105,13 @@ vs 55min 重量化）。
 | **UDCQ 27B 图解码**（blob + 15 tok/s）| ✅ `Q38GraphEngine.from_blob` | ✅ `--mode udcq-graph` | ✅ 同左 |
 
 `Q38GraphEngine`（`ixrun/q38_graph.py`）与 `Int8XEngine` / `PeakQEngine`（`ixrun/peakq_engine.py`）
-同接口（tokenizer/generate/stream），chat/serve 无缝继承（`<think>` 隐藏、SSE 流式均可用）：
+/ `StepGraphEngine`（`ixrun/step_graph.py`，整步图解码 ~50 tok/s）同接口
+（tokenizer/generate/stream），chat/serve 无缝继承（`<think>` 隐藏、SSE 流式均可用）：
 
 ```bash
 # INT8-X（默认）          python -m ixrun.cli chat
 # PEAK-Q 近无损           python -m ixrun.cli chat --codec peakq
+# 整步图解码（快）        python -m ixrun.cli chat --mode step-graph --codec udcq
 # 27B UDCQ 图解码         python -m ixrun.cli chat --mode udcq-graph --cache q38_blob.pt
 ```
 

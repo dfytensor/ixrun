@@ -308,6 +308,10 @@ def serve(
         from .q38_graph import Q38GraphEngine
 
         eng = Q38GraphEngine.from_blob(cache_path, model_path)
+    elif mode == "step-graph":
+        from .step_graph import StepGraphEngine
+
+        eng = StepGraphEngine.from_pretrained(model_path, codec=codec)
     elif codec == "peakq":
         from .peakq_engine import PeakQEngine
 
