@@ -209,8 +209,6 @@ class Q38SpecEngine:
             if cum is not None:
                 self._dsts.append(cum)
                 self._srcs.append(torch.empty_like(cum))
-
-    # static graph outputs
     def _static_buffers(self):
         dev = self.dev
         self.out_h4 = torch.zeros(1, 4, self.H, dtype=torch.bfloat16,
@@ -226,6 +224,8 @@ class Q38SpecEngine:
         self.pin_t = torch.zeros(1, dtype=torch.long, pin_memory=True)
         self.t_gpu = torch.zeros(1, dtype=torch.long, device=dev)
         self.ar4 = torch.arange(4, device=dev)
+        self.temp_g = torch.ones(1, device=dev)   # draft temperature
+        self.draft_p = torch.ones(4, device=dev)  # p(d) per block slot
         self._ev = torch.cuda.Event()
 
     # ------------------------------------------------------------------ #
@@ -321,7 +321,7 @@ class Q38SpecEngine:
             self.pos4.copy_(idx)
             torch._foreach_copy_(self._srcs, self._dsts)   # fast_snap
 
-        def make_chain_body(p):
+        def make_chain_body(p, temp=False):
             n_drafts = 4 - p
             root_slot = p - 1
 
@@ -337,7 +337,18 @@ class Q38SpecEngine:
                 for s in range(n_drafts):
                     e = self.emb_rows(tok.view(1)).view(1, 1, self.H)
                     lg, h = self.mtp.forward2(e, h, self.mtp_pos_buf)
-                    tok = lg[:, -1].argmax()
+                    if temp:
+                        # temperature-sampled draft + its probability p(d)
+                        # (probabilistic acceptance needs p(d) = q alignment)
+                        pr = torch.softmax(
+                            lg[:, -1].float() / self.temp_g, dim=-1)
+                        t1 = torch.multinomial(pr[0], 1)
+                        tok = t1[0]          # 0-dim
+                        # gather: advanced indexing is illegal in capture
+                        self.draft_p[root_slot + 1 + s] = \
+                            pr[0].gather(0, t1).squeeze()
+                    else:
+                        tok = lg[:, -1].argmax()
                     self.tok_out[root_slot + 1 + s].copy_(tok)
                 prep_body()
             return body
@@ -394,6 +405,21 @@ class Q38SpecEngine:
             with torch.cuda.graph(g, pool=pool):
                 bodies[p]()
             self.g_cp[p] = g
+        # temperature-sampled draft chains (probabilistic acceptance)
+        bodies_t = {p: make_chain_body(p, temp=True) for p in (1, 2, 3, 4)}
+        s_t = torch.cuda.Stream()
+        s_t.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s_t):
+            for _ in range(3):
+                for p in (1, 2, 3, 4):
+                    bodies_t[p]()
+        torch.cuda.current_stream().wait_stream(s_t)
+        self.g_cp_t = {}
+        for p in (1, 2, 3, 4):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=pool):
+                bodies_t[p]()
+            self.g_cp_t[p] = g
         self.g4dec = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.g4dec, pool=pool):
             g4dec_body()
@@ -473,6 +499,37 @@ class Q38SpecEngine:
         self.dec_gpu[3] = self.tok_out[2]
         self.dec_gpu[4] = self.tok_out[3]
 
+    @torch.no_grad()
+    def _verify_temp(self, pend, temperature):
+        """Probabilistic acceptance (speculative sampling): drafts are
+        temperature-sampled from the MTP head (p = draft_p); accept each
+        with prob min(1, q(d)/p(d)) where q is the target distribution
+        under the SAME temperature. Rejected positions fall back to the
+        target sample (a_buf). Pending/replayed slots are not judged."""
+        lg = self.out_l4[0].float() / max(temperature, 1e-6)
+        probs = torch.softmax(lg, dim=-1)        # [4, V]
+        for j in range(4):
+            self.a_buf[j] = torch.multinomial(probs[j], 1).squeeze()
+        n_acc = 0
+        ok = True
+        for k in range(pend, 4):
+            if not ok:
+                break
+            d = self.tok_out[k].long()
+            q = probs[k - 1].gather(0, d)
+            p = self.draft_p[k].clamp_min(1e-9)
+            if torch.rand(1, device=self.dev)[0] < \
+                    (q / p).clamp(max=1.0):
+                n_acc += 1
+            else:
+                ok = False
+        L = min(pend + n_acc, 4)
+        self.dec_gpu[0] = L
+        self.dec_gpu[1] = self.tok_out[0]
+        self.dec_gpu[2] = self.tok_out[1]
+        self.dec_gpu[3] = self.tok_out[2]
+        self.dec_gpu[4] = self.tok_out[3]
+
     def _spec_iter(self, ids, max_new_tokens, temperature=0.0,
                    top_p=1.0, top_k=0):
         """Generator: yields batches of newly committed tokens. Sampling
@@ -488,11 +545,19 @@ class Q38SpecEngine:
         stops = self._stop_ids()
         gen = []
         t = len(ids)
+        temp = bool(temperature > 0)
         while len(gen) < max_new_tokens and t < self.max_ctx - 6:
             self.pin_t[0] = t - (pend_cpu - 1)
-            self.g_cp[pend_cpu].replay()
+            if temp:
+                self.temp_g[0] = temperature
+                self.g_cp_t[pend_cpu].replay()
+            else:
+                self.g_cp[pend_cpu].replay()
             self.g4dec.replay()
-            self._verify(temperature, top_p, top_k)
+            if temp:
+                self._verify_temp(pend_cpu, temperature)
+            else:
+                self._verify(0.0, 1.0, 0)
             dec_pin.copy_(self.dec_gpu, non_blocking=True)
             self._ev.record()
             while not self._ev.query():
@@ -516,8 +581,6 @@ class Q38SpecEngine:
     def generate(self, prompt, max_new_tokens=64, temperature=0.0,
                  do_sample=False, top_p=1.0, top_k=0,
                  repetition_penalty=1.0, **kw):
-        from .sampling import needs_sampling
-
         if not do_sample:
             temperature = 0.0
         top_p = float(kw.pop('top_p', top_p))
@@ -526,13 +589,17 @@ class Q38SpecEngine:
                                           repetition_penalty))
         ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
             .tolist()
-        if needs_sampling(do_sample, temperature, top_p, top_k,
-                          repetition_penalty):
-            # sampling disables speculation: measured on the 27B,
-            # temperature flattens the target distribution so draft
-            # acceptance collapses (E~1.0-1.3, ~18 tok/s verify-side
-            # sampling) — the greedy graph + CPU sampling (~33 tok/s,
-            # full HF semantics incl. penalties) is strictly faster.
+        if (temperature > 0 and top_p >= 1.0 and top_k <= 0
+                and repetition_penalty == 1.0):
+            # probabilistic acceptance keeps speculation active under
+            # temperature (drafts sampled from the SAME scaled
+            # distribution -> accept prob min(1, q/p) stays high)
+            out = []
+            for batch in self._spec_iter(ids, max_new_tokens,
+                                         temperature=temperature):
+                out.extend(batch)
+        elif repetition_penalty != 1.0 or top_p < 1.0 or top_k > 0 \
+                or temperature > 0:
             out = self._sample_tokens(ids, max_new_tokens, temperature,
                                       top_p, top_k, repetition_penalty)
         else:
@@ -544,8 +611,6 @@ class Q38SpecEngine:
     def stream(self, prompt, max_new_tokens=64, temperature=0.0,
                do_sample=False, top_p=1.0, top_k=0,
                repetition_penalty=1.0, **kw):
-        from .sampling import needs_sampling
-
         if not do_sample:
             temperature = 0.0
         top_p = float(kw.pop('top_p', top_p))
@@ -554,8 +619,14 @@ class Q38SpecEngine:
                                           repetition_penalty))
         ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
             .tolist()
-        if needs_sampling(do_sample, temperature, top_p, top_k,
-                          repetition_penalty):
+        if (temperature > 0 and top_p >= 1.0 and top_k <= 0
+                and repetition_penalty == 1.0):
+            for batch in self._spec_iter(ids, max_new_tokens,
+                                         temperature=temperature):
+                yield self.tokenizer.decode(batch)
+            return
+        if repetition_penalty != 1.0 or top_p < 1.0 or top_k > 0 \
+                or temperature > 0:
             toks = self._sample_tokens(ids, max_new_tokens, temperature,
                                        top_p, top_k, repetition_penalty)
             for v in toks:
