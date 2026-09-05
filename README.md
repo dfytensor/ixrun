@@ -80,12 +80,31 @@ vs 55min 重量化）。
 | UDCQ 静态 KV + CUDA Graph 贪心 | **15.4→33.7 tok/s** | 手写 CUDA GEMV（`UDCQ_CUDA_GEMV=1`，~700GB/s）|
 | **队列投机 k=3 + CUDA + 真-h seed** | **53.4/45.4/32.3 tok/s**（英/码/中）| 草稿从 `out_h4` 真主模型 h 起拟（递归漂移消除），43-50ms/迭代 |
 | 队列投机（递归 seed 对照）| 39.9/35.8/25.2 tok/s | 同架构，seed 为 MTP 递归近似 |
+| **投机 + 温度 0.9（概率接受）** | **~43 tok/s** | 草稿同温度采样 + `min(1,q/p)` 接受（E 1.1→2.08）|
+| 采样（top-p/k/penalty 激活）| ~33 tok/s | 贪心图 + CPU 采样（完整 HF 语义）|
+
+## 采样 × 投机路由规则
+
+- **纯贪心**（`--no-sample`）→ argmax 投机全速（~60 tok/s，E=2.8）
+- **仅 `--temperature`** → 概率接受投机（草稿同温采样，~43 tok/s）
+- **top_p / top_k / presence / frequency / repetition penalty** → 贪心图 + CPU 采样（~33 tok/s；官方参数组合走此档）
+
+官方 Qwen3.8 参数组合（均已支持，含 presence_penalty HF 语义）：
+```bash
+# 思考模式：temp 1.0, top_p 0.95, top_k 20
+python -m ixrun.cli chat --mode udcq-spec --cache q38_blob.pt \
+    --temperature 1.0 --top-p 0.95 --top-k 20
+# 非思考模式：temp 0.7, top_p 0.80, top_k 20, presence 1.5
+python -m ixrun.cli chat --mode udcq-spec --cache q38_blob.pt \
+    --temperature 0.7 --top-p 0.8 --top-k 20 --presence-penalty 1.5
+# OpenAI API 同语义：temperature/top_p/top_k/presence_penalty 字段直通
+```
 
 投机解码当前受限于两件事：① 权重读取地板（20GB@220GB/s≈106ms/前向，T=4 已摊薄
 到 26ms/token）；② MTP 链式草稿质量衰减（d1 用真 h ~75% 接受，d2/d3 用递归近似
 递减 → E=2.22；中文最弱 1.25）。加深到 k=7（T=8）预估 22-25 tok/s。
 
-### 调试中钉死的四个暗坑（详见 AGENTS.md）
+### 调试中钉死的五个暗坑（详见 AGENTS.md）
 
 1. **transformers 5.15 缓存 `conv_states`/`recurrent_states` 是 dict** — 迭代对象
    得到 int key，`isinstance(Tensor)` 守卫静默失效 → 快照/回滚从未生效（曾伪装成
@@ -97,25 +116,33 @@ vs 55min 重量化）。
 4. **"同步税"不存在** — event 门铃轮询证明 wall==GPU 时间；真凶是诊断克隆泄漏
    3.5GB 显存 → WDDM sysmem 换页（GPU 时间翻倍）。计时前必须释放诊断 + 查
    `mem_get_info`。
+5. **WDDM 图捕获顺序** — S=1 单 token 图必须在 T=4 图之前捕获（反之进程静默挂死）；
+   快照流须在首次前向后再收集（conv/rec dict 初值是 None，早收集=空流=回滚失效）。
 
 | 格式/能力 | 库级 API | CLI（chat/generate）| serve（OpenAI 兼容）|
 |---|---|---|---|
 | **INT8-X**（cached/streaming/graph）| ✅ `Int8XEngine` | ✅ 默认 | ✅ |
 | **PEAK-Q** 10.6bpw 54dB | ✅ `deploy_peakq` | ✅ `--codec peakq` | ✅ 同左 |
-| **UDCQ 27B 图解码**（blob + 15 tok/s）| ✅ `Q38GraphEngine.from_blob` | ✅ `--mode udcq-graph` | ✅ 同左 |
+| **UDCQ 27B 贪心图**（blob，~33 tok/s CUDA）| ✅ `Q38GraphEngine` | ✅ `--mode udcq-graph` | ✅ 同左 |
+| **UDCQ 27B 投机解码**（~60 tok/s 贪心 / 43 温度）| ✅ `Q38SpecEngine` | ✅ `--mode udcq-spec` | ✅ 同左 |
 
-`Q38GraphEngine`（`ixrun/q38_graph.py`）与 `Int8XEngine` / `PeakQEngine`（`ixrun/peakq_engine.py`）
-/ `StepGraphEngine`（`ixrun/step_graph.py`，整步图解码 ~50 tok/s）同接口
-（tokenizer/generate/stream），chat/serve 无缝继承（`<think>` 隐藏、SSE 流式均可用）：
+`Q38GraphEngine` / `Q38SpecEngine`（投机，`ixrun/q38_spec.py`）与 `Int8XEngine` /
+`PeakQEngine`（`ixrun/peakq_engine.py`）/ `StepGraphEngine`（`ixrun/step_graph.py`）
+同接口（tokenizer/generate/stream），chat/serve 无缝继承
+（`<think>` 隐藏、SSE 流式、top_p/top_k/presence/repetition 采样参数均可用）：
 
 ```bash
 # INT8-X（默认）          python -m ixrun.cli chat
 # PEAK-Q 近无损           python -m ixrun.cli chat --codec peakq
 # 整步图解码（快）        python -m ixrun.cli chat --mode step-graph --codec udcq
-# 27B UDCQ 图解码         python -m ixrun.cli chat --mode udcq-graph --cache q38_blob.pt
+# 27B UDCQ 贪心图解码      python -m ixrun.cli chat --mode udcq-graph --cache q38_blob.pt
 # 27B 投机解码（最快）    python -m ixrun.cli chat --mode udcq-spec --cache q38_blob.pt
 # 同上作为 OpenAI 服务    python -m ixrun.cli serve --mode udcq-spec --cache q38_blob.pt --port 8000
 ```
+
+投机/采样档位：`--no-sample` 贪心全速（~60 tok/s）；仅 `--temperature`
+概率接受（~43）；带 top_p/top_k/presence/frequency/repetition 走完整采样
+（~33，官方参数组合）。CUDA kernel 开关：`$env:UDCQ_CUDA_GEMV='1'`
 
 ## API Server（OpenAI 兼容）
 
