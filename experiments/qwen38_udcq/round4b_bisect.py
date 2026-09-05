@@ -1129,7 +1129,9 @@ def main():
         while len(gen) < N and t < MAX_CTX - 6:
             # -- 1. chain + prep fills + snap (ONE replay) --
             _t0 = time.time()
-            pin_t[0] = t
+            # slot j's TRUE position: the block replays pend_cpu-1 pending
+            # tokens (positions t-(pend_cpu-1)..t-1) before the new root
+            pin_t[0] = t - (pend_cpu - 1)
             g_chainprep.replay()       # -> tok_out, emb4/cos4/sin4/pos4
             _t1 = time.time(); t_draft += _t1 - _t0
 
@@ -1158,7 +1160,7 @@ def main():
             gen.extend(committed)
             acc_hist[len(committed) - 1] += 1
             n_iter += 1
-            t += L
+            t += len(committed)      # frontier advances ONLY by new tokens
             # next chain: known prefix = this block's accepted tokens +
             # the new root a_{L-1} (all GPU-resident)
             if L == 4:
