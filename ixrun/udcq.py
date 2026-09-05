@@ -209,17 +209,19 @@ if _HAS_TRITON:
         GROUP: tl.constexpr,
         BK: tl.constexpr,
         R: tl.constexpr,
+        STAGES: tl.constexpr,
     ):
         """Fused decode+GEMV: y = x @ W.T, W = sign*scale*CB[idx] decoded in
         registers. UDCQ's byte-aligned idx makes this a pure LUT walk —
         no bitmaps, no ranks, no cross-word extraction (unlike PEAK-Q/BF16X).
-        bf16 weight never materializes."""
+        bf16 weight never materializes. STAGES enables software pipelining
+        of the chunk loads (depth: hide DRAM latency across k iterations)."""
         pid = tl.program_id(0)
         rows = pid * R + tl.arange(0, R)
         base = rows.to(tl.int64) * IN_F
         acc = tl.zeros((R,), tl.float32)
 
-        for k0 in tl.range(0, IN_F, BK):
+        for k0 in tl.range(0, IN_F, BK, num_stages=STAGES):
             kidx = k0 + tl.arange(0, BK)
             offs = base[:, None] + kidx[None, :]           # [R, BK]
 
@@ -339,6 +341,9 @@ if _HAS_TRITON:
 UDCQ_GEMV_R = 4
 UDCQ_GEMV_BK = 256
 UDCQ_GEMV_WARPS = 2
+# num_stages pipelining HURTS this kernel (2.5x slower: S1 66ms vs S3 158ms
+# in-context — rotating buffers blow registers for the [R,BK] decode tiles)
+UDCQ_GEMV_STAGES = 1
 
 
 # GEMM tile defaults (BM, BN, BK, warps, stages) — tuned on 4090 for
@@ -364,12 +369,14 @@ def udcq_fused_gemm(x, idx, sign, scale, cb, out_f, in_f,
 
 
 def udcq_fused_gemv(x, idx, sign, scale, cb, out_f, in_f,
-                    g=UDCQ_G, r=None, bk=None, num_warps=None):
+                    g=UDCQ_G, r=None, bk=None, num_warps=None,
+                    stages=None):
     """y = x @ W.T single token, UDCQ-decoded in registers."""
     # in-context config override (AGENTS.md: verify with deployed model)
     r = UDCQ_GEMV_R if r is None else r
     bk = UDCQ_GEMV_BK if bk is None else bk
     num_warps = UDCQ_GEMV_WARPS if num_warps is None else num_warps
+    stages = UDCQ_GEMV_STAGES if stages is None else stages
     y = torch.empty(out_f, dtype=torch.bfloat16, device=x.device)
     while r > 1 and out_f % r != 0:               # odd out_f fallback
         r //= 2
@@ -377,7 +384,7 @@ def udcq_fused_gemv(x, idx, sign, scale, cb, out_f, in_f,
     _udcq_gemv_kernel[(out_f // r,)](
         x.reshape(-1), y,
         idx, sign, scale, cb,
-        IN_F=in_f, OUT_F=out_f, GROUP=g, BK=bk, R=r,
+        IN_F=in_f, OUT_F=out_f, GROUP=g, BK=bk, R=r, STAGES=stages,
         num_warps=num_warps,
     )
     return y

@@ -14,17 +14,20 @@ BLOB = r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt'
 MODEL = r'E:\models\Qwen3.8-27B'
 N = 50
 
-CONFIGS = [('default', None), ('R8', dict(r=8)), ('BK512', dict(bk=512)),
-           ('R8BK512', dict(r=8, bk=512))]
+CONFIGS = [('S1-default', dict(r=4, stages=1)),
+           ('R2S1', dict(r=2, stages=1)),
+           ('R2B128S1', dict(r=2, bk=128, stages=1)),
+           ('R4B128S1', dict(r=4, bk=128, stages=1))]
 
 for tag, cfg in CONFIGS:
     from ixrun import udcq as U
-    U.UDCQ_GEMV_R = (cfg or {}).get('r', 4)
-    U.UDCQ_GEMV_BK = (cfg or {}).get('bk', 256)
-    U.UDCQ_GEMV_WARPS = (cfg or {}).get('num_warps', 2)
+    U.UDCQ_GEMV_R = cfg.get('r', 4)
+    U.UDCQ_GEMV_BK = cfg.get('bk', 256)
+    U.UDCQ_GEMV_WARPS = cfg.get('num_warps', 2)
+    U.UDCQ_GEMV_STAGES = cfg.get('stages', 3)
     gc.collect(); torch.cuda.empty_cache()
     print(f'=== {tag}: R={U.UDCQ_GEMV_R} BK={U.UDCQ_GEMV_BK} '
-          f'W={U.UDCQ_GEMV_WARPS} ===', flush=True)
+          f'W={U.UDCQ_GEMV_WARPS} S={U.UDCQ_GEMV_STAGES} ===', flush=True)
     from ixrun.q38_graph import Q38GraphEngine
     eng = Q38GraphEngine.from_blob(BLOB, MODEL, verbose=False)
     tok = AutoTokenizer.from_pretrained(MODEL)
