@@ -112,6 +112,119 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_cuda_kernel(
     if (t == 0) y[row] = __float2bfloat16_rn(s);
 }
 
+// ------------------------------------------------------------------ //
+// Multi-token GEMV (TOK tokens): decode each weight ONCE, FMA across
+// all tokens — single weight-stream read serves TOK outputs. Per thread:
+// TOK*4 independent fp32 accumulator chains over 4 unrolled k-steps.
+// ------------------------------------------------------------------ //
+#define TOK 4
+
+__global__ __launch_bounds__(WARPS * 32) void udcq_gemv_mt_cuda_kernel(
+    const __nv_bfloat16* __restrict__ x,     // [TOK, IN_F]
+    __nv_bfloat16* __restrict__ y,           // [TOK, OUT_F]
+    const uint8_t* __restrict__ idx,         // [OUT_F * IN_F / 2]
+    const int* __restrict__ sign,            // int32 [OUT_F * IN_F / 32]
+    const __half* __restrict__ scale,        // [OUT_F * IN_F / 16]
+    int OUT_F, int IN_F)
+{
+    __shared__ float s_cb[16];
+    if (threadIdx.x < 16) s_cb[threadIdx.x] = c_cb[threadIdx.x];
+    __syncthreads();
+
+    const int row = blockIdx.x * WARPS + threadIdx.x / 32;
+    const int t = threadIdx.x & 31;
+    if (row >= OUT_F) return;
+    const int NSTEP = IN_F / WIDE;
+
+    const uint8_t* irow = idx + (size_t)row * (IN_F / 2);
+    const int* srow = sign + (size_t)row * (IN_F / 32);
+    const __half* crow = scale + (size_t)row * (IN_F / 16);
+
+    // token accumulators: a[TOK][4] chains
+    float a[TOK][4];
+    #pragma unroll
+    for (int tk = 0; tk < TOK; tk++)
+        #pragma unroll
+        for (int u = 0; u < 4; u++) a[tk][u] = 0.f;
+
+    int j = 0;
+    for (; j + 3 < NSTEP; j += 4) {
+        #pragma unroll
+        for (int u = 0; u < 4; u++) {
+            const int k0 = (j + u) * WIDE;
+            const uint32_t b = *(const uint32_t*)(irow + k0 / 2 + (size_t)t * 4);
+            const uint32_t sw = *(const uint32_t*)(srow + (k0 >> 5) + (t >> 2));
+            const float sc = __half2float(crow[(k0 >> 4) + (t >> 1)]);
+            const int sb = (t & 3) * 8;
+            // decode 8 weights once, FMA across TOK tokens
+            float wv[8];
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                wv[i] = s_cb[(b >> (4 * i)) & 0xF] * sc *
+                        bit_to_sgn(sw, sb + i);
+            #pragma unroll
+            for (int tk = 0; tk < TOK; tk++) {
+                const uint4 xv = *(const uint4*)(x + (size_t)tk * IN_F +
+                                                 k0 + (size_t)t * 8);
+                float acc = 0.f;
+                #pragma unroll
+                for (int i = 0; i < 8; i++)
+                    acc += wv[i] * __bfloat162float(
+                        ((const __nv_bfloat16*)&xv)[i]);
+                a[tk][u] += acc;
+            }
+        }
+    }
+    for (; j < NSTEP; j++) {
+        const int k0 = j * WIDE;
+        const uint32_t b = *(const uint32_t*)(irow + k0 / 2 + (size_t)t * 4);
+        const uint32_t sw = *(const uint32_t*)(srow + (k0 >> 5) + (t >> 2));
+        const float sc = __half2float(crow[(k0 >> 4) + (t >> 1)]);
+        const int sb = (t & 3) * 8;
+        float wv[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            wv[i] = s_cb[(b >> (4 * i)) & 0xF] * sc * bit_to_sgn(sw, sb + i);
+        #pragma unroll
+        for (int tk = 0; tk < TOK; tk++) {
+            float acc = 0.f;
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                acc += wv[i] * __bfloat162float(
+                    x[(size_t)tk * IN_F + k0 + (size_t)t * 8 + i]);
+            a[tk][0] += acc;
+        }
+    }
+    float s[TOK];
+    #pragma unroll
+    for (int tk = 0; tk < TOK; tk++) {
+        s[tk] = (a[tk][0] + a[tk][1]) + (a[tk][2] + a[tk][3]);
+        #pragma unroll
+        for (int o = 16; o; o >>= 1)
+            s[tk] += __shfl_xor_sync(0xffffffffu, s[tk], o);
+    }
+    if (t == 0) {
+        #pragma unroll
+        for (int tk = 0; tk < TOK; tk++)
+            y[(size_t)tk * OUT_F + row] = __float2bfloat16_rn(s[tk]);
+    }
+}
+
+torch::Tensor gemv_mt_cuda(torch::Tensor x, torch::Tensor idx,
+                           torch::Tensor sign, torch::Tensor scale,
+                           int64_t out_f, int64_t in_f) {
+    // x: [TOK, IN_F]; y: [TOK, OUT_F]
+    auto y = torch::empty({TOK, out_f}, x.options());
+    int grid = (out_f + WARPS - 1) / WARPS;
+    udcq_gemv_mt_cuda_kernel<<<grid, WARPS * 32, 0,
+                               at::cuda::getCurrentCUDAStream()>>>(
+        (const __nv_bfloat16*)x.data_ptr(),
+        (__nv_bfloat16*)y.data_ptr(),
+        (const uint8_t*)idx.data_ptr(), (const int*)sign.data_ptr(),
+        (const __half*)scale.data_ptr(), (int)out_f, (int)in_f);
+    return y;
+}
+
 torch::Tensor gemv_cuda(torch::Tensor x, torch::Tensor idx,
                         torch::Tensor sign, torch::Tensor scale,
                         torch::Tensor cb, int64_t out_f, int64_t in_f) {
@@ -144,9 +257,13 @@ def _load():
                          'torch::Tensor idx, torch::Tensor sign, '
                          'torch::Tensor scale, torch::Tensor cb, '
                          'int64_t out_f, int64_t in_f);',
+                         'torch::Tensor gemv_mt_cuda(torch::Tensor x, '
+                         'torch::Tensor idx, torch::Tensor sign, '
+                         'torch::Tensor scale, '
+                         'int64_t out_f, int64_t in_f);',
                          'void install_codebook(torch::Tensor cb);'],
             cuda_sources=CUDA_SRC,
-            functions=['gemv_cuda', 'install_codebook'],
+            functions=['gemv_cuda', 'gemv_mt_cuda', 'install_codebook'],
             extra_cuda_cflags=['-O3', '--use_fast_math',
                                '-allow-unsupported-compiler'],
             verbose=False)
@@ -165,6 +282,13 @@ def install_codebook(cb_f32):
     """Upload the model-wide codebook to __constant__ memory (once)."""
     ext = _load()
     ext.install_codebook(cb_f32.cuda())
+
+
+def cuda_gemv_mt(x, idx, sign, scale, out_f, in_f):
+    """x: [4, in_f] bf16 -> y: [4, out_f]. Decodes each weight once."""
+    ext = _load()
+    return ext.gemv_mt_cuda(x.reshape(4, in_f), idx, sign, scale,
+                            out_f, in_f)
 
 
 if __name__ == '__main__':

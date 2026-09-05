@@ -393,6 +393,25 @@ def udcq_fused_gemv(x, idx, sign, scale, cb, out_f, in_f,
 # multi-token GEMV config override (in-context tuning: set env before run,
 # verify with deployed-model timing per AGENTS.md rule)
 import os as _os
+
+_cuda_mod = None
+
+
+def _cuda_gemv_mod():
+    """Lazily import the hand-written CUDA GEMV extension (env-gated).
+    Codebook uploaded to __constant__ once, outside any graph capture."""
+    global _cuda_mod
+    if _cuda_mod is None:
+        import importlib.util as _ilu
+        import sys as _sys
+        _p = _os.environ.get(
+            "UDCQ_CUDA_GEMV_PATH",
+            r"E:\IXRUN\experiments\udcq_gemv_cuda\udcq_gemv_cuda.py")
+        _spec = _ilu.spec_from_file_location("udcq_gemv_cuda_ext", _p)
+        _cuda_mod = _ilu.module_from_spec(_spec)
+        _sys.modules["udcq_gemv_cuda_ext"] = _cuda_mod
+        _spec.loader.exec_module(_cuda_mod)
+    return _cuda_mod
 UDCQ_MT_R = int(_os.environ.get('UDCQ_MT_R', UDCQ_GEMV_R))
 UDCQ_MT_BK = int(_os.environ.get('UDCQ_MT_BK', UDCQ_GEMV_BK))
 UDCQ_MT_WARPS = int(_os.environ.get('UDCQ_MT_WARPS', UDCQ_GEMV_WARPS))
@@ -561,31 +580,13 @@ class UdcqLinear(nn.Module):
         # vs decode-then-GEMM and removes the buffer round-trip)
         w = None
         if x.numel() == self.in_features:
-            if _os.environ.get("UDCQ_CUDA_GEMV") and \
-                    self.in_features % 256 == 0:
+            _cg = _cuda_gemv_mod() if _os.environ.get("UDCQ_CUDA_GEMV") \
+                and self.in_features % 256 == 0 else None
+            if _cg is not None:
+                if not getattr(_cg, "_cb_installed", False):
+                    _cg.install_codebook(self._cb.float())
+                    _cg._cb_installed = True
                 try:
-                    # experimental hand-written CUDA GEMV (higher ILP):
-                    # built lazily on first use; same codebook across all
-                    # layers -> the constant-memory copy happens once
-                    import importlib.util as _ilu
-                    import sys as _sys
-                    _cg = _sys.modules.get("udcq_gemv_cuda_ext")
-                    if _cg is None:
-                        _p = _os.environ.get(
-                            "UDCQ_CUDA_GEMV_PATH",
-                            r"E:\IXRUN\experiments\udcq_gemv_cuda"
-                            r"\udcq_gemv_cuda.py")
-                        _spec = _ilu.spec_from_file_location(
-                            "udcq_gemv_cuda_ext", _p)
-                        _cg = _ilu.module_from_spec(_spec)
-                        _sys.modules["udcq_gemv_cuda_ext"] = _cg
-                        _spec.loader.exec_module(_cg)
-                        # codebook is model-wide: upload to __constant__
-                        # once, OUTSIDE any graph capture
-                        _cg.install_codebook(self._cb.float())
-                    elif not getattr(_cg, "_cb_installed", False):
-                        _cg.install_codebook(self._cb.float())
-                        _cg._cb_installed = True
                     y = _cg.cuda_gemv(x, self._idx, self._sign,
                                       self._scale, self._cb.float(),
                                       self.out_features,
@@ -613,6 +614,22 @@ class UdcqLinear(nn.Module):
         #   M >  256 -> decode-to-shared-buffer + cublas (each W read once;
         #               fused re-decodes per m-tile and loses ~8x at M=4096)
         M = x.numel() // self.in_features
+        _cg = _cuda_gemv_mod() if _os.environ.get("UDCQ_CUDA_GEMV") \
+            and M == 4 and x.shape[-1] == self.in_features \
+            and self.in_features % 256 == 0 else None
+        if _cg is not None:
+            if not getattr(_cg, "_cb_installed", False):
+                _cg.install_codebook(self._cb.float())
+                _cg._cb_installed = True
+            try:
+                y = _cg.cuda_gemv_mt(x, self._idx, self._sign,
+                                     self._scale, self.out_features,
+                                     self.in_features).to(x.dtype)
+                if self._bias is not None:
+                    y = y + self._bias.to(x.dtype)
+                return y.view(*x.shape[:-1], self.out_features)
+            except Exception:
+                pass   # fall through to Triton below
         if (M in (2, 4, 8) and x.shape[-1] == self.in_features
                 and self.in_features % UDCQ_GEMV_BK == 0):
             x2 = x.reshape(M, self.in_features)
