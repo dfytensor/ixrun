@@ -113,6 +113,8 @@ vs 55min 重量化）。
 # PEAK-Q 近无损           python -m ixrun.cli chat --codec peakq
 # 整步图解码（快）        python -m ixrun.cli chat --mode step-graph --codec udcq
 # 27B UDCQ 图解码         python -m ixrun.cli chat --mode udcq-graph --cache q38_blob.pt
+# 27B 投机解码（最快）    python -m ixrun.cli chat --mode udcq-spec --cache q38_blob.pt
+# 同上作为 OpenAI 服务    python -m ixrun.cli serve --mode udcq-spec --cache q38_blob.pt --port 8000
 ```
 
 ## API Server（OpenAI 兼容）
