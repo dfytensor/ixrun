@@ -333,11 +333,13 @@ def serve(
     if mode == "udcq-graph":
         from .q38_graph import Q38GraphEngine
 
-        eng = Q38GraphEngine.from_blob(cache_path, model_path)
+        eng = Q38GraphEngine.from_blob(cache_path, model_path,
+                                  max_ctx=max_ctx)
     elif mode == "udcq-spec":
         from .q38_spec import Q38SpecEngine
 
-        eng = Q38SpecEngine.from_blob(cache_path, model_path)
+        eng = Q38SpecEngine.from_blob(cache_path, model_path,
+                                 max_ctx=max_ctx)
     elif mode == "step-graph":
         from .step_graph import StepGraphEngine
 

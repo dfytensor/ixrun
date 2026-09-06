@@ -1,4 +1,4 @@
-﻿"""IXRUN command-line interface.
+"""IXRUN command-line interface.
 
 Usage examples:
   python -m ixrun.cli search        -- analyze optimal level scheme
@@ -37,6 +37,7 @@ def _cmd_search(args):
 
 
 def _build_engine(args):
+    mctx = int(getattr(args, 'max_ctx', 0) or 256)
     """Engine factory shared by generate/chat.
 
     --mode step-graph  whole-step CUDA-Graph decode (Llama-arch, ~50 tok/s
@@ -49,13 +50,15 @@ def _build_engine(args):
 
         if not args.cache:
             raise SystemExit("udcq-graph requires --cache <q38_blob.pt>")
-        return Q38GraphEngine.from_blob(args.cache, args.model)
+        return Q38GraphEngine.from_blob(args.cache, args.model,
+                                    max_ctx=mctx)
     if getattr(args, "mode", None) == "udcq-spec":
         from .q38_spec import Q38SpecEngine
 
         if not args.cache:
             raise SystemExit("udcq-spec requires --cache <q38_blob.pt>")
-        return Q38SpecEngine.from_blob(args.cache, args.model)
+        return Q38SpecEngine.from_blob(args.cache, args.model,
+                                   max_ctx=mctx)
     if getattr(args, "mode", None) == "step-graph":
         from .step_graph import StepGraphEngine
 
@@ -216,6 +219,8 @@ def main():
     pg.add_argument('--presence-penalty', type=float, default=0.0,
                     help='presence penalty (0.0=off)')
     pg.add_argument("--stream", action="store_true")
+    pg.add_argument("--max-ctx", type=int, default=256,
+                    help="KV window length (256-4096; +0.5GB VRAM at 4096)")
     pg.add_argument("--cache", default=None, help="packed-weight cache file / UDCQ blob")
     pg.set_defaults(func=_cmd_generate)
 
@@ -237,6 +242,8 @@ def main():
     pc.add_argument('--presence-penalty', type=float, default=0.0,
                     help='presence penalty (0.0=off)')
     pc.add_argument("--cache", default=None, help="packed-weight cache file / UDCQ blob")
+    pc.add_argument("--max-ctx", type=int, default=256,
+                    help="KV window length")
     pc.set_defaults(func=_cmd_chat, do_sample=True)
 
     pv = sub.add_parser("serve", help="OpenAI-compatible API server")
@@ -246,6 +253,8 @@ def main():
     pv.add_argument("--codec", default="int8x", choices=["int8x", "peakq", "bf16", "udcq", "udcq-stream"])
     pv.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pv.add_argument("--cache", default=None, help="packed-weight cache file / UDCQ blob")
+    pv.add_argument("--max-ctx", type=int, default=256,
+                    help="KV window length")
     pv.add_argument("--host", default="127.0.0.1")
     pv.add_argument("--port", type=int, default=8000)
     pv.add_argument("--model-id", default=None, help="model id advertised via /v1/models")
