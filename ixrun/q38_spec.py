@@ -577,6 +577,16 @@ class Q38SpecEngine:
             if stops & set(committed):
                 break
 
+    def _clip_ids(self, ids):
+        """Trim over-long prompts to the KV window (keeps the tail —
+        standard sliding-window chat behaviour)."""
+        budget = self.max_ctx - 8
+        if len(ids) > budget:
+            print(f'[q38-spec] prompt {len(ids)} > window {budget}: '
+                  f'trimming to tail', flush=True)
+            return ids[-budget:]
+        return ids
+
     def generate(self, prompt, max_new_tokens=64, temperature=0.0,
                  do_sample=False, top_p=1.0, top_k=0,
                  repetition_penalty=1.0, **kw):
@@ -588,8 +598,9 @@ class Q38SpecEngine:
                                           repetition_penalty))
         presence_penalty = float(kw.pop('presence_penalty', 0.0))
         frequency_penalty = float(kw.pop('frequency_penalty', 0.0))
-        ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
-            .tolist()
+        ids = self._clip_ids(
+            self.tokenizer(prompt, return_tensors='pt')['input_ids'][0]
+            .tolist())
         if (temperature > 0 and top_p >= 1.0 and top_k <= 0
                 and repetition_penalty == 1.0 and presence_penalty == 0.0
                 and frequency_penalty == 0.0):
@@ -623,8 +634,9 @@ class Q38SpecEngine:
                                           repetition_penalty))
         presence_penalty = float(kw.pop('presence_penalty', 0.0))
         frequency_penalty = float(kw.pop('frequency_penalty', 0.0))
-        ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
-            .tolist()
+        ids = self._clip_ids(
+            self.tokenizer(prompt, return_tensors='pt')['input_ids'][0]
+            .tolist())
         if (temperature > 0 and top_p >= 1.0 and top_k <= 0
                 and repetition_penalty == 1.0 and presence_penalty == 0.0
                 and frequency_penalty == 0.0):

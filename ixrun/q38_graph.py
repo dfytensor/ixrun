@@ -364,6 +364,14 @@ class Q38GraphEngine:
 
     # ------------------------------------------------------------------ #
     @torch.no_grad()
+    def _clip_ids(self, ids):
+        budget = self.max_ctx - 8
+        if len(ids) > budget:
+            print(f'[q38] prompt {len(ids)} > window {budget}: trimming',
+                  flush=True)
+            return ids[-budget:]
+        return ids
+
     def _stop_ids(self):
         ids = {self.tokenizer.eos_token_id}
         for sym in ('<|im_end|>', '<|endoftext|>'):
@@ -415,8 +423,9 @@ class Q38GraphEngine:
         top_k = int(kw.pop('top_k', top_k))
         repetition_penalty = float(kw.pop('repetition_penalty',
                                           repetition_penalty))
-        ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
-            .tolist()
+        ids = self._clip_ids(
+            self.tokenizer(prompt, return_tensors='pt')['input_ids'][0]
+            .tolist())
         out = self._gen_tokens(ids, max_new_tokens, temperature, do_sample,
                                top_p, top_k, repetition_penalty)
         return self.tokenizer.decode(out)
@@ -430,8 +439,9 @@ class Q38GraphEngine:
         top_k = int(kw.pop('top_k', top_k))
         repetition_penalty = float(kw.pop('repetition_penalty',
                                           repetition_penalty))
-        ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
-            .tolist()
+        ids = self._clip_ids(
+            self.tokenizer(prompt, return_tensors='pt')['input_ids'][0]
+            .tolist())
         self.hard_reset()
         logits = self.prefill(ids)
         nxt = int(logits[:, -1].argmax(-1).item())
