@@ -186,6 +186,7 @@ def _cmd_serve(args):
         top_k=args.top_k,
         presence_penalty=args.presence_penalty,
         repetition_penalty=args.repetition_penalty,
+        max_ctx=args.max_ctx,
     )
 
 

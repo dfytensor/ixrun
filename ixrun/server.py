@@ -317,8 +317,13 @@ def serve(
     top_k: int | None = None,
     presence_penalty: float | None = None,
     repetition_penalty: float | None = None,
+    max_ctx: int = 256,
 ):
     """Load engine + run uvicorn (blocking).
+
+    max_ctx: KV window. Each slot costs ~128KB on the 27B full-attn KV
+    (16 layers) — 8192 ≈ 1GB. Values above 16384 are clamped with a
+    warning (24GB budget).
 
     mode='udcq-graph' + cache_path=<q38_blob.pt>: Qwen3.8-27B UDCQ 6bpw
     StaticCache + CUDA-Graph engine (~15 tok/s, 24GB card).
@@ -356,6 +361,10 @@ def serve(
     if model_id is None:
         model_id = (model_path.rstrip("/\\").replace("\\", "/").split("/")[-1]
                     .lower().replace(".", "-"))
+    if max_ctx > 16384:
+        print(f'[server] --max-ctx {max_ctx} clamped to 16384 '
+              f'(KV ~128KB/slot on 27B)', flush=True)
+        max_ctx = 16384
     defaults = {}
     if temperature is not None:
         defaults["temperature"] = temperature
