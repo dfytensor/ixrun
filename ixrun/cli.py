@@ -178,6 +178,11 @@ def _cmd_serve(args):
         enable_thinking=args.think,
         batched=args.batched,
         codec=args.codec,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        presence_penalty=args.presence_penalty,
+        repetition_penalty=args.repetition_penalty,
     )
 
 
@@ -246,6 +251,12 @@ def main():
     pv.add_argument("--model-id", default=None, help="model id advertised via /v1/models")
     pv.add_argument("--think", action="store_true",
                     help="enable thinking mode (default: direct answers)")
+    pv.add_argument("--temperature", type=float, default=None,
+                    help="server-side sampling default (request overrides)")
+    pv.add_argument("--top-p", type=float, default=None)
+    pv.add_argument("--top-k", type=int, default=None)
+    pv.add_argument("--presence-penalty", type=float, default=None)
+    pv.add_argument("--repetition-penalty", type=float, default=None)
     pv.add_argument("--batched", action="store_true",
                     help="continuous batching: coalesce concurrent greedy requests "
                          "into batch forwards (~3x aggregate throughput)")

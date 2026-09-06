@@ -95,7 +95,8 @@ class _ThinkSplitter:
 
 def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
                batched: bool = False, min_batch: int = 8,
-               max_batch: int = 16) -> FastAPI:
+               max_batch: int = 16,
+               sampling_defaults: dict | None = None) -> FastAPI:
     app = FastAPI(title="ixrun inference server")
     gen_lock = threading.Lock()  # single GPU: serialize generations
     _bgen = None
@@ -124,24 +125,38 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
         return p, p.rstrip().endswith("<think>")
 
     def _gen_kwargs(req: ChatCompletionRequest) -> dict:
+        D = sampling_defaults or {}
         max_new = req.max_completion_tokens or req.max_tokens or 512
         kw = dict(max_new_tokens=int(max_new))
-        if req.temperature is not None:
-            kw["temperature"] = req.temperature
-            kw["do_sample"] = True
-        else:
-            kw["do_sample"] = False
-        if req.top_p is not None:
-            kw["top_p"] = req.top_p
-        if req.top_k:
-            kw["top_k"] = int(req.top_k)
+        # request wins over server-side defaults (CLI startup params)
+        temp = req.temperature if req.temperature is not None \
+            else D.get("temperature")
+        top_p = req.top_p if req.top_p is not None else D.get("top_p")
+        top_k = req.top_k if req.top_k is not None else D.get("top_k")
         rep = req.repetition_penalty
         if rep is None and req.frequency_penalty is not None:
             rep = 1.0 + max(req.frequency_penalty, 0.0)
+        if rep is None:
+            rep = D.get("repetition_penalty")
+        presence = req.presence_penalty \
+            if req.presence_penalty is not None \
+            else D.get("presence_penalty")
+        if temp is not None:
+            kw["temperature"] = temp
+            kw["do_sample"] = True
+        elif D.get("top_k") or (D.get("top_p") or 1.0) < 1.0 \
+                or presence or (rep or 1.0) != 1.0:
+            kw["do_sample"] = True        # sampling knobs w/o temperature
+        else:
+            kw["do_sample"] = False
+        if top_p is not None:
+            kw["top_p"] = top_p
+        if top_k:
+            kw["top_k"] = int(top_k)
         if rep is not None and rep != 1.0:
             kw['repetition_penalty'] = rep
-        if req.presence_penalty is not None and req.presence_penalty != 0.0:
-            kw['presence_penalty'] = req.presence_penalty
+        if presence is not None and presence != 0.0:
+            kw['presence_penalty'] = presence
         return kw
 
     @app.get("/health")
@@ -297,12 +312,21 @@ def serve(
     min_batch: int = 8,
     max_batch: int = 16,
     codec: str = "int8x",
+    temperature: float | None = None,
+    top_p: float | None = None,
+    top_k: int | None = None,
+    presence_penalty: float | None = None,
+    repetition_penalty: float | None = None,
 ):
     """Load engine + run uvicorn (blocking).
 
     mode='udcq-graph' + cache_path=<q38_blob.pt>: Qwen3.8-27B UDCQ 6bpw
     StaticCache + CUDA-Graph engine (~15 tok/s, 24GB card).
     codec='peakq': near-lossless 10.6bpw engine.
+    Sampling args become SERVER-SIDE DEFAULTS (per-request API fields
+    override them): e.g. --temperature 0.7 --top-p 0.8 --top-k 20
+    --presence-penalty 1.5 reproduces the official non-thinking combo
+    for every request that does not specify sampling itself.
     """
     import uvicorn
 
@@ -330,8 +354,22 @@ def serve(
     if model_id is None:
         model_id = (model_path.rstrip("/\\").replace("\\", "/").split("/")[-1]
                     .lower().replace(".", "-"))
+    defaults = {}
+    if temperature is not None:
+        defaults["temperature"] = temperature
+    if top_p is not None:
+        defaults["top_p"] = top_p
+    if top_k is not None:
+        defaults["top_k"] = top_k
+    if presence_penalty is not None:
+        defaults["presence_penalty"] = presence_penalty
+    if repetition_penalty is not None:
+        defaults["repetition_penalty"] = repetition_penalty
     app = create_app(eng, model_id, enable_thinking=enable_thinking,
-                     batched=batched, min_batch=min_batch, max_batch=max_batch)
+                     batched=batched, min_batch=min_batch,
+                     max_batch=max_batch, sampling_defaults=defaults or None)
     print(f"[server] listening on http://{host}:{port}/v1 (model={model_id}"
-          f"{', batched' if batched else ''})", flush=True)
+          f"{', batched' if batched else ''}"
+          f"{', defaults=' + repr(defaults) if defaults else ''})",
+          flush=True)
     uvicorn.run(app, host=host, port=port, log_level="warning")
