@@ -1,190 +1,179 @@
 # IXRUN — 单卡 24GB LLM 压缩推理引擎
 
-> 三代权重编码（INT8-X / PEAK-Q / UDCQ）+ Triton 融合 kernel + CUDA Graph 解码 +
-> MTP 投机解码。目标：RTX 4090 24GB 上跑 Qwen3.8-27B（51.75GB bf16 → 20GB 压缩）。
+> 四代权重编码 + Triton/手写 CUDA kernel + CUDA-Graph + MTP 投机解码 + OpenAI 兼容服务。
+> 目标硬件：RTX 4090 24GB / WDDM。旗舰结果：**Qwen3.8-27B 单卡投机解码 60 tok/s**。
 
-## 核心能力
+## 能力速览
 
-| 模块 | 文件 | 说明 |
-|---|---|---|
-| **INT8-X** 无损位图编码 | `quantize.py` | bf16→int8→(3,5,8) 嵌套位图，5.5 bpw，对 int8 逐位无损 |
-| **PEAK-Q** 近无损指数分组 | `peakq.py` | 10.6 bpw，54dB SNR，ppl +0.14；v2 rows 布局免前缀表 |
-| **UDCQ** 4-bit 码本量化 | `udcq.py` | 6.0 bpw，ppl ±0；nibble idx + 融合 GEMV/GEMM |
-| **多 token GEMV** | `udcq.py` | `udcq_fused_gemv_mt` T∈{2,4,8}：同走带+同累加式 ⇒ 与 M=1 **逐位一致**，带宽受限 ⇒ T=4 成本≈单 token（投机解码免费验证） |
-| **融合 kernel** | `fused.py` `tpab_gemv*.py` | decode+GEMV 单 kernel，bf16 权重永不落地（3× 流量→1×） |
-| **CUDA mma kernel** | `experiments/udcq_mma/` | m16n8k16 手写 mma.sync + cp.async 双缓冲，M=256 时 1.06-2.26× vs cublas |
-| **27B 投机解码** | `experiments/qwen38_udcq/round4b_bisect.py` | 队列架构 k=3：MTP 链式草稿 + T=4 单图验证 + 单同步 + **零前缀重放** |
-| **流式引擎** | `engine.py` | cached / streaming / graph 三模式 + ResourceScheduler |
-| **OpenAI 兼容 server** | `cli.py serve` | fastapi，SSE 流式，`<think>` 自动隐藏 |
+| 能力 | 说明 |
+|---|---|
+| **压缩格式** | INT8-X 5.5bpw（int8 无损）/ PEAK-Q 10.6bpw（54dB 近无损）/ UDCQ 6bpw（4-bit 码本，ppl≈±0）/ TPAB / ixgs |
+| **解码 kernel** | Triton fused decode+GEMV · 多 token GEMV（bit-exact，T=4 成本≈单 token）· **手写 CUDA GEMV**（~700GB/s，2.2× Triton）· CUDA mma 批量 |
+| **图执行** | CUDA-Graph 全步捕获（MiniCPM5 ~134 tok/s）；27B 验证图/链图多图管线（共享池、静态输出） |
+| **投机解码** | 队列架构 k=3 + 真-h MTP seed + 概率接受（温度兼容）；贪心 E=2.8 |
+| **采样** | temperature / top_p / top_k / presence / frequency / repetition penalty（HF 语义）+ Qwen3.8 官方参数组合 |
+| **推理引擎** | 5 个统一接口引擎（tokenizer/generate/stream），全部可挂 CLI + OpenAI serve |
+| **模型规模** | MiniCPM5-1B（整步图）→ Qwen3.8-27B（UDCQ blob 19.4GB，9 秒部署）|
 
-## 三代编码格式
+## 一、编码格式（四代）
 
-```
-INT8-X  5.5 bpw  对 int8 无损（ppl 差全部来自 int8 量化本身）— 基础设施
-PEAK-Q  10.6 bpw 54dB SNR，69% 元素 bit-exact — 近无损档
-UDCQ    6.0 bpw  4-bit 码本 + per-group scale，ppl ±0 — 27B 单卡落地的主力
-ixgs    4.2 bpw  per-group scale（group=64），25.4dB — 重尾权重/视频 DiT 方向
-TPAB    2-6 bit  64×64 tile 定长布局 — 小模型 8.9×，27B 不敌 UDCQ
-```
-
-## 快速使用
-
-```python
-from ixrun import Int8XEngine
-from ixrun.config import MODEL_PATH
-
-eng = Int8XEngine.from_pretrained(MODEL_PATH, mode="cached")
-print(eng.generate("The theory of relativity states that", max_new_tokens=64))
-for chunk in eng.stream("Once upon a time", max_new_tokens=64):
-    print(chunk, end="", flush=True)
-```
-
-```bash
-python -m ixrun.cli search                  # 穷举最优位图组合
-python -m ixrun.cli generate "Hello" --stream
-python -m ixrun.cli bench                   # bf16 vs INT8-X
-
-# 27B UDCQ 6bpw + CUDA Graph (~15 tok/s, blob 9s 快载)
-python -m ixrun.cli chat --model E:\models\Qwen3.8-27B --mode udcq-graph \
-    --cache experiments/qwen38_udcq/q38_blob.pt
-python -m ixrun.cli serve --model E:\models\Qwen3.8-27B --mode udcq-graph \
-    --cache experiments/qwen38_udcq/q38_blob.pt --port 8000   # OpenAI 兼容
-```
-
-## MiniCPM5-1B 基准（今日实测）
-
-| 模式 | 前向 | GPU 显存 | ppl | 存储 | 压缩比 |
-|---|---|---|---|---|---|
-| bf16 基线 | 37ms | 2.2GB | 56.02 | 2161MB | 1.0× |
-| INT8-X cached | 38ms | 2.2GB | 62.15 | 463MB | 4.66× |
-| INT8-X streaming | 49ms | 1.3GB | — | 463MB* | 4.66× |
-| INT8-X graph | 44ms | 4.3GB | — | 463MB* | 4.66× |
-| UDCQ (4-bit) | ≡bf16 | — | ±0 | ~390MB | ~5.5× |
-
-无损等价性：INT8-X == 纯 int8 逐位相等（ppl 62.1496 完全相同，10 层 bit-exact，
-greedy 一致率 100%）。多 token GEMV bit-exact 测试：
-`python -X utf8 experiments/qwen38_udcq/test_mt_gemv.py`（全部形状 × T∈{2,4,8} 零差异）。
-
-## Qwen3.8-27B 单卡推理（UDCQ 6bpw）
-
-64 层混合架构（48 GatedDeltaNet 线性注意力 + 16 全注意力），27B bf16 51.75GB
-无法进 24GB；UDCQ 压到 ~20GB（blob 快速部署 `q38_blob.pt` 21.76GB，18s 加载
-vs 55min 重量化）。
-
-### 性能阶梯（全部文本连贯）
-
-| 阶段 | 速度 | 说明 |
-|---|---|---|
-| INT8-X streaming 基线 | 310→138 ms/tok | cumsum 削减 + fused GEMV + fla 绑定 + split-K |
-| **MiniCPM5 整步图解码** | **~50-130 tok/s** | `StepGraphEngine`（`--mode step-graph`），延迟同步后 134 tok/s |
-| UDCQ 静态 KV + CUDA Graph 贪心 | **15.4→33.7 tok/s** | 手写 CUDA GEMV（`UDCQ_CUDA_GEMV=1`，~700GB/s）|
-| **队列投机 k=3 + CUDA + 真-h seed** | **53.4/45.4/32.3 tok/s**（英/码/中）| 草稿从 `out_h4` 真主模型 h 起拟（递归漂移消除），43-50ms/迭代 |
-| 队列投机（递归 seed 对照）| 39.9/35.8/25.2 tok/s | 同架构，seed 为 MTP 递归近似 |
-| **投机 + 温度 0.9（概率接受）** | **~43 tok/s** | 草稿同温度采样 + `min(1,q/p)` 接受（E 1.1→2.08）|
-| 采样（top-p/k/penalty 激活）| ~33 tok/s | 贪心图 + CPU 采样（完整 HF 语义）|
-
-## 采样 × 投机路由规则
-
-- **纯贪心**（`--no-sample`）→ argmax 投机全速（~60 tok/s，E=2.8）
-- **仅 `--temperature`** → 概率接受投机（草稿同温采样，~43 tok/s）
-- **top_p / top_k / presence / frequency / repetition penalty** → 贪心图 + CPU 采样（~33 tok/s；官方参数组合走此档）
-
-官方 Qwen3.8 参数组合（均已支持，含 presence_penalty HF 语义）：
-```bash
-# 思考模式：temp 1.0, top_p 0.95, top_k 20
-python -m ixrun.cli chat --mode udcq-spec --cache q38_blob.pt \
-    --temperature 1.0 --top-p 0.95 --top-k 20
-# 非思考模式：temp 0.7, top_p 0.80, top_k 20, presence 1.5
-python -m ixrun.cli chat --mode udcq-spec --cache q38_blob.pt \
-    --temperature 0.7 --top-p 0.8 --top-k 20 --presence-penalty 1.5
-# OpenAI API 同语义：temperature/top_p/top_k/presence_penalty 字段直通
-```
-
-投机解码当前受限于两件事：① 权重读取地板（20GB@220GB/s≈106ms/前向，T=4 已摊薄
-到 26ms/token）；② MTP 链式草稿质量衰减（d1 用真 h ~75% 接受，d2/d3 用递归近似
-递减 → E=2.22；中文最弱 1.25）。加深到 k=7（T=8）预估 22-25 tok/s。
-
-### 调试中钉死的五个暗坑（详见 AGENTS.md）
-
-1. **transformers 5.15 缓存 `conv_states`/`recurrent_states` 是 dict** — 迭代对象
-   得到 int key，`isinstance(Tensor)` 守卫静默失效 → 快照/回滚从未生效（曾伪装成
-   "10-30 token 后文本退化"+"图 vs eager 数值不同"两个玄学）。
-2. **注意力输出 `[B,H,S,D]` reshape 前必须 transpose(1,2)** — q_len=1 碰巧无害，
-   q_len≥2 head/token 布局乱码（dmax 6.0）。
-3. **CUDA Graph 共享池混叠** — 捕获返回的张量在后续图回放中被覆盖，输出必须在
-   图内拷入静态 buffer（症状：token id 变 float 位模式）。
-4. **"同步税"不存在** — event 门铃轮询证明 wall==GPU 时间；真凶是诊断克隆泄漏
-   3.5GB 显存 → WDDM sysmem 换页（GPU 时间翻倍）。计时前必须释放诊断 + 查
-   `mem_get_info`。
-5. **WDDM 图捕获顺序** — S=1 单 token 图必须在 T=4 图之前捕获（反之进程静默挂死）；
-   快照流须在首次前向后再收集（conv/rec dict 初值是 None，早收集=空流=回滚失效）。
-
-| 格式/能力 | 库级 API | CLI（chat/generate）| serve（OpenAI 兼容）|
+| 格式 | bpw | 精度 | 用途 |
 |---|---|---|---|
-| **INT8-X**（cached/streaming/graph）| ✅ `Int8XEngine` | ✅ 默认 | ✅ |
-| **PEAK-Q** 10.6bpw 54dB | ✅ `deploy_peakq` | ✅ `--codec peakq` | ✅ 同左 |
-| **UDCQ 27B 贪心图**（blob，~33 tok/s CUDA）| ✅ `Q38GraphEngine` | ✅ `--mode udcq-graph` | ✅ 同左 |
-| **UDCQ 27B 投机解码**（~60 tok/s 贪心 / 43 温度）| ✅ `Q38SpecEngine` | ✅ `--mode udcq-spec` | ✅ 同左 |
+| **INT8-X** | 5.5 | 对 int8 无损（ppl 差 = int8 量化本身）| 引擎默认（cached/streaming/graph）|
+| **PEAK-Q** | 10.6 | 54dB SNR，69% 元素 bit-exact | 近无损档 |
+| **UDCQ** | 6.0 | 4-bit 码本（分布自适应），ppl≈±0 | **27B 单卡主力** |
+| **ixgs** | 4.2 | per-group scale，25.4dB | 重尾权重/视频 DiT 方向 |
+| TPAB | 2-6 | tile 定长 | 原型 |
 
-`Q38GraphEngine` / `Q38SpecEngine`（投机，`ixrun/q38_spec.py`）与 `Int8XEngine` /
-`PeakQEngine`（`ixrun/peakq_engine.py`）/ `StepGraphEngine`（`ixrun/step_graph.py`）
-同接口（tokenizer/generate/stream），chat/serve 无缝继承
-（`<think>` 隐藏、SSE 流式、top_p/top_k/presence/repetition 采样参数均可用）：
+关键设计：UDCQ 的 byte-aligned nibble → **纯 LUT 解码**（无位图/rank/跨字提取），解码便宜是比位宽更值钱的资产；多 token GEMV 与逐位一致因此投机验证免费。
 
-```bash
-# INT8-X（默认）          python -m ixrun.cli chat
-# PEAK-Q 近无损           python -m ixrun.cli chat --codec peakq
-# 整步图解码（快）        python -m ixrun.cli chat --mode step-graph --codec udcq
-# 27B UDCQ 贪心图解码      python -m ixrun.cli chat --mode udcq-graph --cache q38_blob.pt
-# 27B 投机解码（最快）    python -m ixrun.cli chat --mode udcq-spec --cache q38_blob.pt
-# 同上作为 OpenAI 服务    python -m ixrun.cli serve --mode udcq-spec --cache q38_blob.pt --port 8000
-```
-
-投机/采样档位：`--no-sample` 贪心全速（~60 tok/s）；仅 `--temperature`
-概率接受（~43）；带 top_p/top_k/presence/frequency/repetition 走完整采样
-（~33，官方参数组合）。CUDA kernel 开关：`$env:UDCQ_CUDA_GEMV='1'`
-
-## API Server（OpenAI 兼容）
+## 二、快速开始
 
 ```powershell
-$env:HF_HUB_OFFLINE='1'; $env:PYTHONPATH='E:\IXRUN'
-& 'F:\rwkv\.venv\Scripts\python.exe' -m ixrun.cli serve --model E:\models\Qwen3.8-27B --cache E:\models\qwen38_packed.pt --port 8000 --model-id qwen3.8-27b
+# 环境
+$env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; $env:PYTHONUTF8='1'
+$env:UDCQ_CUDA_GEMV='1'          # 手写 CUDA kernel（贪心 15→34 tok/s 的关键）
+
+# MiniCPM5-1B 整步图（~134 tok/s）
+python -m ixrun.cli chat --mode step-graph --codec udcq
+
+# Qwen3.8-27B 投机解码（最快）
+python -m ixrun.cli chat --mode udcq-spec `
+  --model E:\models\Qwen3.8-27B `
+  --cache E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt
+
+# 作为 OpenAI 兼容服务
+python -m ixrun.cli serve --mode udcq-spec `
+  --model E:\models\Qwen3.8-27B --cache ...\q38_blob.pt --port 8000
 ```
 
-端点：`GET /v1/models` · `POST /v1/chat/completions`（`stream=true` SSE）· `GET /health`。
-opencode 接入：provider baseURL `http://127.0.0.1:8000/v1`，模型 `qwen3.8-27b`。
+## 三、27B 性能阶梯
 
-## 项目结构
+| 档位 | 速度 | 条件 |
+|---|---|---|
+| **投机全速（贪心）** | **~53-60 tok/s**（E=2.8）| `--no-sample` |
+| **投机 + 温度**（概率接受）| ~43 tok/s（E=2.08）| 仅 `--temperature`（如 0.9）|
+| 完整采样（含 penalty）| ~33 tok/s | top_p/top_k/presence/frequency/rep |
+| CUDA 贪心图（无投机）| 33.7 tok/s | `--mode udcq-graph` |
+| Triton 贪心（无 CUDA env）| 15.4 tok/s | 不设 `UDCQ_CUDA_GEMV` |
+
+里程碑（本仓库演进）：Triton 贪心 15.4 → CUDA 贪心 33.7 → 投机贪心 53-60 tok/s。
+三大提速支柱：**手写 CUDA GEMV**（320→700GB/s，warp-per-row + smem 码本 + 128-bit 装载 + 4 独立累加链）、**队列投机架构**（零前缀重放、单同步）、**真-h MTP seed**（草稿从 `out_h4` 真主模型隐状态起拟，E 2.2→2.8）。
+
+### 投机 × 采样路由规则
+
+- 纯贪心 → argmax 投机（全速）
+- 仅 temperature → **概率接受**：草稿同温度采样 + `min(1, q(d)/p(d))` 逐槽接受（温度不关投机）
+- top_p / top_k / presence / frequency / repetition → 完整采样档（贪心图 + CPU 采样，HF 语义）
+- 统计事实：投机收益 ∝ 草稿在 target 分布下的概率质量——温度摊平分布必然降接受率，故采样档位速度低于贪心
+
+## 四、Qwen3.8 官方参数组合（一键复刻）
+
+```bash
+# 思考模式：temp 1.0, top_p 0.95, top_k 20
+python -m ixrun.cli serve --mode udcq-spec --cache q38_blob.pt `
+  --model E:\models\Qwen3.8-27B --temperature 1.0 --top-p 0.95 --top-k 20
+
+# 非思考模式：temp 0.7, top_p 0.80, top_k 20, presence_penalty 1.5
+python -m ixrun.cli serve --mode udcq-spec --cache q38_blob.pt `
+  --model E:\models\Qwen3.8-27B --temperature 0.7 --top-p 0.8 `
+  --top-k 20 --presence-penalty 1.5
+```
+
+serve 启动参数 = **服务端默认**，API 请求字段可覆盖；OpenAI 请求的
+`temperature/top_p/top_k/presence_penalty/frequency_penalty` 字段全部直通。
+
+## 五、引擎矩阵（统一 tokenizer/generate/stream 接口）
+
+| 引擎 | 库 | CLI mode | serve | 说明 |
+|---|---|---|---|---|
+| Int8XEngine | `ixrun/engine.py` | 默认 / `--codec int8x` | ✅ | INT8-X cached/streaming/graph，HF generate |
+| PeakQEngine | `ixrun/peakq_engine.py` | `--codec peakq` | ✅ | PEAK-Q 近无损 |
+| StepGraphEngine | `ixrun/step_graph.py` | `--mode step-graph` | ✅ | 整步 CUDA-Graph（Llama-arch，MiniCPM5 134 tok/s）|
+| Q38GraphEngine | `ixrun/q38_graph.py` | `--mode udcq-graph` | ✅ | 27B 贪心图解码（33.7 tok/s）|
+| **Q38SpecEngine** | `ixrun/q38_spec.py` | `--mode udcq-spec` | ✅ | **27B 投机解码（60/43/33 三档）** |
+
+通用参数：`--max-ctx`（KV 窗口，默认 256，上限 16384）· `--codec` · `--cache`
+（blob/打包权重）· 全部采样参数。server 另支持 `<think>` 隐藏、SSE 流式、
+请求级采样、连续批处理。
+
+## 六、服务 API
+
+- `GET /v1/models` · `POST /v1/chat/completions`（stream SSE / 非流式）· `GET /health`
+- OpenAI 语义：model / messages / max_tokens / stream / temperature / top_p /
+  top_k / presence_penalty / frequency_penalty / repetition_penalty
+- `reasoning_content` 字段承载思考内容；多轮会话由调用方维护历史（每轮重 prefill）
+
+## 七、架构原理（投机解码）
+
+1. **队列投机**：T=4 单图验证 [已知前缀 + root + 3 草稿]；部分接受 → 回滚 →
+   接受前缀作为下块已知 token **自动再验证**（位置簿记精确：槽真实位置 =
+   状态前沿 - pending 数）→ 零前缀重放、每迭代一次门铃同步。
+2. **真-h seed**：回滚不清 `out_h4` —— 草稿从验证刚算出的**真主模型隐状态**
+   seed（按 pending 长度选 4 张链图之一），消除 MTP 递归漂移。
+3. **概率接受**（仅温度档）：草稿链同温度采样并存草稿概率 p(d)；验证算
+   q(d) = target 同温分布概率；`u < min(1, q/p)` 逐槽接受。
+4. **手写 CUDA GEMV**（`experiments/udcq_gemv_cuda/`，env `UDCQ_CUDA_GEMV=1`）：
+   每 warp 一行、每线程 8 元素连续块、128-bit 装载、smem 码本 gather、
+   4 路独立 fp32 累加；M=1 与 M=4（单遍解码服务 4 token）均可用。
+
+## 八、基准数据
+
+### MiniCPM5-1B（整步图 + 延迟同步）
+
+| 模式 | tok/s | VRAM |
+|---|---|---|
+| eager cached | 25 | 2.2GB |
+| StepGraphEngine bf16 | 105 | 2.28GB |
+| StepGraphEngine UDCQ | **134** | 2.28GB |
+
+### 27B 负载画像（profiler 结论）
+
+单 token GPU 时间 = 121 个 GEMV（合计 2.2ms，18μs/个）+ attention@KV +
+elementwise；真正的税是 CPU 同步与 Python —— 整步图 + 门铃轮询 + 延迟批量
+读回逐一消除（WDDM 上无同步税：wall == GPU 时间，前提显存不换页）。
+
+### 编码格式 A/B（wikitext ppl delta vs bf16）
+
+| 格式 | bpw | Δppl |
+|---|---|---|
+| MXINT8（OCP 对照）| 8.25 | -0.21 |
+| UDCQ | 6.0 | +2.04 |
+| MXFP6（OCP 对照）| 6.25 | +3.93 |
+| INT8-X | 5.46 | +6.13 |
+
+## 九、调试中钉死的五个暗坑
+
+1. transformers 5.15 缓存 `conv_states/recurrent_states` 是 **dict**——迭代得
+   int key，快照/回滚静默失效（曾伪装成"文本退化"与"图 vs eager 不同"）。
+2. 注意力输出 `[B,H,S,D]` reshape 前必须 transpose——q_len≥2 布局乱码。
+3. CUDA-Graph 共享池混叠——图输出必须拷入静态 buffer。
+4. "同步税"是假象——真凶是显存超卖触发 WDDM sysmem 换页；计时前查
+   `mem_get_info()`。
+5. WDDM 图捕获顺序：S=1 图先于 T=4 图捕获（反序进程静默挂死）；快照流在
+   首次前向后再收集（conv/rec dict 初值 None）。
+
+## 十、项目结构
 
 ```
-ixrun/
-├── config.py            # 路径与常量
-├── quantize.py          # INT8-X: bf16→int8→(3,5,8) 位图
-├── peakq.py             # PEAK-Q v2: 指数分组近无损 + 融合 GEMV
-├── udcq.py              # UDCQ: 4-bit 码本 + 融合 GEMV/GEMM/多token GEMV
-├── triton_kernels.py    # INT8-X 解码 kernel
-├── fused.py             # INT8-X 融合 decode+GEMV
-├── tpab*.py hybrid.py   # TPAB tile 编码与混合后端
-├── linear.py            # 部署层（Int8XLinear / UdcqLinear / PeakQLinear）
-├── engine.py            # 三模式引擎 + ResourceScheduler
-├── fla_patch.py         # fla Triton kernel 绑定（否则 HF 回退 120ms/tok Python 循环）
-├── gdn_seq_patch.py     # GDN 种子块逐 token 精确路径 (S≤8，投机验证用)
-├── generate.py eval_utils.py cli.py mtp.py
-ixgs/                    # Group-Scale v3（视频 DiT 方向，见 ixgs/README.md）
-experiments/
-├── qwen38_udcq/         # 27B 全链路：blob 部署/静态KV图解码/投机解码/test_mt_gemv
-├── udcq_mma/            # CUDA mma.sync 批量 kernel
-benchmarks/              # bench_minicpm5 / bench_qwen38 / bench_peakq
-tests/                   # test_core（无损验证）
+ixrun/            config.py · quantize.py(INT8-X) · peakq.py · udcq.py
+                  triton_kernels.py · fused.py · tpab*.py
+                  linear.py · engine.py(Int8XEngine) · peakq_engine.py
+                  step_graph.py · q38_graph.py · q38_spec.py(投机)
+                  fla_patch.py · gdn_seq_patch.py · sampling.py
+                  generate.py · chat.py · cli.py · server.py
+ixgs/             Group-Scale 方向
+experiments/      qwen38_udcq/(blob/round4b 投机原型) · udcq_gemv_cuda/(手写 kernel)
+                  udcq_mma/ · mx 格式 A/B
+benchmarks/       bench_minicpm5 · bench_q38_ab · bench_formats_minicpm5 · bench_q38_cfg
+tests/            test_core（无损验证）
 ```
 
 ## 环境与铁律
 
-- Python `F:\rwkv\.venv\Scripts\python.exe` (3.12)，torch 2.13+cu126，triton 3.7.1，
-  transformers 5.15（qwen3_5 需 ≥5.8），RTX 4090 24GB / WDDM
-- 离线：`HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`；中文/特殊字符加 `PYTHONUTF8=1`
-- **`import pandas` 必须在 `import torch` 之前**（反序会堆损坏 0xC0000374）
-- kernel 配置**必须用部署模型实测**校验（孤立计时在此 WDDM 机器不可靠，
-  warps=4 孤立更快、在模型中慢 15-60%）
-- 计时基准前：释放诊断张量 + `torch.cuda.empty_cache()` + 检查
-  `torch.cuda.mem_get_info()`（free=0 ⇒ 已进换页区，数字全废）
+- Python `F:\rwkv\.venv\Scripts\python.exe`；torch 2.13+cu126、triton 3.7.1、
+  transformers 5.15；RTX 4090 24GB / WDDM；nvcc 13.1 + VS2022（扩展编译）
+- `import pandas` 先于 `import torch`；离线 env 三件套；中文加 `PYTHONUTF8=1`
+- kernel 配置必须用部署模型实测校验（孤立计时不可信，warps=4 在模型中慢 15-60%）
+- 27B 显存预算：blob 19.4GB + int8 emb 1.27GB + 快照/图 ≈ 21.9GB —— 严禁超 24GB
+- 投机引擎构建需先跑一次 CUDA smoke（进程强杀后 WDDM 可能让图捕获挂死）
