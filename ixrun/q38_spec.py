@@ -174,13 +174,19 @@ class Q38SpecEngine:
         self.log1 = torch.zeros(1, 1, self.V, dtype=torch.bfloat16,
                                 device=dev)
 
-        # int8 GPU embedding table for in-graph gathers (~1.27GB)
+        # int4 packed GPU embedding table (~0.64GB vs 1.27GB int8): the
+        # 27B spec pipeline needs every free GB (GMM 5-bit codec leaves
+        # <1GB headroom; int8 emb OOMed at engine construction).
+        print('[q38-spec] staging int4 emb table...', flush=True)
         emb_f = self._emb_weight().float()
-        emb_s = (emb_f.abs().amax(dim=1) / 127.0).clamp_min(1e-12)
-        self.emb_i8 = (emb_f / emb_s.unsqueeze(1)).round().to(torch.int8)
-        self.emb_i8 = self.emb_i8.cuda()
+        emb_s = (emb_f.abs().amax(dim=1) / 7.0).clamp_min(1e-12)
+        q = (emb_f / emb_s.unsqueeze(1)).round().clamp(-8, 7) \
+            .to(torch.int8)
+        lo4 = (q[:, 0::2] & 0x0F).to(torch.uint8)
+        hi4 = (q[:, 1::2] & 0x0F).to(torch.uint8)
+        self.emb_p4 = (lo4 | (hi4 << 4)).cuda()
         self.s_g = emb_s.cuda().unsqueeze(1)
-        del emb_f
+        del emb_f, q, lo4, hi4
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -229,9 +235,15 @@ class Q38SpecEngine:
 
     # ------------------------------------------------------------------ #
     def emb_rows(self, ids_t):
-        q = F.embedding(ids_t, self.emb_i8)
+        """int4-unpacked dequantized rows (capture-safe gathers)."""
+        b = F.embedding(ids_t, self.emb_p4)            # [n, H/2] uint8
+        lo = (b & 0x0F).to(torch.int16)
+        hi = ((b >> 4) & 0x0F).to(torch.int16)
+        lo = torch.where(lo >= 8, lo - 16, lo).to(torch.float32)
+        hi = torch.where(hi >= 8, hi - 16, hi).to(torch.float32)
+        q = torch.stack([lo, hi], dim=-1).reshape(*b.shape[:-1], -1)
         sc = F.embedding(ids_t, self.s_g)
-        return (q.float() * sc).to(torch.bfloat16)
+        return (q * sc).to(torch.bfloat16)
 
     @classmethod
     def from_blob(cls, blob_path, model_path=QWEN38_PATH, tokenizer=None,

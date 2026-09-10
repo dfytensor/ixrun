@@ -16,41 +16,43 @@ BLOB = r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt'
 MODEL = r'E:\models\Qwen3.8-27B'
 
 
-def gmm5_pack_gpu(w, mu, group=16):
-    """GPU encoder: nibble low 4 bits + 1-bit high bitmap + fp16 scale."""
+def gmm5_pack_gpu(w, mu, group=16, row_blk=2048):
+    """GPU encoder, row-blocked: keeps temporaries small (lm_head alone
+    is 1.27G elements — a full float expand is 5GB)."""
     dev = w.device
-    flat = w.reshape(-1).float()
-    N = flat.numel()
-    pad = (-N) % group
-    if pad:
-        flat = torch.cat([flat, flat.new_zeros(pad)])
-    g = flat.view(-1, group)
+    of, inf = w.shape
+    assert inf % 32 == 0, 'bitmap alignment requires in_f % 32 == 0'
+    N = of * inf
+    b_out = torch.zeros((N + 1) // 2, dtype=torch.uint8, device=dev)
+    hp = torch.zeros((N + 31) // 32, dtype=torch.int32, device=dev)
+    sc_out = torch.empty(N // group, dtype=torch.float16, device=dev)
     mmax = float(mu.abs().max())
-    sc = (g.abs().amax(1) / mmax).clamp_min(1e-12)
-    y = g / sc[:, None]
-    ng = y.shape[0]
-    idx = torch.empty(ng, group, dtype=torch.long, device=dev)
-    BLK = 20000                       # chunked argmin: one kernel, low mem
-    for b0 in range(0, ng, BLK):
-        yb = y[b0:b0 + BLK]
-        d = (yb[:, None, :] - mu[None, :, None]).abs()   # [nb, K, group]
-        idx[b0:b0 + BLK] = d.argmin(1)
-    idx = idx.reshape(-1)[:N]
-    low = (idx & 0xF).to(torch.uint8)
-    hi = (idx >> 4).to(torch.int32)
-    if N % 2 == 0:
-        b = low[0::2] | (low[1::2] << 4)
-    else:
-        b = torch.cat([low[0::2] | (low[1::2] << 4), low[-1:]])
-    nw = (N + 31) // 32
-    hp = torch.zeros(nw, dtype=torch.int32, device=dev)
-    for bit in range(32):
-        sel = hi[bit::32]
-        hp[:sel.numel()] |= sel << bit
+    for r0 in range(0, of, row_blk):
+        wb = w[r0:r0 + row_blk].reshape(-1).float()
+        n0 = r0 * inf
+        g = wb.view(-1, group)
+        sc = (g.abs().amax(1) / mmax).clamp_min(1e-12)
+        y = g / sc[:, None]
+        idx = torch.empty(g.shape[0], group, dtype=torch.long, device=dev)
+        for c0 in range(0, g.shape[0], 20000):
+            yb = y[c0:c0 + 20000]
+            d = (yb[:, None, :] - mu[None, :, None]).abs()
+            idx[c0:c0 + 20000] = d.argmin(1)
+        idx = idx.reshape(-1)
+        low = (idx & 0xF).to(torch.uint8)
+        hi = (idx >> 4).to(torch.int32)
+        b_blk = low[0::2] | (low[1::2] << 4)
+        b_out[n0 // 2: n0 // 2 + b_blk.numel()] = b_blk
+        for bit in range(32):
+            sel = hi[bit::32]
+            hp[n0 // 32: n0 // 32 + sel.numel()] |= sel << bit
+        sc_out[n0 // group: n0 // group + sc.numel()] = \
+            sc.to(torch.float16)
+        del wb, g, y, idx, low, hi, b_blk
     return {
-        'g': group, 'out_f': w.shape[0], 'in_f': w.shape[1], 'N': N,
-        'idx': b.to(torch.uint8), 'sign_packed': hp,
-        'scale': sc.to(torch.float16),
+        'g': group, 'out_f': of, 'in_f': inf, 'N': N,
+        'idx': b_out, 'sign_packed': hp,
+        'scale': sc_out,
         'codebook': mu.to(torch.float16).clone(),
         'bits_per_weight': 4 + 1 + 16 / group,
     }
