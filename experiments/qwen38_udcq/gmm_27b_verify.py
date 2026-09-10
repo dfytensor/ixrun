@@ -78,7 +78,7 @@ def main():
             continue
         with safe_open(rf'{MODEL}\{idx[key]}', 'pt') as sf:
             w = sf.get_tensor(key).to(torch.bfloat16)
-        packed = gmm_pack(w, mu)
+        packed = gmm_pack(w, mu, group=8)
         del w
         _set_parent_child(m, name,
                           UdcqLinear(packed, bias=None, cache='stream'))
