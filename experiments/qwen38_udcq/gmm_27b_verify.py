@@ -6,7 +6,7 @@ generate + measure speed (UDCQ_CUDA_GEMV=1 for the hand CUDA kernel).
 Run:  $env:UDCQ_CUDA_GEMV='1'
       python -X utf8 -m experiments.qwen38_udcq.gmm_27b_verify
 """
-import sys, time, gc, json
+import sys, time, gc, json, os
 sys.path.insert(0, r'E:\IXRUN')
 import pandas
 import torch
@@ -91,6 +91,31 @@ def main():
     print(f'[g27b] re-encoded {len(names)} linears in '
           f'{time.time()-t0:.0f}s', flush=True)
     gc.collect(); torch.cuda.empty_cache()
+
+    # ---- save as a UDCQ-compatible blob (engines can load it directly:
+    # Q38GraphEngine/Q38SpecEngine only need {layers:{idx,scale,sign},
+    # codebook, embed}) ----
+    if os.environ.get('G27B_SAVE'):
+        GMM_BLOB = r'E:\IXRUN\experiments\qwen38_udcq\q38_gmm_blob.pt'
+        t0 = time.time()
+        layers = {}
+        for name in names:
+            parts = name.split('.')
+            parent = m
+            for q in parts[:-1]:
+                parent = getattr(parent, q)
+            mod = getattr(parent, parts[-1])
+            layers[name] = {'idx': mod._idx.cpu(), 'scale': mod._scale.cpu(),
+                            'sign': mod._sign.cpu()}
+        emb = None
+        for mod in m.modules():
+            if type(mod).__name__ == '_CpuEmbed':
+                emb = mod.weight_cpu
+                break
+        torch.save({'layers': layers, 'codebook': mu.to(torch.float16),
+                    'embed': emb}, GMM_BLOB)
+        print(f'[g27b] saved GMM blob {GMM_BLOB} '
+              f'({time.time()-t0:.0f}s)', flush=True)
 
     # ---- generate (eager per-token, CUDA fused GEMV) ----
     tm = m.model.language_model if hasattr(m.model, 'language_model') \
