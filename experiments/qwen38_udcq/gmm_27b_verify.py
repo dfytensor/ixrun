@@ -141,11 +141,7 @@ def main():
     sin1 = torch.zeros_like(cos1)
     pos1 = torch.zeros(1, dtype=torch.long, device=dev)
 
-    def step(tid, t):
-        emb1.copy_(emb_cpu[tid].view(1, 1, H).to(dev, torch.bfloat16))
-        cos1.copy_(cos_all[t].view(1, 1, -1))
-        sin1.copy_(sin_all[t].view(1, 1, -1))
-        pos1.fill_(t)
+    def fwd():
         h = emb1
         for layer in tm.layers:
             h = layer(h, position_embeddings=(cos1, sin1),
@@ -155,9 +151,34 @@ def main():
                 h = h[0]
         return m.lm_head(tm.norm(h))
 
+    def step(tid, t):
+        emb1.copy_(emb_cpu[tid].view(1, 1, H).to(dev, torch.bfloat16))
+        cos1.copy_(cos_all[t].view(1, 1, -1))
+        sin1.copy_(sin_all[t].view(1, 1, -1))
+        pos1.fill_(t)
+        return fwd()
+
     ids = tok('The theory of relativity states that',
               return_tensors='pt')['input_ids'][0].tolist()
+
+    # ---- CUDA-graph capture (g1 single-token decode) ----
+    # seed the cache first (GDN branch selection), then capture
+    for i in range(12):
+        step(5 + i, i)
     hard_reset()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            fwd()
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        logits_s = fwd()
+    hard_reset()
+    print('[g27b] g1 graph captured', flush=True)
+
+    # prefill (eager) + graph decode
     logits = None
     for i, tid in enumerate(ids):
         logits = step(tid, i)
@@ -168,13 +189,17 @@ def main():
     t0 = time.time()
     N = 30
     for _ in range(N - 1):
-        logits = step(nxt, t)
-        nxt = int(logits[:, -1].argmax(-1).item())
+        emb1.copy_(emb_cpu[nxt].view(1, 1, H).to(dev, torch.bfloat16))
+        cos1.copy_(cos_all[t].view(1, 1, -1))
+        sin1.copy_(sin_all[t].view(1, 1, -1))
+        pos1.fill_(t)
+        g.replay()
+        nxt = int(logits_s[:, -1].argmax(-1).item())
         out.append(nxt)
         t += 1
     torch.cuda.synchronize()
     dt = (time.time() - t0) / (N - 1)
-    print(f'[g27b] GMM-27B: {1/dt:.2f} tok/s ({dt*1000:.0f}ms/tok) '
+    print(f'[g27b] GMM-27B (g1 graph): {1/dt:.2f} tok/s ({dt*1000:.0f}ms/tok) '
           f'| gpu {torch.cuda.max_memory_allocated()/1e9:.2f}GB', flush=True)
     print(f'[g27b] -> {tok.decode(out)[:110]!r}', flush=True)
 
