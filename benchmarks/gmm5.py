@@ -90,8 +90,51 @@ def gmm5_pack(w, mu, group=GROUP):
     }
 
 
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Gmm5Linear(nn.Module):
+    """Streaming 5-bit GMM linear (packed GPU-resident, fused GEMV)."""
+
+    def __init__(self, packed, bias=None):
+        super().__init__()
+        self.in_features = packed['in_f']
+        self.out_features = packed['out_f']
+        self.N = packed['N']
+        self.g = packed['g']
+        for key, val in [('_idx', packed['idx']),
+                         ('_high', packed['sign_packed']),
+                         ('_scale', packed['scale']),
+                         ('_cb', packed['codebook'])]:
+            self.register_buffer(key, val.cuda() if torch.is_tensor(val)
+                                 else val)
+        self._bias = bias.detach().clone() if bias is not None else None
+        self.packed = {k: v for k, v in packed.items()
+                       if not isinstance(v, torch.Tensor)}
+
+    def forward(self, x):
+        w = None
+        if x.numel() == self.in_features:
+            y = gmm5_fused_gemv(x, self._idx, self._high, self._scale,
+                                self._cb, self.out_features,
+                                self.in_features, g=self.g).to(x.dtype)
+            if self._bias is not None:
+                y = y + self._bias.to(x.dtype)
+            return y.view(*x.shape[:-1], self.out_features)
+        # multi-token: decode + F.linear (prefill path; rare)
+        w = gmm5_reference({**self.packed, 'idx': self._idx,
+                            'sign_packed': self._high,
+                            'scale': self._scale,
+                            'codebook': self._cb,
+                            'N': self.N, 'g': self.g})
+        w = w[:self.out_features * self.in_features].reshape(
+            self.out_features, self.in_features).to(x.dtype)
+        b = self._bias.to(x.dtype) if self._bias is not None else None
+        return F.linear(x, w, b)
+
+
 def gmm5_reference(packed, group=GROUP):
-    """Nibble+high unpack -> mu[idx] * scale (fp16 values)."""
     b = packed['idx']
     N = packed['N']
     low = torch.empty(N, dtype=torch.long)
