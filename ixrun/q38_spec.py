@@ -307,6 +307,16 @@ class Q38SpecEngine:
         torch._foreach_copy_(self._dsts, self._srcs)
 
     def _capture(self, verbose=True):
+        # WDDM paging-edge guard: graph capture/replay at <2GB free VRAM
+        # can silently corrupt numerics (observed: 23.67/24GB -> text
+        # degeneration while eager decode at the same footprint was fine).
+        free_b, _ = torch.cuda.mem_get_info()
+        if free_b < 2e9:
+            raise RuntimeError(
+                f'insufficient VRAM headroom for graph capture: '
+                f'{free_b / 1e9:.2f}GB free, need >=2GB — WDDM paging '
+                f'edge silently corrupts graphs. Free VRAM or reduce '
+                f'model size (e.g. 5bpw instead of 6bpw).')
         pool = torch.cuda.graph_pool_handle()
 
         def prep_body():
