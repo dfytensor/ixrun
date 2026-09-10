@@ -71,7 +71,8 @@ def _nearest(y, mu):
     return idx
 
 
-def quantize_layer_gmm(w, mu, group=GROUP, residual_bits=0, block=200000):
+def quantize_layer_gmm(w, mu, group=GROUP, residual_bits=0, block=200000,
+                       idx_bits=4):
     """Returns (w_deq [same shape], bits_per_weight)."""
     flat = w.reshape(-1).float().cpu()
     N = flat.numel()
@@ -100,7 +101,7 @@ def quantize_layer_gmm(w, mu, group=GROUP, residual_bits=0, block=200000):
                 -(1 << (residual_bits - 1)), (1 << (residual_bits - 1)) - 1)
             deq[b0:b0 + block] = wq + rq * rs[:, None]
     wd = deq.reshape(-1)[:N].reshape(w.shape)
-    bits = 4 + 16 / group                       # 4-bit idx + fp16 scale/64
+    bits = idx_bits + 16 / group                # idx + fp16 scale/group
     if residual_bits:
         bits += residual_bits + 16 / group
     return wd, bits
@@ -155,6 +156,8 @@ def main():
     print(f'[gmm] effective components {len(mu)}/16 (pruned by prior), '
           f'{time.time()-t0:.0f}s', flush=True)
     print(f'[gmm] mu = {[round(float(v), 4) for v in mu]}', flush=True)
+    mu32, _, _ = fit_bayesian_gmm(xs, K=32, iters=40)
+    print(f'[gmm] K=32 fit: {len(mu32)} effective components', flush=True)
 
     # keep a pristine copy of the weights (CPU bf16) for repeated runs
     master = [(name, mod.weight.data.clone()) for name, mod in targets]
@@ -164,7 +167,8 @@ def main():
             mod.weight.data = w0.clone()
 
     results = []
-    for kind in ('int8', 'int8g', 'gmm', 'gmm+r4', 'gmm+r2'):
+    for kind in ('int8', 'int8g', 'gmm', 'gmm+r4', 'gmm+r2',
+                 'g16', 'g16+r2', 'g32', 'g32+r2'):
         restore()
         t1 = time.time()
         bpw_acc = []
@@ -178,8 +182,19 @@ def main():
                 wd, bits = quantize_layer_gmm(w, mu)
             elif kind == 'gmm+r4':
                 wd, bits = quantize_layer_gmm(w, mu, residual_bits=4)
-            else:
+            elif kind == 'gmm+r2':
                 wd, bits = quantize_layer_gmm(w, mu, residual_bits=2)
+            elif kind == 'g16':
+                wd, bits = quantize_layer_gmm(w, mu, group=16)
+            elif kind == 'g16+r2':
+                wd, bits = quantize_layer_gmm(w, mu, group=16,
+                                              residual_bits=2)
+            elif kind == 'g32':
+                wd, bits = quantize_layer_gmm(w, mu32, group=16,
+                                              idx_bits=5)
+            else:
+                wd, bits = quantize_layer_gmm(w, mu32, group=16,
+                                              idx_bits=5, residual_bits=2)
             mod.weight.data = wd.to(torch.bfloat16)
             bpw_acc.append(bits)
         m = m.cuda()
