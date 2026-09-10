@@ -96,7 +96,8 @@ def main():
     # Q38GraphEngine/Q38SpecEngine only need {layers:{idx,scale,sign},
     # codebook, embed}) ----
     if os.environ.get('G27B_SAVE'):
-        GMM_BLOB = r'E:\IXRUN\experiments\qwen38_udcq\q38_gmm_blob.pt'
+        GMM_BLOB = os.environ.get(
+            'G27B_BLOB', r'D:\q38_gmm_blob.pt')
         t0 = time.time()
         layers = {}
         for name in names:
