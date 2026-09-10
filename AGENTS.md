@@ -147,3 +147,5 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   value-identical (use numeric equality for losslessness checks).
 - Group-scale only wins on heavy-tailed weights (real LLM/DiT); pure gaussian
   synthetic data favors per-tensor.
+
+- **NEW kernel variants MUST pass a bit-exact unit test before deployment** (per-group GMM: G=8 variant was never bit-exact-verified — it produced 27B text degeneration while G=16 was fine; severe VRAM paging did NOT corrupt text, so degeneration = numerical bug in the new variant). Rule: any new tl.constexpr configuration (GROUP/BK/R/T) gets a decode-vs-reference bit-exact check on real shapes before touching a model.
