@@ -70,6 +70,34 @@ class StepGraphEngine:
             from .udcq import deploy_udcq
 
             stats.update(deploy_udcq(model, cache='stream', verbose=verbose))
+        elif codec == 'gmm-stream':
+            # Bayesian-GMM codebook encoded into UDCQ-compatible packed
+            # format (signed codebook, all-ones sign stream) -> the fused
+            # decode+GEMV kernels run unchanged inside the whole-step graph
+            from .linear import iter_quantizable_linears, _set_parent_child
+            from .udcq import UdcqLinear
+            from benchmarks.gmm_stream_minicpm5 import (gmm_pack,
+                                                        fit_bayesian_gmm)
+
+            targets = list(iter_quantizable_linears(model))
+            samp = []
+            per = max(1, 3_000_000 // len(targets))
+            for _, mod in targets:
+                w = mod.weight.data.reshape(-1).float()
+                if w.numel() > per:
+                    w = w[torch.randint(0, w.numel(), (per,))]
+                samp.append(w)
+            mu, _, _ = fit_bayesian_gmm(torch.cat(samp), K=16, iters=40)
+            for name, mod in targets:
+                packed = gmm_pack(mod.weight.data, mu)
+                bias = mod.bias.data if mod.bias is not None else None
+                _set_parent_child(model, name,
+                                  UdcqLinear(packed, bias=bias,
+                                             cache='stream'))
+            stats.update({'gmm_components': len(mu), 'bpw': 5.03})
+            if verbose:
+                print(f'[gmm-stream] {len(targets)} linears | '
+                      f'{len(mu)} components | 5.03 bpw', flush=True)
         elif codec != 'bf16':
             raise ValueError(f'unknown codec: {codec}')
         model = model.cuda()

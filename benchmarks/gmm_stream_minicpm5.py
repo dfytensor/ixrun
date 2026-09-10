@@ -86,6 +86,21 @@ def main():
     ms, mem = bench_forward(m, tok, warmup=3, n_runs=10)
     print(f'[gmm-stream] ppl={ppl:.2f}  fwd={ms:.0f}ms  gpu={mem:.2f}GB '
           f'(packed streaming, 5.03 bpw)', flush=True)
+    # single-token decode speed (M=1 -> fused GEMV / CUDA kernel path)
+    ids = tok('The theory of relativity states that',
+              return_tensors='pt').input_ids.cuda()
+    with torch.no_grad():
+        m.generate(ids, max_new_tokens=5, do_sample=False,
+                   pad_token_id=tok.eos_token_id)
+        torch.cuda.synchronize()
+        t0 = time.time()
+        m.generate(ids, max_new_tokens=30, do_sample=False,
+                   pad_token_id=tok.eos_token_id)
+        torch.cuda.synchronize()
+    dt = (time.time() - t0) / 30
+    print(f'[gmm-stream] decode: {1/dt:.1f} tok/s ({dt*1000:.1f}ms/tok) '
+          f'[UDCQ_CUDA_GEMV={"1" if __import__("os").environ.get("UDCQ_CUDA_GEMV") else "0"}]',
+          flush=True)
     print(f'[ref] resident GMM g16 ppl 61.26 @2.2GB | bf16 ppl 56.02 @2.2GB',
           flush=True)
 

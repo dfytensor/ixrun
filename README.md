@@ -7,7 +7,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| **压缩格式** | INT8-X 5.5bpw（int8 无损）/ PEAK-Q 10.6bpw（54dB 近无损）/ UDCQ 6bpw（4-bit 码本，ppl≈±0）/ TPAB / ixgs |
+| **压缩格式** | INT8-X 5.5bpw（int8 无损）/ PEAK-Q 10.6bpw（54dB 近无损）/ UDCQ 6bpw（4-bit 码本，ppl≈±0）/ **GMM 5-6bpw（贝叶斯高斯混合 + 残差补偿）** / TPAB / ixgs |
 | **解码 kernel** | Triton fused decode+GEMV · 多 token GEMV（bit-exact，T=4 成本≈单 token）· **手写 CUDA GEMV**（~700GB/s，2.2× Triton）· CUDA mma 批量 |
 | **图执行** | CUDA-Graph 全步捕获（MiniCPM5 ~134 tok/s）；27B 验证图/链图多图管线（共享池、静态输出） |
 | **投机解码** | 队列架构 k=3 + 真-h MTP seed + 概率接受（温度兼容）；贪心 E=2.8 |
@@ -22,8 +22,13 @@
 | **INT8-X** | 5.5 | 对 int8 无损（ppl 差 = int8 量化本身）| 引擎默认（cached/streaming/graph）|
 | **PEAK-Q** | 10.6 | 54dB SNR，69% 元素 bit-exact | 近无损档 |
 | **UDCQ** | 6.0 | 4-bit 码本（分布自适应），ppl≈±0 | **27B 单卡主力** |
+| **GMM**（贝叶斯高斯混合）| 5.0-6.0 | K=32 6bpw ppl 57.92 ≈ UDCQ；+残差 8.5bpw == bf16 | 最省 bpw 档；流式 5.03bpw |
 | **ixgs** | 4.2 | per-group scale，25.4dB | 重尾权重/视频 DiT 方向 |
 | TPAB | 2-6 | tile 定长 | 原型 |
+
+GMM 要点：EM + Dirichlet 先验拟合分量（自动剪枝），**分量中心带符号 → 无 sign 流**，编码成
+UDCQ 兼容布局（sign 流全 1）即可零 kernel 改动复用全部 fused decode+GEMV 基础设施；
+残差补偿是精度关键（4.25bpw 70.4 → +4bit 残差 8.5bpw 55.99 == bf16）。
 
 关键设计：UDCQ 的 byte-aligned nibble → **纯 LUT 解码**（无位图/rank/跨字提取），解码便宜是比位宽更值钱的资产；多 token GEMV 与逐位一致因此投机验证免费。
 
@@ -36,6 +41,8 @@ $env:UDCQ_CUDA_GEMV='1'          # 手写 CUDA kernel（贪心 15→34 tok/s 的
 
 # MiniCPM5-1B 整步图（~134 tok/s）
 python -m ixrun.cli chat --mode step-graph --codec udcq
+# GMM 流式整步图（141 tok/s @ 1.40GB —— 当前最快最省）
+python -m ixrun.cli chat --mode step-graph --codec gmm-stream
 
 # Qwen3.8-27B 投机解码（最快）
 python -m ixrun.cli chat --mode udcq-spec `
@@ -125,7 +132,12 @@ serve 启动参数 = **服务端默认**，API 请求字段可覆盖；OpenAI �
 |---|---|---|
 | eager cached | 25 | 2.2GB |
 | StepGraphEngine bf16 | 105 | 2.28GB |
-| StepGraphEngine UDCQ | **134** | 2.28GB |
+| StepGraphEngine UDCQ | 134 | 2.28GB |
+| **StepGraphEngine GMM 流式（`--codec gmm-stream`）** | **141** | **1.40GB** |
+| GMM 流式 eager（对照）| 25.7 | 1.35GB |
+
+GMM 流式整步图 = 当前全局最优：**比 resident 整步图更快（141 vs 134）且显存 -39%**——
+fused decode+GEMV 无 decode buffer 往返，整步图消灭 Python/launch，两者叠加 5.5×。
 
 ### 27B 负载画像（profiler 结论）
 
