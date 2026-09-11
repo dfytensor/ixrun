@@ -108,7 +108,7 @@ def main():
         key = ckpt_key(name)
         with safe_open(rf'{MODEL}\{idxj[key]}', 'pt') as sf:
             w = sf.get_tensor(key).to(torch.bfloat16).cuda()
-        packed = gmm5_pack_gpu(w, mu)
+        packed = gmm5_pack_gpu(w, mu, group=64)
         del w
         _set_parent_child(m, name, Gmm5Linear(packed))
         if (i + 1) % 50 == 0:

@@ -322,13 +322,17 @@ class Q38SpecEngine:
         # WDDM paging-edge guard: graph capture/replay at <2GB free VRAM
         # can silently corrupt numerics (observed: 23.67/24GB -> text
         # degeneration while eager decode at the same footprint was fine).
+        # Override via Q38_MIN_FREE_GB for experiments on tight codecs
+        # (the observed corruption case was at 0.4GB free).
+        import os as _os2
+        min_free = float(_os2.environ.get('Q38_MIN_FREE_GB', '2.0')) * 1e9
         free_b, _ = torch.cuda.mem_get_info()
-        if free_b < 2e9:
+        if free_b < min_free:
             raise RuntimeError(
                 f'insufficient VRAM headroom for graph capture: '
-                f'{free_b / 1e9:.2f}GB free, need >=2GB — WDDM paging '
-                f'edge silently corrupts graphs. Free VRAM or reduce '
-                f'model size (e.g. 5bpw instead of 6bpw).')
+                f'{free_b / 1e9:.2f}GB free, need >={min_free / 1e9:.2f}GB'
+                f' — WDDM paging edge silently corrupts graphs. Free '
+                f'VRAM or reduce model size (e.g. 5bpw instead of 6bpw).')
         pool = torch.cuda.graph_pool_handle()
 
         def prep_body():
@@ -397,20 +401,26 @@ class Q38SpecEngine:
         self._collect_snap()        # conv/rec now materialized as tensors
 
         # greedy single-token graph first (sampling fallback; capture
-        # ORDER matters 鈥?capturing it after the T=4 graphs hung WDDM)
-        def g1_body():
-            h, lg = self._step(self.emb1, self.cos1, self.sin1, self.pos1)
-            self.log1.copy_(lg)
+        # ORDER matters — capturing it after the T=4 graphs hung WDDM).
+        # Q38_NO_G1=1 skips it (pure-spec runs never use it; the pool
+        # space matters on tight-VRAM codecs like GMM 5-bit).
+        if os.environ.get('Q38_NO_G1'):
+            self.g1 = None
+        else:
+            def g1_body():
+                h, lg = self._step(self.emb1, self.cos1, self.sin1,
+                                   self.pos1)
+                self.log1.copy_(lg)
 
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(3):
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    g1_body()
+            torch.cuda.current_stream().wait_stream(s)
+            self.g1 = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.g1, pool=pool):
                 g1_body()
-        torch.cuda.current_stream().wait_stream(s)
-        self.g1 = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.g1, pool=pool):
-            g1_body()
 
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
