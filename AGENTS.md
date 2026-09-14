@@ -35,6 +35,10 @@
   state+seq_len>_MAX_S) through fla chunk kernel — no change needed there.
 - Remaining 10s profile guess: GDN chunk launches at S=256 + 606-linear
   python dispatch per block; bigger blocks (512) may squeeze more.
+- VALIDATED spec engine: Q38_PREFILL_BLOCK=64 TTFT 100.6s -> 4.4s @512tok
+  (22.8x), generated tokens IDENTICAL to per-token path. Capture needs
+  desktop VRAM lean; Q38_MIN_FREE_GB=1.2 override is safe (corruption
+  was at 0.4GB; 1.5GB free captured cleanly with coherent output).
 - VRAM watch: Q38SpecEngine graph capture needs >=2GB free
   (Q38_MIN_FREE_GB guard); a busy desktop (QQ/Quark/Edge ~4GB) can push
   24GB cards under the guard at any ctx — engine itself unchanged.
