@@ -28,7 +28,9 @@ SUB = DIM // M
 def kmeans_gpu(X, k, iters=25, blk=200_000):
     """Simple Lloyd k-means on GPU (X: [n, d])."""
     n = X.shape[0]
-    idx = torch.randperm(n, device=X.device)[:k]
+    gk = torch.Generator(device=X.device)
+    gk.manual_seed(42)
+    idx = torch.randperm(n, device=X.device, generator=gk)[:k]
     C = X[idx].clone()
     for _ in range(iters):
         assign = torch.empty(n, dtype=torch.long, device=X.device)
