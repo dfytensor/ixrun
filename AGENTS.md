@@ -39,6 +39,11 @@
   (22.8x), generated tokens IDENTICAL to per-token path. Capture needs
   desktop VRAM lean; Q38_MIN_FREE_GB=1.2 override is safe (corruption
   was at 0.4GB; 1.5GB free captured cleanly with coherent output).
+- HPQ x per-block-scale final ladder (MiniCPM5-1B ppl): m8k32+scale
+  6bpw 60.17 vs UDCQ 58.06 / GMM 57.92 (same bpw -> we still win);
+  m8k64+scale 7bpw 56.93 BEATS both (err 0.0245) — scale restores the
+  per-element magnitude that block-PQ binding destroys, +1bpw. HPQ
+  viable only at 7bpw; kept as research, not deployed.
 - VRAM watch: Q38SpecEngine graph capture needs >=2GB free
   (Q38_MIN_FREE_GB guard); a busy desktop (QQ/Quark/Edge ~4GB) can push
   24GB cards under the guard at any ctx — engine itself unchanged.
