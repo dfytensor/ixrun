@@ -23,7 +23,8 @@ from benchmarks.hpq_minicpm5 import hpq_quantize
 SELECTIONS = {
     'down': lambda n: 'down_proj' in n,
     'down+o': lambda n: 'down_proj' in n or 'o_proj' in n,
-    'down+o+head2': None,   # filled below (needs block index)
+    'down+head2': None,     # filled below (needs block index)
+    'down+o+head2': None,   # filled below
 }
 
 
@@ -35,6 +36,7 @@ def head2(n):
     return b < 2 or b >= 22
 
 
+SELECTIONS['down+head2'] = lambda n: ('down_proj' in n or head2(n))
 SELECTIONS['down+o+head2'] = lambda n: ('down_proj' in n or 'o_proj' in n
                                         or head2(n))
 
