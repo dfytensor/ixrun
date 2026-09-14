@@ -69,16 +69,24 @@ def hpq_quantize(W, levels=2, k=16, m=M):
     H, Wd = W.shape
     blocks = W.reshape(H // BS, BS, Wd // BS, BS).permute(0, 2, 1, 3) \
         .reshape(-1, DIM)
+    # per-block scale (HPQ x group-scale hybrid): normalize each 4x4
+    # block before PQ so the codebooks see unit-norm-ish data; the scale
+    # costs 16 bit / 16 elem = +1.0 bpw (fp16) and is what UDCQ/GMM use
+    # at group granularity (their 4x lower error at same bpw)
+    bs_scale = blocks.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
+    blocks = blocks / bs_scale
     recon = torch.zeros_like(blocks)
     resid = blocks.clone()
     for _ in range(levels):
         r, _, _ = pq_encode_decode(resid, None, k=k, m=m)
         recon += r
         resid = blocks - recon
+    recon = recon * bs_scale
     out = recon.reshape(H // BS, Wd // BS, BS, BS).permute(0, 2, 1, 3) \
         .reshape(H, Wd)
     out = out[:of, :inf]
-    bpw = m * levels * (k.bit_length() - 1) / DIM
+    bpw = m * levels * (k.bit_length() - 1) / DIM + \
+        16.0 / DIM
     return out, bpw
 
 
@@ -86,7 +94,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
     texts = load_wikitext(cache_dir=DATASET_CACHE)
     results = []
-    for levels, k, mq in [(2, 64, 8)]:
+    for levels, k, mq in [(2, 32, 8)]:
         m = AutoModelForCausalLM.from_pretrained(
             MODEL_PATH, torch_dtype=torch.bfloat16, trust_remote_code=True)
         m.eval()
