@@ -330,8 +330,14 @@ class Q38SpecEngine:
         # Override via Q38_MIN_FREE_GB for experiments on tight codecs
         # (the observed corruption case was at 0.4GB free).
         import os as _os2
+        torch.cuda.empty_cache()   # return reserved-but-unused to driver
         min_free = float(_os2.environ.get('Q38_MIN_FREE_GB', '2.0')) * 1e9
         free_b, _ = torch.cuda.mem_get_info()
+        if verbose:
+            print(f'[q38-spec] pre-capture: torch alloc '
+                  f'{torch.cuda.memory_allocated()/2**30:.2f}GB, reserved '
+                  f'{torch.cuda.memory_reserved()/2**30:.2f}GB, driver '
+                  f'free {free_b/2**30:.2f}GB', flush=True)
         if free_b < min_free:
             raise RuntimeError(
                 f'insufficient VRAM headroom for graph capture: '

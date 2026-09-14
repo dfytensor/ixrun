@@ -40,10 +40,10 @@ from .udcq import UDCQ_G, UdcqLinear
 
 __all__ = ["Q38GraphEngine"]
 
-MAX_BLOCK = int(__import__('os').environ.get('Q38_MAX_BLOCK', '64'))
-# prefill chunk size; 8 = legacy (mt-GEMV M=8 bit-exact), larger blocks
-# hit the fused-GEMM/cublas wide-M path and stream weights far fewer
-# times per prefill (TTFT ~8x lower at 2k tokens)
+MAX_BLOCK = int(__import__('os').environ.get('Q38_MAX_BLOCK', '512'))
+# prefill chunk size (measured on 4090, 2048-tok prompt: 8 -> 97s,
+# 256 -> 10.3s, 512 -> 7.7s, 2048 -> 10.8s — SDPA math backend
+# materializes S x ctx scores and regresses past 512)
 
 
 def _apply_static_attention():
