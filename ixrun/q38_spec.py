@@ -157,6 +157,13 @@ class Q38SpecEngine:
             cos_all, sin_all = cos_all[0], sin_all[0]
         self._cos_all, self._sin_all = cos_all, sin_all
 
+        # greedy-only mode (Q38_GREEDY_ONLY=1): capture argmax in-graph,
+        # skip log1/out_l4 static logits (1.5GB) + g1 graph — lets the
+        # 27B spec engine fit 24GB beside a normal desktop. Sampling
+        # (temperature/top_p/top_k) is unavailable in this mode.
+        self.greedy_only = os.environ.get(
+            'Q38_GREEDY_ONLY', '') not in ('', '0')
+
         self.cache = StaticCache(config=model.config,
                                  max_cache_len=max_ctx)
         cd = cos_all.shape[-1]
@@ -171,13 +178,9 @@ class Q38SpecEngine:
         self.sin4 = torch.zeros_like(self.cos4)
         self.pos4 = torch.zeros(4, dtype=torch.long, device=dev)
         # greedy-graph buffers (sampling fallback when knobs are active)
-        self.emb1 = torch.zeros(1, 1, self.H, dtype=torch.bfloat16,
-                                device=dev)
-        self.cos1 = torch.zeros(1, 1, cd, dtype=cos_all.dtype, device=dev)
-        self.sin1 = torch.zeros_like(self.cos1)
-        self.pos1 = torch.zeros(1, dtype=torch.long, device=dev)
-        self.log1 = torch.zeros(1, 1, self.V, dtype=torch.bfloat16,
-                                device=dev)
+        if not self.greedy_only:
+            self.log1 = torch.zeros(1, 1, self.V, dtype=torch.bfloat16,
+                                    device=dev)
 
         # int4 packed GPU embedding table (~0.64GB vs 1.27GB int8): the
         # 27B spec pipeline needs every free GB (GMM 5-bit codec leaves
@@ -223,8 +226,9 @@ class Q38SpecEngine:
         dev = self.dev
         self.out_h4 = torch.zeros(1, 4, self.H, dtype=torch.bfloat16,
                                   device=dev)
-        self.out_l4 = torch.zeros(1, 4, self.V, dtype=torch.bfloat16,
-                                  device=dev)
+        if not self.greedy_only:
+            self.out_l4 = torch.zeros(1, 4, self.V, dtype=torch.bfloat16,
+                                      device=dev)
         self.a_buf = torch.zeros(4, dtype=torch.long, device=dev)
         self.dec_gpu = torch.zeros(6, dtype=torch.long, device=dev)
         self.tok_out = torch.zeros(4, dtype=torch.long, device=dev)
@@ -392,7 +396,12 @@ class Q38SpecEngine:
         def g4dec_body():
             h, lg = self._forward4()
             self.out_h4.copy_(h)
-            self.out_l4.copy_(lg)
+            if self.greedy_only:
+                # argmax in-graph: no [1,4,V] logits buffer needed
+                # (-1.2GB); _verify only does the accept-length compare
+                self.a_buf.copy_(lg[0].argmax(dim=-1))
+            else:
+                self.out_l4.copy_(lg)
 
         bodies = {p: make_chain_body(p) for p in (1, 2, 3, 4)}
         if verbose:
@@ -415,7 +424,8 @@ class Q38SpecEngine:
         # ORDER matters — capturing it after the T=4 graphs hung WDDM).
         # Q38_NO_G1=1 skips it (pure-spec runs never use it; the pool
         # space matters on tight-VRAM codecs like GMM 5-bit).
-        if os.environ.get('Q38_NO_G1'):
+        if self.greedy_only or os.environ.get('Q38_NO_G1', '') \
+                not in ('', '0'):
             self.g1 = None
         else:
             def g1_body():
@@ -515,8 +525,10 @@ class Q38SpecEngine:
 
         sampling = bool(temperature > 0) or top_p < 1.0 or top_k > 0
         if not sampling:
-            for j in range(4):
-                self.a_buf[j] = self.out_l4[0, j].argmax()
+            if not self.greedy_only:
+                for j in range(4):
+                    self.a_buf[j] = self.out_l4[0, j].argmax()
+            # greedy_only: g4dec already wrote a_buf via in-graph argmax
         else:
             # batched: one temperature-scaled softmax over all 4 rows
             lg = self.out_l4[0].float()          # [4, V]
@@ -652,6 +664,13 @@ class Q38SpecEngine:
                                           repetition_penalty))
         presence_penalty = float(kw.pop('presence_penalty', 0.0))
         frequency_penalty = float(kw.pop('frequency_penalty', 0.0))
+        if self.greedy_only and (temperature > 0 or do_sample
+                                 or top_p < 1.0 or top_k > 0
+                                 or repetition_penalty != 1.0
+                                 or presence_penalty != 0.0
+                                 or frequency_penalty != 0.0):
+            raise RuntimeError('Q38_GREEDY_ONLY engine: sampling knobs '
+                               'are unavailable (no logits buffers)')
         ids = self._clip_ids(
             self.tokenizer(prompt, return_tensors='pt')['input_ids'][0]
             .tolist())
@@ -688,6 +707,13 @@ class Q38SpecEngine:
                                           repetition_penalty))
         presence_penalty = float(kw.pop('presence_penalty', 0.0))
         frequency_penalty = float(kw.pop('frequency_penalty', 0.0))
+        if self.greedy_only and (temperature > 0 or do_sample
+                                 or top_p < 1.0 or top_k > 0
+                                 or repetition_penalty != 1.0
+                                 or presence_penalty != 0.0
+                                 or frequency_penalty != 0.0):
+            raise RuntimeError('Q38_GREEDY_ONLY engine: sampling knobs '
+                               'are unavailable (no logits buffers)')
         ids = self._clip_ids(
             self.tokenizer(prompt, return_tensors='pt')['input_ids'][0]
             .tolist())
