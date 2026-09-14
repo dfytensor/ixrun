@@ -9,6 +9,13 @@ Subpackages:
   engine        streaming inference + resource scheduler
   generate      text generation with streaming token output
 """
+try:          # MUST precede torch CUDA init: loading its pyd after
+    import torchvision  # type: ignore  # noqa: F401  (CPU build is fine)
+    # torch spawns its thread pool deadlocks the Windows loader lock;
+    # qwen3_5 (multimodal) pulls torchvision lazily via transformers)
+except ImportError:
+    pass
+
 from .quantize import int8x_quantize, DEFAULT_LEVELS
 from .search import search_optimal_levels
 from .linear import Int8XLinear, deploy_model

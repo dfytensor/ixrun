@@ -5,11 +5,39 @@
 - Run all commands from `E:\IXRUN` (working directory).
 - Offline mode required (no internet to HF): prefix with
   `HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1`
+- **IMPORT ORDER (hard-won)**: `import torchvision` MUST happen before
+  transformers imports a multimodal model module (qwen3_5). Loading the
+  torchvision CPU pyd AFTER torch has initialized CUDA + its thread pool
+  deadlocks the Windows loader lock (main thread blocked in
+  LoadLibraryEx, 0% CPU, permanent). `ixrun/__init__.py` imports
+  torchvision early as the fix. Symptom history: any `ixrun.q38_spec`
+  import hung at ~712MB RSS forever; the opencode shell tool reported
+  "ChildProcess.kill" (its own timeout cleaning up the hung tree, NOT
+  an external watchdog).
+- **Env-flag gotcha**: never test env flags with bare
+  `os.environ.get(X)` — the string "0" is truthy (`UDCQ_CUDA_GEMV=0`
+  enabled the CUDA path; udcq.py now checks `not in ("", "0")`).
 - Model: MiniCPM5-1B (Llama-arch, 24 layers) at path in `ixrun/config.py:MODEL_PATH`.
 - Model (large): Qwen3.8-27B (multimodal qwen3_5, 64 layers hybrid linear/full attn)
   at `ixrun/config.py:QWEN38_PATH` = `E:\models\Qwen3.8-27B`. Needs transformers>=5.8
   (installed: 5.15.0). 27B streaming: CPU lazy-load -> per-layer quantize -> packed
   to GPU, bf16 freed eagerly; 606 layers, packed 16.91GB, runs on 24GB card.
+
+## Prefill (TTFT) — 2026/9/14 session results
+- 27B graph engine, 2048-token prompt: 97s -> **10.3s** (9.4x) via
+  (a) blocked prefill `Q38_MAX_BLOCK` (q38_graph MAX_BLOCK 8->256) and
+  `Q38_PREFILL_BLOCK` (q38_spec; legacy per-token was 24ms/token -> ~49s
+  TTFT at 2k), (b) ONE batched SDPA per full-attn layer instead of a
+  per-token python loop (32k SDPA launches was the top profile item).
+- Correctness gate: prefill last-token top-8 IDENTICAL between S=64 and
+  S=256; vs S=8 only rank 3/4 swap (bf16-level kernel-order noise).
+- The GDN seq-patch ELSE branch already routes prefill (no state AND
+  state+seq_len>_MAX_S) through fla chunk kernel — no change needed there.
+- Remaining 10s profile guess: GDN chunk launches at S=256 + 606-linear
+  python dispatch per block; bigger blocks (512) may squeeze more.
+- VRAM watch: Q38SpecEngine graph capture needs >=2GB free
+  (Q38_MIN_FREE_GB guard); a busy desktop (QQ/Quark/Edge ~4GB) can push
+  24GB cards under the guard at any ctx — engine itself unchanged.
 
 ## Commands
 ```powershell

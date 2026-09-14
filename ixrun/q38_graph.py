@@ -40,7 +40,10 @@ from .udcq import UDCQ_G, UdcqLinear
 
 __all__ = ["Q38GraphEngine"]
 
-MAX_BLOCK = 8          # prefill chunk size (mt-GEMV M=8, bit-exact)
+MAX_BLOCK = int(__import__('os').environ.get('Q38_MAX_BLOCK', '64'))
+# prefill chunk size; 8 = legacy (mt-GEMV M=8 bit-exact), larger blocks
+# hit the fused-GEMM/cublas wide-M path and stream weights far fewer
+# times per prefill (TTFT ~8x lower at 2k tokens)
 
 
 def _apply_static_attention():
@@ -92,19 +95,12 @@ def _apply_static_attention():
         if n_rep > 1:
             k_full = k_full.repeat_interleave(n_rep, dim=1)
             v_full = v_full.repeat_interleave(n_rep, dim=1)
-        if q_len > 1:
-            # per-token SDPA: same kernel sequence as sequential q_len=1;
-            # transpose REQUIRED before flatten or head/token interleave
-            outs = []
-            for t in range(q_len):
-                outs.append(F.scaled_dot_product_attention(
-                    query_states[:, :, t:t + 1], k_full, v_full,
-                    attn_mask=mask[:, :, t:t + 1], scale=self.scaling))
-            attn_output = torch.cat(outs, dim=2).transpose(1, 2)
-        else:
-            attn_output = F.scaled_dot_product_attention(
-                query_states, k_full, v_full, attn_mask=mask,
-                scale=self.scaling).transpose(1, 2)
+        # q_len > 1 (prefill): ONE batched SDPA over the causal mask —
+        # the per-token loop cost ~1ms/layer/block in python dispatch and
+        # dominated TTFT (32k SDPA launches for a 2k prompt)
+        attn_output = F.scaled_dot_product_attention(
+            query_states, k_full, v_full, attn_mask=mask,
+            scale=self.scaling).transpose(1, 2)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)

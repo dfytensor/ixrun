@@ -579,8 +579,9 @@ class UdcqLinear(nn.Module):
         # kernel per layer, weight never materialized — halves launch count
         # vs decode-then-GEMM and removes the buffer round-trip)
         w = None
+        _gemv_env = _os.environ.get("UDCQ_CUDA_GEMV", "") not in ("", "0")
         if x.numel() == self.in_features:
-            _cg = _cuda_gemv_mod() if _os.environ.get("UDCQ_CUDA_GEMV") \
+            _cg = _cuda_gemv_mod() if _gemv_env \
                 and self.in_features % 256 == 0 else None
             if _cg is not None:
                 if not getattr(_cg, "_cb_installed", False):
@@ -614,7 +615,7 @@ class UdcqLinear(nn.Module):
         #   M >  256 -> decode-to-shared-buffer + cublas (each W read once;
         #               fused re-decodes per m-tile and loses ~8x at M=4096)
         M = x.numel() // self.in_features
-        _cg = _cuda_gemv_mod() if _os.environ.get("UDCQ_CUDA_GEMV") \
+        _cg = _cuda_gemv_mod() if _gemv_env \
             and M == 4 and x.shape[-1] == self.in_features \
             and self.in_features % 256 == 0 else None
         if _cg is not None:

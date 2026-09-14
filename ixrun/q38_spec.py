@@ -37,6 +37,11 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (  # noqa: E402
 
 _ORIG_ATTN_FWD = Qwen3_5Attention.forward    # saved BEFORE static patch
 
+# prefill chunk: tokens per eager forward (GDN chunk kernel + fused GEMM);
+# 1 restores the legacy per-token path (~24ms/token on 27B -> ~49s TTFT
+# for a 2k prompt; blocked prefill streams weights once per chunk)
+PREFILL_BLOCK = int(os.environ.get('Q38_PREFILL_BLOCK', '64'))
+
 
 class _MTPHead(nn.Module):
     def __init__(self, dim, layer, rotary, lm_head):
@@ -460,18 +465,29 @@ class Q38SpecEngine:
 
     # ------------------------------------------------------------------ #
     def _prefill(self, ids):
-        """Per-token eager prefill; returns (h_norm, logits) of last."""
+        """Blocked eager prefill (PREFILL_BLOCK tokens per forward);
+        returns (h_norm, logits) of the LAST token [1, 1, ·]."""
         emb_w = self._emb_weight()
-        h = logits = None
-        for i, tid in enumerate(ids):
-            self.emb1.copy_(emb_w[tid].view(1, 1, self.H).to(
-                self.dev, torch.bfloat16))
-            self.cos1.copy_(self._cos_all[i].view(1, 1, -1))
-            self.sin1.copy_(self._sin_all[i].view(1, 1, -1))
-            self.pos1.fill_(i)
-            h, logits = self._step(self.emb1, self.cos1, self.sin1,
-                                   self.pos1)
-        return h, logits
+        h_last = None
+        n = len(ids)
+        for i in range(0, n, PREFILL_BLOCK):
+            blk = ids[i:i + PREFILL_BLOCK]
+            S = len(blk)
+            emb = emb_w[blk].to(self.dev, torch.bfloat16).view(
+                1, S, self.H)
+            idx = torch.arange(i, i + S, device=self.dev)
+            cos = self._cos_all[idx].view(1, S, -1)
+            sin = self._sin_all[idx].view(1, S, -1)
+            h = emb
+            for layer in self.layers:
+                h = layer(h, position_embeddings=(cos, sin),
+                          attention_mask=None,
+                          position_ids=idx.view(1, -1),
+                          past_key_values=self.cache)
+                if isinstance(h, tuple):
+                    h = h[0]
+            h_last = self.final_norm(h[:, -1:])
+        return h_last, self.model.lm_head(h_last)
 
     def _stop_ids(self):
         """eos + chat-template end (<|im_end|>) token ids."""
