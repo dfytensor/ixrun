@@ -44,6 +44,11 @@
   m8k64+scale 7bpw 56.93 BEATS both (err 0.0245) — scale restores the
   per-element magnitude that block-PQ binding destroys, +1bpw. HPQ
   viable only at 7bpw; kept as research, not deployed.
+- hpqs_runtime.py: Triton decode+GEMV for HPQ-x-scale, BIT-EXACT gemv
+  (gmax 0.0000 vs fp16-cb ref). Triton gotcha: None-indexing silently
+  drops dims - use tl.expand_dims. SEEDED mixed-precision ppl ladder
+  (kmeans seed 42): down+o 6.36bpw 57.22 = best value (-0.84 vs UDCQ
+  58.06); unseeded runs jitter +-0.5 - always seed before comparing.
 - VRAM watch: Q38SpecEngine graph capture needs >=2GB free
   (Q38_MIN_FREE_GB guard); a busy desktop (QQ/Quark/Edge ~4GB) can push
   24GB cards under the guard at any ctx — engine itself unchanged.
