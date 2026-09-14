@@ -9,6 +9,7 @@ Usage examples:
 from __future__ import annotations
 import argparse
 import gc
+import os
 import sys
 import torch
 
@@ -57,6 +58,15 @@ def _build_engine(args):
 
         if not args.cache:
             raise SystemExit("udcq-spec requires --cache <q38_blob.pt>")
+        if os.environ.get("Q38_GREEDY_ONLY", "") in ("", "0"):
+            # greedy request with no sampling knobs -> skip log1/out_l4
+            # (1.5MB) + g1 graph capture: ~0.4GB pool + capture time
+            if not (getattr(args, "temperature", 0) > 0
+                    or getattr(args, "top_p", 1.0) < 1.0
+                    or getattr(args, "top_k", 0) > 0
+                    or getattr(args, "presence_penalty", 0.0) != 0.0
+                    or getattr(args, "repetition_penalty", 1.0) != 1.0):
+                os.environ["Q38_GREEDY_ONLY"] = "1"
         return Q38SpecEngine.from_blob(args.cache, args.model,
                                    max_ctx=mctx)
     if getattr(args, "mode", None) == "step-graph":
