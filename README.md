@@ -69,10 +69,27 @@ python -m ixrun.cli serve --mode udcq-spec `
 
 ### 投机 × 采样路由规则
 
-- 纯贪心 → argmax 投机（全速）
+- 纯贪心 → argmax 投机（全速；CLI 自动启用 `Q38_GREEDY_ONLY=1`，免 g1 图捕获）
 - 仅 temperature → **概率接受**：草稿同温度采样 + `min(1, q(d)/p(d))` 逐槽接受（温度不关投机）
 - top_p / top_k / presence / frequency / repetition → 完整采样档（贪心图 + CPU 采样，HF 语义）
 - 统计事实：投机收益 ∝ 草稿在 target 分布下的概率质量——温度摊平分布必然降接受率，故采样档位速度低于贪心
+
+### Prefill（首字延迟 TTFT）
+
+27B 曾是逐 token eager prefill（~24ms/token → 2k prompt 近百秒首字）。
+现役为**块化 prefill**：`Q38_MAX_BLOCK`（graph 引擎，默认 512）/
+`Q38_PREFILL_BLOCK`（spec 引擎，默认 64），全注意力层每层一次 batched SDPA。
+
+| 引擎 @2048 tok prompt | 旧 | 新 | 提速 |
+|---|---|---|---|
+| graph（S=512）| 97.0s | **7.7s** | 12.6× |
+| spec（S=64，@512tok 实测外推）| 100.6s | **4.4s** | 22.8× |
+
+正确性：块化 prefill 与逐 token 路径**生成 token 全同**（16/16）；
+prefill top-8 仅 bf16 级名次互换。块大小阶梯实测：256→10.3s、
+512→7.7s（甜点）、2048→10.8s（SDPA math 后端物化 S×ctx 分数矩阵反而退化）。
+spec 引擎图捕获需 ≥2GB 空闲显存（`Q38_MIN_FREE_GB` 可调；1.5GB 空闲时
+1.2 覆盖值实证安全，0.4GB 曾出过静默损坏）。
 
 ## 四、Qwen3.8 官方参数组合（一键复刻）
 
@@ -154,7 +171,34 @@ elementwise；真正的税是 CPU 同步与 Python —— 整步图 + 门铃轮�
 | MXFP6（OCP 对照）| 6.25 | +3.93 |
 | INT8-X | 5.46 | +6.13 |
 
-## 九、调试中钉死的五个暗坑
+### HPQ 研究线（块级乘积量化，外部报告复现与超越）
+
+对一份外部 HPQ 报告做了完整复现、戳伪与超越（`benchmarks/hpq_*`）：
+
+1. **m（子空间数）才是 PQ 的第一参数**——报告最优 `bs=4 m=8 k=32`，最初只调
+   k 的评测方向性错误：m4→m8 让 ppl 44,968 → 374.6 →（k=64）68.5。
+2. **报告的 "k=64 + 4bit codes = 10x 压缩" 是存储虚标**：`code_bits` 只进
+   存储公式，编码器从未使用；实测 64 中心全活跃、top-16 仅覆盖 40% 块，
+   4bit 截断必毁——真实压缩 ~5x。
+3. **HPQ × per-block scale（我们补的拼片）**：块内 fp16 scale 恢复被维度
+   绑定抹掉的量值信息，每档误差减半：
+
+| 方案 | bpw | ppl |
+|---|---|---|
+| bf16 | 16 | 56.02 |
+| GMM K32 | 6.0 | 57.92 |
+| UDCQ | 6.0 | 58.06 |
+| HPQ×scale m8k32 | 6.0 | 60.17 |
+| **HPQ×scale 混合 down+o**（UDCQ 其余）| **6.36** | **57.22** |
+| HPQ×scale m8k64 全模型 | 7.0 | **56.93** |
+
+4. **Triton 运行时 kernel**（`benchmarks/hpqs_runtime.py`）：GEMV 位精确
+   （gmax=0.0000），但 0.02-0.04× bf16——gather 延迟链 + 4 行串行游走，
+   追平需手写 CUDA。**裁决：部署保持 UDCQ/GMM，HPQ×scale 为研究线**
+   （编码器映射不变量与 kernel 蓝图已入 AGENTS.md）。
+   附注：kmeans 必须固定 seed——未播种 ppl 抖动 ±0.5。
+
+## 九、调试中钉死的七个暗坑
 
 1. transformers 5.15 缓存 `conv_states/recurrent_states` 是 **dict**——迭代得
    int key，快照/回滚静默失效（曾伪装成"文本退化"与"图 vs eager 不同"）。
@@ -164,6 +208,13 @@ elementwise；真正的税是 CPU 同步与 Python —— 整步图 + 门铃轮�
    `mem_get_info()`。
 5. WDDM 图捕获顺序：S=1 图先于 T=4 图捕获（反序进程静默挂死）；快照流在
    首次前向后再收集（conv/rec dict 初值 None）。
+6. **torchvision 导入死锁**（Windows loader-lock）：transformers 导入多模态
+   模型（qwen3_5）会拉 torchvision，其 pyd 在 torch CUDA 初始化后加载必永久
+   挂死（712MB RSS、0% CPU）。`ixrun/__init__.py` 顶部提前导入 torchvision
+   根治——MiniCPM5（纯文本）不触发，故只在 27B 路径暴露。
+7. **env 开关 "0" 是真值**：`os.environ.get(X)` 对 "UDCQ_CUDA_GEMV=0" 返回
+   "0"（truthy），开关关不掉。一律 `not in ("", "0")`。Triton 的 `None`
+   索引同理——静默丢维，必须 `tl.expand_dims`。
 
 ## 十、项目结构
 
