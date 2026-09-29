@@ -79,6 +79,42 @@ __global__ void hpqs_gemv_kernel(
     }
 }
 
+__global__ void hpqs_decode_kernel(
+    const uint8_t* __restrict__ codes,
+    const __half2* __restrict__ cb,
+    const __half* __restrict__ scale,
+    __nv_bfloat16* __restrict__ W,         // [out_f, in_f]
+    int n_bc)
+{
+    __shared__ float2 cb_sm[16][64];
+    for (int i = threadIdx.x; i < 16 * 64; i += blockDim.x) {
+        cb_sm[i / 64][i % 64] = __half22float2(cb[i]);
+    }
+    __syncthreads();
+    long long bidx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    uint4 cw = *reinterpret_cast<const uint4*>(codes + bidx * 16);
+    uint8_t cA[8], cB[8];
+    memcpy(cA, &cw.x, 4); memcpy(cA + 4, &cw.y, 4);
+    memcpy(cB, &cw.z, 4); memcpy(cB + 4, &cw.w, 4);
+    float sc = __half2float(scale[bidx]);
+    int g = (int)(bidx / n_bc);
+    int jb = (int)(bidx % n_bc);
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int s0 = r * 2, s1 = r * 2 + 1;
+        float2 a0 = cb_sm[s0][cA[s0]];
+        float2 a1 = cb_sm[s1][cA[s1]];
+        float2 b0v = cb_sm[8 + s0][cB[s0]];
+        float2 b1v = cb_sm[8 + s1][cB[s1]];
+        __nv_bfloat16* row = W + (long long)(g * 4 + r) * (n_bc * 4)
+                           + jb * 4;
+        row[0] = __float2bfloat16((a0.x + b0v.x) * sc);
+        row[1] = __float2bfloat16((a0.y + b0v.y) * sc);
+        row[2] = __float2bfloat16((a1.x + b1v.x) * sc);
+        row[3] = __float2bfloat16((a1.y + b1v.y) * sc);
+    }
+}
+
 torch::Tensor gemv(torch::Tensor x, torch::Tensor codes,
                    torch::Tensor cb, torch::Tensor scale,
                    int64_t out_f, int64_t in_f)
@@ -100,12 +136,33 @@ torch::Tensor gemv(torch::Tensor x, torch::Tensor codes,
         yf.data_ptr<float>(), n_bc, n_sp, wpb);
     return yf.to(torch::kBFloat16);
 }
+
+torch::Tensor decode(torch::Tensor codes, torch::Tensor cb,
+                     torch::Tensor scale, int64_t out_f, int64_t in_f)
+{
+    auto W = torch::empty({out_f, in_f},
+        torch::dtype(torch::kBFloat16).device(codes.device()));
+    int n_bc = (int)(in_f / 4);
+    long long nB = (long long)out_f / 4 * n_bc;
+    int thr = 256;
+    unsigned gx = (unsigned)((nB + thr - 1) / thr);
+    hpqs_decode_kernel<<<gx, thr>>>(
+        codes.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half2*>(cb.data_ptr()),
+        reinterpret_cast<const __half*>(scale.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(
+            W.view(torch::kUInt16).data_ptr()),
+        n_bc);
+    return W;
+}
 """
 
 _CPP_SRC = """
 torch::Tensor gemv(torch::Tensor x, torch::Tensor codes,
                    torch::Tensor cb, torch::Tensor scale,
                    int64_t out_f, int64_t in_f);
+torch::Tensor decode(torch::Tensor codes, torch::Tensor cb,
+                     torch::Tensor scale, int64_t out_f, int64_t in_f);
 """
 
 _EXT = None
@@ -115,10 +172,10 @@ def _load():
     global _EXT
     if _EXT is None:
         _EXT = load_inline(
-            name='hpqs_gemv_cuda_v2',
+            name='hpqs_gemv_cuda_v3',
             cpp_sources=[_CPP_SRC],
             cuda_sources=[_CUDA_SRC],
-            functions=['gemv'],
+            functions=['gemv', 'decode'],
             extra_cuda_cflags=['-O3', '--use_fast_math',
                                '-allow-unsupported-compiler'],
             verbose=False)

@@ -178,19 +178,13 @@ class HpqsLinear(torch.nn.Module):
         self.in_features = packed['in_f']
 
     def _decode(self):
-        codes = self.packed['codes'].reshape(-1, 2, 8).float()
-        cb = self.packed['cb'].float()
-        sc = self.packed['scale'].float()
-        nB = codes.shape[0]
-        recon = torch.zeros(nB, 16, device=codes.device)
-        for l in range(2):
-            for s in range(8):
-                recon[:, s * 2:(s + 1) * 2] += \
-                    cb[l, s][codes[:, l, s].long()]
-        recon *= sc.unsqueeze(1)
-        of, inf = self.packed['out_f'], self.packed['in_f']
-        return recon.reshape(of // 4, inf // 4, 4, 4) \
-            .permute(0, 2, 1, 3).reshape(of, inf).to(torch.bfloat16)
+        from experiments.hpqs_gemv_cuda.hpqs_gemv_cuda import _load
+        ext = _load()
+        return ext.decode(self.packed['codes'],
+                          self.packed['cb'],
+                          self.packed['scale'],
+                          self.packed['out_f'],
+                          self.packed['in_f'])
 
     def forward(self, x):
         from experiments.hpqs_gemv_cuda.hpqs_gemv_cuda import \
