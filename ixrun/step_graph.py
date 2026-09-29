@@ -98,6 +98,27 @@ class StepGraphEngine:
             if verbose:
                 print(f'[gmm-stream] {len(targets)} linears | '
                       f'{len(mu)} components | 5.03 bpw', flush=True)
+        elif codec == 'hpqs-mixed':
+            # HPQ-x-scale (7bpw, hand-CUDA GEMV) on down_proj+o_proj,
+            # UDCQ-stream (6bpw) on the rest; packs from disk cache
+            import os as _os
+            from .linear import iter_quantizable_linears, _set_parent_child
+            from .udcq import deploy_udcq
+            from benchmarks.hpqs_runtime import HpqsLinear
+
+            cache_p = _os.environ.get(
+                'HPQS_PACK_CACHE',
+                r'E:\IXRUN\experiments\hpqs_minicpm5\down_o_packs.pt')
+            packs = torch.load(cache_p, weights_only=False)
+            for name, mod in list(iter_quantizable_linears(model)):
+                if name in packs:
+                    _set_parent_child(model, name, HpqsLinear(packs[name]))
+            stats.update(deploy_udcq(model, cache='stream',
+                                     verbose=verbose))
+            stats['hpqs_layers'] = len(packs)
+            if verbose:
+                print(f'[hpqs-mixed] {len(packs)} HpqsLinear + '
+                      f'{stats["n_layers"]} UdcqLinear', flush=True)
         elif codec != 'bf16':
             raise ValueError(f'unknown codec: {codec}')
         model = model.cuda()

@@ -215,7 +215,7 @@ def main():
     pg.add_argument("--model", default=MODEL_PATH)
     pg.add_argument("--mode", default="cached",
                     choices=["cached", "streaming", "graph", "udcq-graph", "udcq-spec", "step-graph"])
-    pg.add_argument("--codec", default="int8x", choices=["int8x", "peakq", "bf16", "udcq", "udcq-stream", "gmm-stream"])
+    pg.add_argument("--codec", default="int8x", choices=["int8x", "peakq", "bf16", "udcq", "udcq-stream", "gmm-stream", "hpqs-mixed"])
     pg.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pg.add_argument("--max-new-tokens", type=int, default=128)
     pg.add_argument("--temperature", type=float, default=0.7)
@@ -239,7 +239,7 @@ def main():
     pc.add_argument("--model", default=MODEL_PATH)
     pc.add_argument("--mode", default="streaming",
                     choices=["cached", "streaming", "udcq-graph", "udcq-spec", "step-graph"])
-    pc.add_argument("--codec", default="int8x", choices=["int8x", "peakq", "bf16", "udcq", "udcq-stream", "gmm-stream"])
+    pc.add_argument("--codec", default="int8x", choices=["int8x", "peakq", "bf16", "udcq", "udcq-stream", "gmm-stream", "hpqs-mixed"])
     pc.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pc.add_argument("--max-new-tokens", type=int, default=256)
     pc.add_argument("--temperature", type=float, default=0.7)
@@ -261,7 +261,7 @@ def main():
     pv.add_argument("--model", default=MODEL_PATH)
     pv.add_argument("--mode", default="streaming",
                     choices=["cached", "streaming", "udcq-graph", "udcq-spec", "step-graph"])
-    pv.add_argument("--codec", default="int8x", choices=["int8x", "peakq", "bf16", "udcq", "udcq-stream", "gmm-stream"])
+    pv.add_argument("--codec", default="int8x", choices=["int8x", "peakq", "bf16", "udcq", "udcq-stream", "gmm-stream", "hpqs-mixed"])
     pv.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pv.add_argument("--cache", default=None, help="packed-weight cache file / UDCQ blob")
     pv.add_argument("--max-ctx", type=int, default=256,
