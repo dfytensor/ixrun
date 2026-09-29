@@ -77,9 +77,22 @@ def main():
                 HpqsLinear(packs[name])
     torch.cuda.empty_cache()
 
+    # ---- UDCQ for the rest (HpqsLinear is not nn.Linear -> skipped) ----
+    from ixrun.udcq import deploy_udcq
+    stats = deploy_udcq(m, cache='stream', verbose=True)
+
+    hpq_bytes = sum(p['codes'].numel() + p['scale'].numel() * 2 + 4096
+                    for p in packs.values())
+    hpq_elems = sum(p['out_f'] * p['in_f'] for p in packs.values())
+    tot_e = hpq_elems + stats['n_elems']
+    bpw = (hpq_bytes + stats['total_bytes']) * 8 / tot_e
+    bpw_packed6 = ((hpq_elems * 7 / 8) + stats['total_bytes']) * 8 / tot_e
+    print(f'storage: HPQS {hpq_bytes/1e6:.0f}MB (unpack8) + '
+          f'UDCQ {stats["total_bytes"]/1e6:.0f}MB -> {bpw:.2f} bpw '
+          f'(6-bit codes would give {bpw_packed6:.2f})', flush=True)
+
     tps, tok_id = gen_loop(m, prompt_ids, N_NEW)
-    print(f'HPQS down+o mixed: {tps:.1f} tok/s '
-          f'({(base_tps - tps) / base_tps * 100:.1f}% slower than bf16), '
+    print(f'HPQS down+o + UDCQ rest: {tps:.1f} tok/s '
           f'last tok {tok_id}', flush=True)
     with torch.no_grad():
         out = m(prompt_ids)
