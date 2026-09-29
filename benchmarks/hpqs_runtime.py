@@ -187,10 +187,14 @@ class HpqsLinear(torch.nn.Module):
                           self.packed['in_f'])
 
     def forward(self, x):
-        from experiments.hpqs_gemv_cuda.hpqs_gemv_cuda import \
-            hpqs_gemv_cuda
+        from experiments.hpqs_gemv_cuda.hpqs_gemv_cuda import _load
+        ext = _load()
         if x.numel() == self.in_features:
-            return hpqs_gemv_cuda(x.reshape(-1), self.packed)
+            y = ext.gemv(x.reshape(-1).contiguous(),
+                         self.packed['codes'], self.packed['cb'],
+                         self.packed['scale'],
+                         self.out_features, self.in_features)
+            return y
         W = self._decode()
         return torch.nn.functional.linear(
             x.to(W.dtype), W)

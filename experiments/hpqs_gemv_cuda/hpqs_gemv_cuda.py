@@ -16,6 +16,7 @@ _CUDA_SRC = r"""
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <ATen/cuda/CUDAContext.h>
 
 __global__ void hpqs_gemv_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -137,6 +138,45 @@ torch::Tensor gemv(torch::Tensor x, torch::Tensor codes,
     return yf.to(torch::kBFloat16);
 }
 
+__global__ void cast_f32_to_bf16(const float* src, __nv_bfloat16* dst,
+                                 int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = __float2bfloat16(src[i]);
+    }
+}
+
+void gemv_into(torch::Tensor x, torch::Tensor codes,
+               torch::Tensor cb, torch::Tensor scale,
+               torch::Tensor yf32, torch::Tensor ybf16,
+               int64_t out_f, int64_t in_f)
+{
+    int n_bc_tot = (int)(in_f / 4);
+    int n_sp = n_bc_tot / 256; if (n_sp < 1) n_sp = 1;
+    if (n_sp > 8) n_sp = 8;
+    int n_bc = n_bc_tot / n_sp;
+    int wpb = 8;
+    unsigned gx = (unsigned)(out_f / 4 / wpb);
+    dim3 grid(gx, (unsigned)n_sp);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaMemsetAsync(yf32.data_ptr(), 0, out_f * sizeof(float),
+                    stream.stream());
+    hpqs_gemv_kernel<<<grid, wpb * 32, 0, stream.stream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+        codes.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half2*>(cb.data_ptr()),
+        reinterpret_cast<const __half*>(scale.data_ptr()),
+        yf32.data_ptr<float>(), n_bc, n_sp, wpb);
+    int thr = 256;
+    unsigned cg = (unsigned)((out_f + thr - 1) / thr);
+    cast_f32_to_bf16<<<cg, thr, 0, stream>>>(
+        yf32.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(
+            ybf16.view(torch::kUInt16).data_ptr()),
+        (int)out_f);
+}
+
 torch::Tensor decode(torch::Tensor codes, torch::Tensor cb,
                      torch::Tensor scale, int64_t out_f, int64_t in_f)
 {
@@ -163,6 +203,10 @@ torch::Tensor gemv(torch::Tensor x, torch::Tensor codes,
                    int64_t out_f, int64_t in_f);
 torch::Tensor decode(torch::Tensor codes, torch::Tensor cb,
                      torch::Tensor scale, int64_t out_f, int64_t in_f);
+void gemv_into(torch::Tensor x, torch::Tensor codes,
+               torch::Tensor cb, torch::Tensor scale,
+               torch::Tensor yf32, torch::Tensor ybf16,
+               int64_t out_f, int64_t in_f);
 """
 
 _EXT = None
@@ -172,10 +216,10 @@ def _load():
     global _EXT
     if _EXT is None:
         _EXT = load_inline(
-            name='hpqs_gemv_cuda_v3',
+            name='hpqs_gemv_cuda_v4',
             cpp_sources=[_CPP_SRC],
             cuda_sources=[_CUDA_SRC],
-            functions=['gemv', 'decode'],
+            functions=['gemv', 'decode', 'gemv_into'],
             extra_cuda_cflags=['-O3', '--use_fast_math',
                                '-allow-unsupported-compiler'],
             verbose=False)
