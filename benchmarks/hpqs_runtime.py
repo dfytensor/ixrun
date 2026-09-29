@@ -163,3 +163,58 @@ if __name__ == '__main__':
               f'decode-vs-fp16cb dmax={dmax:.2e} '
               f'gemv gmax={gmax:.4f} rel={rel:.4f}', flush=True)
     print('OK' if dmax == 0 else 'CHECK', flush=True)
+
+
+class HpqsLinear(torch.nn.Module):
+    """Deploy wrapper: M=1 -> hand-CUDA GEMV; M>1 -> decode+cublas."""
+
+    def __init__(self, packed):
+        super().__init__()
+        self.packed = packed
+        self.packed['codes'] = packed['codes'].cuda()
+        self.packed['cb'] = packed['cb'].cuda()
+        self.packed['scale'] = packed['scale'].cuda()
+        self.out_features = packed['out_f']
+        self.in_features = packed['in_f']
+
+    def _decode(self):
+        codes = self.packed['codes'].reshape(-1, 2, 8).float()
+        cb = self.packed['cb'].float()
+        sc = self.packed['scale'].float()
+        nB = codes.shape[0]
+        recon = torch.zeros(nB, 16, device=codes.device)
+        for l in range(2):
+            for s in range(8):
+                recon[:, s * 2:(s + 1) * 2] += \
+                    cb[l, s][codes[:, l, s].long()]
+        recon *= sc.unsqueeze(1)
+        of, inf = self.packed['out_f'], self.packed['in_f']
+        return recon.reshape(of // 4, inf // 4, 4, 4) \
+            .permute(0, 2, 1, 3).reshape(of, inf).to(torch.bfloat16)
+
+    def forward(self, x):
+        from experiments.hpqs_gemv_cuda.hpqs_gemv_cuda import \
+            hpqs_gemv_cuda
+        if x.numel() == self.in_features:
+            return hpqs_gemv_cuda(x.reshape(-1), self.packed)
+        W = self._decode()
+        return torch.nn.functional.linear(
+            x.to(W.dtype), W)
+
+
+def deploy_hpqs_selected(model, pred, verbose=True):
+    """Wrap linears whose name matches pred() with HpqsLinear."""
+    from ixrun.linear import iter_quantizable_linears, _set_parent_child
+    n = 0
+    for name, mod in list(iter_quantizable_linears(model)):
+        if not pred(name):
+            continue
+        W = mod.weight.data.float().cuda()
+        pk = hpqs_pack(W)
+        del W
+        torch.cuda.empty_cache()
+        _set_parent_child(model, name, HpqsLinear(pk))
+        n += 1
+        if verbose:
+            print(f'[hpqs-deploy] {name}', flush=True)
+    return n
