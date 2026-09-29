@@ -57,6 +57,14 @@
   HPQ-x-scale is DEPLOYABLE-TIER speed; line reopened. Smem level-1
   rows live at 8+s - mis-indexing breaks bit-exactness silently.
   ALWAYS pre-stage GPU tensors before kernel timing loops.
+- **Extension kernels + CUDA graphs (294c163)**: torch extensions that
+  launch kernels WITHOUT a stream arg land on the LEGACY stream, which
+  silently BYPASSES cudaStreamCapture - the kernel runs once during
+  capture (eager looks perfect) but is ABSENT from replay (pool
+  garbage). ALWAYS launch on at::cuda::getCurrentCUDAStream() in
+  extension code that can be captured. Symptom: eager correct + graph
+  garbage. Also: UdcqLinear cache='full' re-decodes EVERY forward
+  (docstring claims once) - stream is the deployed fast path.
 - VRAM watch: Q38SpecEngine graph capture needs >=2GB free
   (Q38_MIN_FREE_GB guard); a busy desktop (QQ/Quark/Edge ~4GB) can push
   24GB cards under the guard at any ctx — engine itself unchanged.
