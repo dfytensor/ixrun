@@ -129,7 +129,8 @@ torch::Tensor gemv(torch::Tensor x, torch::Tensor codes,
     int wpb = 8;
     unsigned gx = (unsigned)(out_f / 4 / wpb);
     dim3 grid(gx, (unsigned)n_sp);
-    hpqs_gemv_kernel<<<grid, wpb * 32>>>(
+    auto s0 = at::cuda::getCurrentCUDAStream();
+    hpqs_gemv_kernel<<<grid, wpb * 32, 0, s0>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
         codes.data_ptr<uint8_t>(),
         reinterpret_cast<const __half2*>(cb.data_ptr()),
@@ -186,7 +187,8 @@ torch::Tensor decode(torch::Tensor codes, torch::Tensor cb,
     long long nB = (long long)out_f / 4 * n_bc;
     int thr = 256;
     unsigned gx = (unsigned)((nB + thr - 1) / thr);
-    hpqs_decode_kernel<<<gx, thr>>>(
+    auto s1 = at::cuda::getCurrentCUDAStream();
+    hpqs_decode_kernel<<<gx, thr, 0, s1>>>(
         codes.data_ptr<uint8_t>(),
         reinterpret_cast<const __half2*>(cb.data_ptr()),
         reinterpret_cast<const __half*>(scale.data_ptr()),
@@ -216,7 +218,7 @@ def _load():
     global _EXT
     if _EXT is None:
         _EXT = load_inline(
-            name='hpqs_gemv_cuda_v4',
+            name='hpqs_gemv_cuda_v5',
             cpp_sources=[_CPP_SRC],
             cuda_sources=[_CUDA_SRC],
             functions=['gemv', 'decode', 'gemv_into'],
