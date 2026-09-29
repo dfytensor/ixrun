@@ -49,13 +49,14 @@
   drops dims - use tl.expand_dims. SEEDED mixed-precision ppl ladder
   (kmeans seed 42): down+o 6.36bpw 57.22 = best value (-0.84 vs UDCQ
   58.06);   unseeded runs jitter +-0.5 - always seed before comparing.
-- hpqs kernel PERF verdict (f1d0376): bit-exact but 0.02-0.04x bf16
-  (~10-15GB/s) across layouts (codes [2,8,nB] vs [nB,16]) and select
-  vs select-free gather forms - bottleneck is gather latency chain +
-  serial 4-row walk; parity needs hand-CUDA (UDCQ-class effort).
-  Deploy stays UDCQ/GMM. Encoder mapping: d=r*4+c, s=d//2, pos=c%2;
-  codes flat [nB, l*8+s]; same-subspace cols share ONE code (pos lives
-  only in the cb offset - conflating them breaks bit-exactness).
+- hpqs kernel PERF verdict REVISED (6c58852): the "0.02-0.04x bf16"
+  Triton-era numbers were H2D-copy artifacts (codes tensor .cuda()
+  inside the timing loop). Hand-CUDA kernel (warp-per-4-row-group,
+  8 warps/block, split-K fp32 atomicAdd, uint4=16 codes, smem cb):
+  0.90x bf16 matmul @2048x6144, gmax 0.0039 (reduction-order noise).
+  HPQ-x-scale is DEPLOYABLE-TIER speed; line reopened. Smem level-1
+  rows live at 8+s - mis-indexing breaks bit-exactness silently.
+  ALWAYS pre-stage GPU tensors before kernel timing loops.
 - VRAM watch: Q38SpecEngine graph capture needs >=2GB free
   (Q38_MIN_FREE_GB guard); a busy desktop (QQ/Quark/Edge ~4GB) can push
   24GB cards under the guard at any ctx — engine itself unchanged.
