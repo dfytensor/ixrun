@@ -1,4 +1,4 @@
-﻿"""End-to-end: TPAB backend on MiniCPM5 鈥?quality (ppl) + generation speed.
+"""End-to-end: TPAB backend on MiniCPM5 鈥?quality (ppl) + generation speed.
 
 Compares: bf16 / INT8-X streaming / TPAB streaming.
 """

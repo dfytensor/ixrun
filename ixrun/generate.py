@@ -1,4 +1,4 @@
-﻿"""Text generation on INT8-X deployed models.
+"""Text generation on INT8-X deployed models.
 
 Works with any HuggingFace causal LM (LlamaForCausalLM and friends) whose
 Linear layers have been replaced by Int8XLinear. Supports greedy / sampling

@@ -1,4 +1,4 @@
-﻿"""TPAB: Tile-parallel Adaptive Bit-width weight compression.
+"""TPAB: Tile-parallel Adaptive Bit-width weight compression.
 
 Prototype successor to INT8-X. The (3,5,8) nested bitmap needs global rank
 prefixes (sequential walks + cumsum) to locate each value's stream position,

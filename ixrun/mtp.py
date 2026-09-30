@@ -1,4 +1,4 @@
-﻿"""Multi-Token Prediction (MTP) head + speculative decoding for Qwen3.8.
+"""Multi-Token Prediction (MTP) head + speculative decoding for Qwen3.8.
 
 Qwen3.8-27B ships an MTP module (config `mtp_num_hidden_layers: 1`) that
 transformers loads-and-ignores (`_keys_to_ignore_on_load_unexpected`). The

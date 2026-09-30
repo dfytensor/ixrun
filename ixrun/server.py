@@ -1,4 +1,4 @@
-﻿"""OpenAI-compatible HTTP API server for Int8XEngine.
+"""OpenAI-compatible HTTP API server for Int8XEngine.
 
 Endpoints:
   GET  /v1/models

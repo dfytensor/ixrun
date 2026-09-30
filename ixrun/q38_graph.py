@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Q38GraphEngine: Qwen3.8-27B UDCQ 6bpw + StaticCache + CUDA-Graph
 greedy/sampling decode, blob fast-deploy.
 

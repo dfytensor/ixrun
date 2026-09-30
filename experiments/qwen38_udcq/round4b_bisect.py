@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """round4b: speculative decode, fast-iteration version.
 
 - loads the disk blob (2min) instead of re-quantizing (55min)
