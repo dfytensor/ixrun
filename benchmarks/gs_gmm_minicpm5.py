@@ -18,7 +18,7 @@ from ixrun.linear import iter_quantizable_linears
 from benchmarks.hpq_minicpm5 import kmeans_gpu
 
 G = 16
-CONFIGS = [(32, 8), (32, 16)]
+CONFIGS = [(32, 'i8'), (32, 8)]
 
 
 def gs_quant(W, K, sbits):
@@ -31,7 +31,11 @@ def gs_quant(W, K, sbits):
     if sbits == 16:
         sc_q = sc.half().float()
     elif sbits == 8:
-        sc_q = sc.to(torch.bfloat16).float()
+        sc_q = sc.to(torch.float8_e4m3fn).float()
+    elif sbits == 'i8':
+        smax = sc.max()
+        sc_q = ((sc / smax * 255).round().clamp(0, 255)
+                / 255 * smax)
     g = g / sc_q
     X = g.reshape(-1)
     samp = X[torch.randperm(X.numel(), device=X.device)[:2_000_000]]
@@ -44,7 +48,8 @@ def gs_quant(W, K, sbits):
                                      C).argmin(1)
     rec = (C[a.squeeze()]).reshape(g.shape) * sc_q
     out = rec.reshape(of, inf).to(torch.bfloat16)
-    bpw = (K.bit_length() - 1) + (sbits / G if sbits else 0)
+    sb = 8 if sbits == 'i8' else (sbits or 0)
+    bpw = (K.bit_length() - 1) + sb / G
     return out, bpw
 
 
