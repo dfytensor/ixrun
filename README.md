@@ -303,3 +303,17 @@ tests/            test_core（无损验证）
 - kernel 配置必须用部署模型实测校验（孤立计时不可信，warps=4 在模型中慢 15-60%）
 - 27B 显存预算：blob 19.4GB + int8 emb 1.27GB + 快照/图 ≈ 21.9GB —— 严禁超 24GB
 - 投机引擎构建需先跑一次 CUDA smoke（进程强杀后 WDDM 可能让图捕获挂死）
+
+---
+
+## 许可证
+
+MIT License（见仓库根目录 `LICENSE`）。
+
+## 开发与贡献
+
+- **环境**：Python 3.12 + CUDA 12.6/13.1；`pip install -r requirements.txt`（Windows Triton 用 `triton-windows`）。
+- **单元测试**：`python -m tests.test_core`（INT8-X 无损性）；`python -m ixgs.test_gs`（组尺度包）。
+- **量化基准**：`benchmarks/` 下全部可复现（wikitext ppl、格式 A/B、R-D 扫描、kernel 位精确门禁）。
+- **kernel 纪律**：任何新 kernel 变体必须先过位精确单测再进部署（AGENTS.md 全量铁律）。
+- **提交规范**：`TYPE(scope): 一行结论 + 证据/数字`；负结果同样入库并写明根因。
