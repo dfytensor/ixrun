@@ -18,7 +18,7 @@ from ixrun.linear import iter_quantizable_linears
 from benchmarks.hpq_minicpm5 import kmeans_gpu
 
 G = 16
-CONFIGS = [(16, 8), (64, 16), (16, 16), (32, 8)]
+CONFIGS = [(32, 8), (32, 16)]
 
 
 def gs_quant(W, K, sbits):
