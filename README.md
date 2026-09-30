@@ -192,11 +192,18 @@ elementwise；真正的税是 CPU 同步与 Python —— 整步图 + 门铃轮�
 | **HPQ×scale 混合 down+o**（UDCQ 其余）| **6.36** | **57.22** |
 | HPQ×scale m8k64 全模型 | 7.0 | **56.93** |
 
-4. **Triton 运行时 kernel**（`benchmarks/hpqs_runtime.py`）：GEMV 位精确
-   （gmax=0.0000），但 0.02-0.04× bf16——gather 延迟链 + 4 行串行游走，
-   追平需手写 CUDA。**裁决：部署保持 UDCQ/GMM，HPQ×scale 为研究线**
-   （编码器映射不变量与 kernel 蓝图已入 AGENTS.md）。
-   附注：kmeans 必须固定 seed——未播种 ppl 抖动 ±0.5。
+4. **手写 CUDA kernel 毕业为第三编解码器**（`experiments/hpqs_gemv_cuda/`）：
+   warp-per-4-row-group + split-K fp32 原子累加 + uint4 装码 + smem 码本，
+   0.84-0.90× bf16 matmul、位精确（gmax 0.0039 归约序噪声级）。6-bit codes
+   打包（pack6/unpack6，12B/块）后存储 **6.36 bpw** 兑现。
+5. **双路径部署验证**：MiniCPM5 StepGraph（`--codec hpqs-mixed`，48 层
+   HpqsLinear + 120 层 UDCQ-stream，同 harness 速度 ≥ UDCQ-stream）与
+   27B spec 引擎注入（`Q38_HPQS_INJECT`/`Q38_HPQS_PACK`，1.60GB free
+   捕获 + 连贯生成）全绿。
+6. **裁决（更新）**：HPQ×scale 混合 = 57.22 ppl @ 6.36bpw——同比特质量
+   优于 UDCQ/GMM，速度持平，三编解码器（UDCQ / GMM / HPQ×scale）全部
+   可部署。方法论遗产见 AGENTS.md：H2D 计时假象、legacy-stream 图捕获
+   逃逸、smem 层级 8+s 索引、CPU 指针进 kernel。
 
 ## 九、调试中钉死的七个暗坑
 

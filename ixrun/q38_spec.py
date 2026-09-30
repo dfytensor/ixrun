@@ -204,24 +204,34 @@ class Q38SpecEngine:
         # becomes a no-op (state drift -> text degeneration).
         self._dsts, self._srcs = [], []
         if os.environ.get('Q38_HPQS_INJECT'):
-            # bisect hook: swap one blob UdcqLinear for HpqsLinear.
-            # Q38_HPQS_PACK=path loads a prebuilt pack (no encode
-            # transients - they fragment the capture-time VRAM pool).
-            name = os.environ['Q38_HPQS_INJECT']
+            # bisect/deploy hook: swap blob UdcqLinear(s) for
+            # HpqsLinear. Q38_HPQS_INJECT=down+o wraps every layer in
+            # Q38_HPQS_PACK (batch mode); a specific module name loads
+            # that single layer's prebuilt pack.
             from .linear import _set_parent_child
             from .udcq import UdcqLinear
             from benchmarks.hpqs_runtime import HpqsLinear
             ppath = os.environ['Q38_HPQS_PACK']
-            pk = torch.load(ppath, map_location='cpu', weights_only=False)
-            pk['codes'] = pk['codes'].cuda()
-            pk['cb'] = pk['cb'].cuda()
-            pk['scale'] = pk['scale'].cuda()
-            parent = self.model.get_submodule(name.rsplit('.', 1)[0])
-            mod = parent._modules[name.rsplit('.', 1)[1]]
-            assert isinstance(mod, UdcqLinear), type(mod)
-            _set_parent_child(self.model, name, HpqsLinear(pk))
+            target = os.environ['Q38_HPQS_INJECT']
+            pk_all = torch.load(ppath, map_location='cpu',
+                                weights_only=False)
+            if target == 'down+o':
+                names = [n for n in pk_all]
+            else:
+                names = [target]
+            for name in names:
+                pk = pk_all[name]
+                pk['codes6'] = pk['codes6'].cuda()
+                pk['cb'] = pk['cb'].cuda()
+                pk['scale'] = pk['scale'].cuda()
+                parent = self.model.get_submodule(
+                    name.rsplit('.', 1)[0])
+                mod = parent._modules[name.rsplit('.', 1)[1]]
+                assert isinstance(mod, UdcqLinear), type(mod)
+                _set_parent_child(self.model, name, HpqsLinear(pk))
+            torch.cuda.empty_cache()
             if verbose:
-                print(f'[q38-spec] injected HpqsLinear: {name} '
+                print(f'[q38-spec] injected {len(names)} HpqsLinear '
                       f'(pack {ppath})', flush=True)
         self._static_buffers()
         self._capture(verbose=verbose)
