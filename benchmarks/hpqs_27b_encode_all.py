@@ -16,9 +16,13 @@ HID, INTER = 5120, 17408
 
 blob = torch.load(BLOB, map_location='cpu', mmap=True,
                   weights_only=False)
-names = [f'model.layers.{i}.mlp.down_proj' for i in range(64)] + \
-        [f'model.layers.{i}.self_attn.o_proj' for i in range(64)]
+names = sorted(n for n in blob['layers']
+               if n.endswith('down_proj') or n.endswith('o_proj'))
 packs = {}
+if __import__('os').path.exists(OUT):
+    packs = torch.load(OUT, map_location='cpu', weights_only=False)
+    names = [n for n in names if n not in packs]
+    print(f'resume: {len(packs)} done, {len(names)} to go', flush=True)
 t00 = time.time()
 for i, name in enumerate(names):
     t0 = time.time()
