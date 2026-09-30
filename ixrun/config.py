@@ -5,16 +5,18 @@ import os
 PYTHON = r"F:\rwkv\.venv\Scripts\python.exe"
 
 # --- Model ---
-MODEL_PATH = (
+# Override via env: IXRUN_MODEL_PATH / IXRUN_QWEN38_PATH /
+# IXRUN_DATASET_CACHE (any HF local snapshot dir works).
+MODEL_PATH = os.environ.get(
+    "IXRUN_MODEL_PATH",
     r"F:\dg_minicpm5\hf_cache\models--openbmb--MiniCPM5-1B\snapshots"
-    r"\4e9de7a0778dc1c362e983e6858f0e77542cbdca"
-)
+    r"\4e9de7a0778dc1c362e983e6858f0e77542cbdca")
 
 # Qwen3.8-27B (multimodal: vision + hybrid linear/full attention, 64 layers)
-QWEN38_PATH = r"E:\models\Qwen3.8-27B"
+QWEN38_PATH = os.environ.get("IXRUN_QWEN38_PATH", r"E:\models\Qwen3.8-27B")
 
 # --- Dataset cache (for wikitext ppl eval) ---
-DATASET_CACHE = r"F:\hf_cache\datasets"
+DATASET_CACHE = os.environ.get("IXRUN_DATASET_CACHE", r"F:\hf_cache\datasets")
 
 # --- Default quantization scheme ---
 # (3,5,8) nested bitmap: 3-bit(|v|<=3, ~55%) + 5-bit(|v|<=15, ~40%) + 8-bit(rest, ~4%)

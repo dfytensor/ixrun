@@ -32,6 +32,62 @@ UDCQ 兼容布局（sign 流全 1）即可零 kernel 改动复用全部 fused de
 
 关键设计：UDCQ 的 byte-aligned nibble → **纯 LUT 解码**（无位图/rank/跨字提取），解码便宜是比位宽更值钱的资产；多 token GEMV 与逐位一致因此投机验证免费。
 
+## 〇、安装与获取（从零到跑通）
+
+### 0.1 获取源码 + 环境
+
+```powershell
+git clone https://github.com/dfytensor/ixrun.git
+cd ixrun
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+# Windows Triton（Linux 用官方 triton 包）:
+pip install triton-windows
+```
+
+要求：Python 3.12、NVIDIA GPU（≥16GB 建议）+ CUDA 12.6/13.1 运行时。
+手写 CUDA GEMV 扩展在**首次运行时 JIT 编译**（torch load_inline），
+需要 MSVC 2022 Build Tools + CUDA Toolkit，并在编译会话里先执行
+`vcvars64.bat`（验证过的构建配方见 AGENTS.md）：
+
+```powershell
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+set PATH=%CD%\.venv\Scripts;%PATH%
+```
+
+### 0.2 获取模型
+
+```powershell
+# MiniCPM5-1B（整步图路径，开箱即用）
+huggingface-cli download openbmb/MiniCPM5-1B --local-dir models\MiniCPM5-1B
+# Qwen3.8-27B（投机解码路径）
+huggingface-cli download Qwen/Qwen3.8-27B --local-dir models\Qwen3.8-27B
+```
+
+路径通过环境变量注入（`ixrun/config.py` 支持，无需改源码）：
+
+```powershell
+set IXRUN_MODEL_PATH=%CD%\models\MiniCPM5-1B
+set IXRUN_QWEN38_PATH=%CD%\models\Qwen3.8-27B
+set IXRUN_DATASET_CACHE=%CD%\hf_datasets
+```
+
+### 0.3 运行
+
+```powershell
+:: ① MiniCPM5-1B：零构建，直接跑（自动量化部署 + 整步图捕获）
+python -m ixrun.cli chat --mode step-graph --codec gmm-stream
+:: ② Qwen3.8-27B：先一次性构建 UDCQ blob（~1h，之后 9 秒部署）
+python -m experiments.qwen38_udcq.pack_q38_blob
+python -m ixrun.cli chat --mode udcq-spec --cache experiments\qwen38_udcq\q38_blob.pt
+:: ③ OpenAI 兼容服务
+python -m ixrun.cli serve --mode step-graph --codec gsq --port 8000
+```
+
+无容器镜像（本仓库目标是单卡 Windows/WDDM 深度调优，容器化不在路线图）。
+评测复现脚本全部在 `benchmarks/`（wikitext ppl、格式 A/B、R-D 扫描）。
+
 ## 二、快速开始
 
 ```powershell

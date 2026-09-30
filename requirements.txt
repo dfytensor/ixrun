@@ -1,0 +1,13 @@
+# IXRUN runtime (verified: python 3.12, CUDA 12.6/13.1, RTX 4090 24GB)
+torch>=2.5
+transformers>=5.8,<6
+accelerate
+pandas            # MUST be imported before torch in some layouts (ixrun handles it)
+numpy
+ninja             # JIT builds of the hand-CUDA GEMV extensions
+fla-core>=0.5.2   # GDN delta-rule kernels (27B qwen3_5 path)
+datasets          # wikitext ppl evals
+# serving (optional):
+fastapi
+uvicorn
+# Windows triton: pip install triton-windows

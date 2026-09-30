@@ -14,7 +14,8 @@ from ixrun.udcq import udcq_fit_codebook, udcq_quantize, UDCQ_G
 from ixrun.config import QWEN38_PATH
 from transformers import AutoModelForCausalLM
 
-BLOB = r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt'
+BLOB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+         'q38_blob.pt')
 
 m = AutoModelForCausalLM.from_pretrained(
     QWEN38_PATH, dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map='cpu')
