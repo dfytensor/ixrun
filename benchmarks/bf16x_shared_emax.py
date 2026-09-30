@@ -22,7 +22,7 @@ from ixrun.linear import iter_quantizable_linears
 
 G = 16            # elems per emax-group (PEAK-Q granularity)
 MB = 7            # mantissa bits kept (of bf16's 7) — try 7 and 5
-CONFIGS = [(32, 5), (32, 4), (32, 3), (32, 2), (32, 1)]
+CONFIGS = [(64, 2), (64, 1), (64, 0)]
 
 
 def bf16x_decode(W, kg, mb):
@@ -59,6 +59,13 @@ def bf16x_decode(W, kg, mb):
     return W2, bits_per_elem, dbits
 
 
+def int8_decode(W):
+    qmax = 127
+    s = W.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / qmax
+    Wq = ((W.float() / s).round().clamp(-qmax, qmax)) * s
+    return Wq.to(torch.bfloat16), 8.0 + 16.0 / W.shape[1], 0
+
+
 def main():
     tok = AutoTokenizer.from_pretrained(MODEL_PATH,
                                         trust_remote_code=True)
@@ -78,7 +85,10 @@ def main():
         dbits_max = 0
         for name, mod in targets:
             W = mod.weight.data
-            W2, bpw, dbits = bf16x_decode(W, kg, mb)
+            if mb == 0:
+                W2, bpw, dbits = int8_decode(W)
+            else:
+                W2, bpw, dbits = bf16x_decode(W, kg, mb)
             dbits_max = max(dbits_max, dbits)
             w = orig[name].float().cuda()
             r = W2.float().cuda()
