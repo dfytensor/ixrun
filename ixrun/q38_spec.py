@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Q38SpecEngine: Qwen3.8-27B speculative decoding with the engine
 interface (tokenizer / generate / stream) so CLI chat/generate and the
 OpenAI-compatible server work unchanged:
@@ -203,6 +203,26 @@ class Q38SpecEngine:
         # start as None and only become tensors after the first forward 鈥?        # collecting earlier silently yields empty streams and rollback
         # becomes a no-op (state drift -> text degeneration).
         self._dsts, self._srcs = [], []
+        if os.environ.get('Q38_HPQS_INJECT'):
+            # bisect hook: swap one blob UdcqLinear for HpqsLinear.
+            # Q38_HPQS_PACK=path loads a prebuilt pack (no encode
+            # transients - they fragment the capture-time VRAM pool).
+            name = os.environ['Q38_HPQS_INJECT']
+            from .linear import _set_parent_child
+            from .udcq import UdcqLinear
+            from benchmarks.hpqs_runtime import HpqsLinear
+            ppath = os.environ['Q38_HPQS_PACK']
+            pk = torch.load(ppath, map_location='cpu', weights_only=False)
+            pk['codes'] = pk['codes'].cuda()
+            pk['cb'] = pk['cb'].cuda()
+            pk['scale'] = pk['scale'].cuda()
+            parent = self.model.get_submodule(name.rsplit('.', 1)[0])
+            mod = parent._modules[name.rsplit('.', 1)[1]]
+            assert isinstance(mod, UdcqLinear), type(mod)
+            _set_parent_child(self.model, name, HpqsLinear(pk))
+            if verbose:
+                print(f'[q38-spec] injected HpqsLinear: {name} '
+                      f'(pack {ppath})', flush=True)
         self._static_buffers()
         self._capture(verbose=verbose)
 
