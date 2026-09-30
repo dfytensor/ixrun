@@ -38,10 +38,20 @@ __global__ void hpqs_gemv_kernel(
     float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
     for (int jb = jb0 + lane; jb < jb1; jb += 32) {
         int bidx = g * (n_bc * n_sp) + jb;
-        uint4 cw = *reinterpret_cast<const uint4*>(codes + bidx * 16);
+        const uint8_t* cp = codes + (size_t)bidx * 12;
+        uint32_t d0 = *(const uint32_t*)cp;
+        uint32_t d1 = *(const uint32_t*)(cp + 4);
+        uint32_t d2 = *(const uint32_t*)(cp + 8);
+        unsigned long long lo = (unsigned long long)d0
+            | ((unsigned long long)d1 << 32);
+        unsigned long long hi = ((unsigned long long)d1 >> 16)
+            | ((unsigned long long)d2 << 16);
         uint8_t cA[8], cB[8];
-        memcpy(cA, &cw.x, 4); memcpy(cA + 4, &cw.y, 4);
-        memcpy(cB, &cw.z, 4); memcpy(cB + 4, &cw.w, 4);
+        #pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            cA[s] = (uint8_t)((lo >> (6 * s)) & 0x3F);
+            cB[s] = (uint8_t)((hi >> (6 * s)) & 0x3F);
+        }
         float sc = __half2float(scale[bidx]);
         const __nv_bfloat16* x4 = x + jb * 4;
         float xa0 = __bfloat162float(x4[0]);
@@ -85,7 +95,7 @@ __global__ void hpqs_decode_kernel(
     const __half2* __restrict__ cb,
     const __half* __restrict__ scale,
     __nv_bfloat16* __restrict__ W,         // [out_f, in_f]
-    int n_bc)
+    int n_bc, long long nB)
 {
     __shared__ float2 cb_sm[16][64];
     for (int i = threadIdx.x; i < 16 * 64; i += blockDim.x) {
@@ -93,10 +103,23 @@ __global__ void hpqs_decode_kernel(
     }
     __syncthreads();
     long long bidx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    uint4 cw = *reinterpret_cast<const uint4*>(codes + bidx * 16);
+    if (bidx >= nB) {
+        return;
+    }
+    const uint8_t* cp = codes + (size_t)bidx * 12;
+    uint32_t d0 = *(const uint32_t*)cp;
+    uint32_t d1 = *(const uint32_t*)(cp + 4);
+    uint32_t d2 = *(const uint32_t*)(cp + 8);
+    unsigned long long lo = (unsigned long long)d0
+        | ((unsigned long long)d1 << 32);
+    unsigned long long hi = ((unsigned long long)d1 >> 16)
+        | ((unsigned long long)d2 << 16);
     uint8_t cA[8], cB[8];
-    memcpy(cA, &cw.x, 4); memcpy(cA + 4, &cw.y, 4);
-    memcpy(cB, &cw.z, 4); memcpy(cB + 4, &cw.w, 4);
+    #pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        cA[s] = (uint8_t)((lo >> (6 * s)) & 0x3F);
+        cB[s] = (uint8_t)((hi >> (6 * s)) & 0x3F);
+    }
     float sc = __half2float(scale[bidx]);
     int g = (int)(bidx / n_bc);
     int jb = (int)(bidx % n_bc);
@@ -194,7 +217,7 @@ torch::Tensor decode(torch::Tensor codes, torch::Tensor cb,
         reinterpret_cast<const __half*>(scale.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(
             W.view(torch::kUInt16).data_ptr()),
-        n_bc);
+        n_bc, nB);
     return W;
 }
 """
@@ -218,7 +241,7 @@ def _load():
     global _EXT
     if _EXT is None:
         _EXT = load_inline(
-            name='hpqs_gemv_cuda_v5',
+            name='hpqs_gemv_cuda_v6',
             cpp_sources=[_CPP_SRC],
             cuda_sources=[_CUDA_SRC],
             functions=['gemv', 'decode', 'gemv_into'],
@@ -231,7 +254,7 @@ def _load():
 def hpqs_gemv_cuda(x, packed):
     """x [in_f] bf16 -> y [out_f] bf16. out_f % 32 == 0 required."""
     ext = _load()
-    return ext.gemv(x.contiguous(), packed['codes'].cuda(),
+    return ext.gemv(x.contiguous(), packed['codes6'].cuda(),
                     packed['cb'].cuda(), packed['scale'].cuda(),
                     packed['out_f'], packed['in_f'])
 
@@ -245,7 +268,7 @@ if __name__ == '__main__':
         W = (torch.randn(of, inf) * 0.02).cuda()
         pk = hpqs_pack(W)
         dref = _decode_ref(pk).cuda()
-        pk['codes'] = pk['codes'].cuda()
+        pk['codes6'] = pk['codes6'].cuda()
         pk['cb'] = pk['cb'].cuda()
         pk['scale'] = pk['scale'].cuda()
         x = torch.randn(inf, dtype=torch.bfloat16, device='cuda')
