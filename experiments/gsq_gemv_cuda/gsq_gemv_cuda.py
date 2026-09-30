@@ -153,5 +153,7 @@ if __name__ == '__main__':
             Wb @ x.float()
         torch.cuda.synchronize()
         t_b = (time.time() - t0) / 200 * 1000
+        t_b = max(t_b, 1e-4)
+        t_b = max(t_b, 1e-4)
         print(f'[{of}x{inf}] gmax={gmax:.4f} gsq={t_g:.3f}ms '
               f'bf16={t_b:.3f}ms ({t_b/t_g:.2f}x)', flush=True)

@@ -43,17 +43,19 @@ def gs_pack(W, K=32, seed=42):
     out = rec.reshape(of, inf).to(torch.bfloat16)
     # pack 16 x 5-bit codes -> 10 bytes (d0|d1<<32 lo64, d2 hi16)
     a = a.reshape(-1, 16)
+    nG = a.shape[0]
     ar5 = torch.arange(5, device=a.device)
-    ar12 = torch.arange(12, device=a.device)
-    ar4 = torch.arange(4, device=a.device)
-    v = (a[:, :12].long() * (1 << (5 * ar12))).sum(1)      # 60 bits
-    w = (a[:, 12:].long() * (1 << (5 * ar4))).sum(1)       # 20 bits
-    lb = v.view(torch.uint8).reshape(-1, 8)
-    lb[:, 7] = (lb[:, 7] & 0x0F) | ((w & 0xF).to(torch.uint8) << 4)
-    c5 = torch.empty(a.shape[0], 10, dtype=torch.uint8)
-    c5[:, 0:8] = lb
-    c5[:, 8:10] = ((w >> 4) & 0xFFFF).to(torch.uint16) \
-        .view(torch.uint8).reshape(-1, 2)
+    ar8 = torch.arange(8, device=a.device)
+    c5 = torch.empty(nG, 10, dtype=torch.uint8)
+    blk = 4_000_000
+    for i0 in range(0, nG, blk):
+        b = a[i0:i0 + blk]
+        bits = torch.zeros(b.shape[0], 80, dtype=torch.int64,
+                           device=a.device)
+        for i in range(16):
+            bits[:, i * 5:(i + 1) * 5] = (b[:, i:i + 1] >> ar5) & 1
+        c5[i0:i0 + blk] = (bits.reshape(-1, 10, 8)
+                           * (1 << ar8)).sum(-1).to(torch.uint8)
     return {'codes5': c5.contiguous().cpu(),
             's_i8': s_i8.cpu().contiguous(),
             's_base': float(umin),
@@ -64,20 +66,12 @@ def gs_pack(W, K=32, seed=42):
 
 def gs_decode_ref(pk):
     C = pk['cb'].cuda()
-    nG = pk['s_i8'].numel()
-    lo = pk['codes5'][:, 0:8].long().cuda()
-    lo64 = (lo * (1 << (8 * torch.arange(8, device=lo.device)
-                        ))).sum(1)
-    hi = pk['codes5'][:, 8:10].long().cuda()
-    hi16 = (hi * (1 << (8 * torch.arange(2, device=hi.device)
-                        ))).sum(1)
-    codes = torch.empty(nG, 16, dtype=torch.long, device='cuda')
-    ar12 = torch.arange(12, device='cuda')
-    codes[:, :12] = ((lo64[:, None] >> (5 * ar12)) & 0x1F)
-    codes[:, 12] = ((lo64 >> 60) | (hi16 << 4)) & 0x1F
-    codes[:, 13] = (hi16 >> 1) & 0x1F
-    codes[:, 14] = (hi16 >> 6) & 0x1F
-    codes[:, 15] = (hi16 >> 11) & 0x1F
+    c5 = pk['codes5'].long().cuda()
+    nG = c5.shape[0]
+    ar8 = torch.arange(8, device=c5.device)
+    ar5 = torch.arange(5, device=c5.device)
+    bits = ((c5.unsqueeze(-1) >> ar8) & 1).reshape(nG, 80)
+    codes = (bits.reshape(nG, 16, 5) * (1 << ar5)).sum(-1)
     s = torch.pow(2.0, pk['s_base'] + pk['s_i8'].float().cuda()
                   * pk['s_step'])
     rec = (C[codes.reshape(-1)] * s.reshape(-1, 1).expand(-1, 16)
