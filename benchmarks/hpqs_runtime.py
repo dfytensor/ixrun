@@ -227,7 +227,7 @@ class HpqsLinear(torch.nn.Module):
         ext = _load()
         if x.numel() == self.in_features:
             y = ext.gemv(x.reshape(-1).contiguous(),
-                         self.packed['codes'], self.packed['cb'],
+                         self.packed['codes6'], self.packed['cb'],
                          self.packed['scale'],
                          self.out_features, self.in_features)
             return y
