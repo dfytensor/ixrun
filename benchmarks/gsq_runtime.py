@@ -89,3 +89,48 @@ if __name__ == '__main__':
     r = d.float()
     print('pack/decode rel_err =',
           ((w - r).norm() / w.norm()).item(), flush=True)
+
+
+class GsqLinear(torch.nn.Module):
+    """Deploy wrapper: M=1 -> hand-CUDA GEMV; M>1 -> decode+cublas."""
+
+    def __init__(self, pk):
+        super().__init__()
+        self.pk = pk
+        self.pk['codes5'] = pk['codes5'].cuda()
+        self.pk['cb'] = pk['cb'].cuda()
+        self.pk['s_i8'] = pk['s_i8'].cuda()
+        self.out_features = pk['out_f']
+        self.in_features = pk['in_f']
+
+    def _decode(self):
+        from experiments.gsq_gemv_cuda.gsq_gemv_cuda import _load
+        _load()
+        return gs_decode_ref(self.pk)
+
+    def forward(self, x):
+        from experiments.gsq_gemv_cuda.gsq_gemv_cuda import gs_gemv_cuda
+        if x.numel() == self.in_features:
+            return gs_gemv_cuda(x.reshape(-1), self.pk)
+        W = self._decode()
+        return torch.nn.functional.linear(
+            x.to(W.dtype), W)
+
+
+def deploy_gs(model, pred=None, verbose=True):
+    from ixrun.linear import iter_quantizable_linears, _set_parent_child
+    n = 0
+    for name, mod in list(iter_quantizable_linears(model)):
+        if pred is not None and not pred(name):
+            continue
+        W = mod.weight.data.float().cuda()
+        pk = gs_pack(W)
+        del W
+        torch.cuda.empty_cache()
+        _set_parent_child(model, name, GsqLinear(pk))
+        n += 1
+        if verbose and n % 40 == 0:
+            print(f'[gs-deploy] {n} layers...', flush=True)
+    if verbose:
+        print(f'[gs-deploy] {n} GsqLinear', flush=True)
+    return n

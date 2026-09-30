@@ -119,6 +119,23 @@ class StepGraphEngine:
             if verbose:
                 print(f'[hpqs-mixed] {len(packs)} HpqsLinear + '
                       f'{stats["n_layers"]} UdcqLinear', flush=True)
+        elif codec == 'gsq':
+            # GSQ: K32 signed codebook (5b) + log-i8 per-16 scales
+            # (5.50bpw), hand-CUDA GEMV in-graph
+            from .linear import iter_quantizable_linears, _set_parent_child
+            from benchmarks.gsq_runtime import GsqLinear
+
+            for name, mod in list(iter_quantizable_linears(model)):
+                W = mod.weight.data.float().cuda()
+                pk = {}
+                from benchmarks.gsq_runtime import gs_pack
+                pk = gs_pack(W)
+                del W
+                torch.cuda.empty_cache()
+                _set_parent_child(model, name, GsqLinear(pk))
+            stats.update({'bpw': 5.5, 'codec': 'gsq'})
+            if verbose:
+                print('[gsq] all linears wrapped (5.50bpw)', flush=True)
         elif codec != 'bf16':
             raise ValueError(f'unknown codec: {codec}')
         model = model.cuda()
