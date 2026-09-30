@@ -40,7 +40,7 @@ UDCQ 兼容布局（sign 流全 1）即可零 kernel 改动复用全部 fused de
 git clone https://github.com/dfytensor/ixrun.git
 cd ixrun
 python -m venv .venv
-.\.venv\Scripts\activate
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 # Windows Triton（Linux 用官方 triton 包）:
 pip install triton-windows
@@ -56,32 +56,35 @@ call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliar
 set PATH=%CD%\.venv\Scripts;%PATH%
 ```
 
-### 0.2 获取模型
+### 0.2 获取模型（零配置路径：下载到仓库内 models\ 即可）
+
+`ixrun/config.py` 会自动发现 `<仓库>\models\` 下的模型目录——
+下载到默认位置后**无需任何环境变量**：
 
 ```powershell
-# MiniCPM5-1B（整步图路径，开箱即用）
 huggingface-cli download openbmb/MiniCPM5-1B --local-dir models\MiniCPM5-1B
-# Qwen3.8-27B（投机解码路径）
 huggingface-cli download Qwen/Qwen3.8-27B --local-dir models\Qwen3.8-27B
 ```
 
-路径通过环境变量注入（`ixrun/config.py` 支持，无需改源码）：
+模型放别处时用环境变量（**PowerShell 语法**）：
 
 ```powershell
-set IXRUN_MODEL_PATH=%CD%\models\MiniCPM5-1B
-set IXRUN_QWEN38_PATH=%CD%\models\Qwen3.8-27B
-set IXRUN_DATASET_CACHE=%CD%\hf_datasets
+$env:IXRUN_MODEL_PATH = "D:\models\MiniCPM5-1B"
+$env:IXRUN_QWEN38_PATH = "D:\models\Qwen3.8-27B"
+$env:IXRUN_DATASET_CACHE = "D:\hf_datasets"
 ```
+
+（CMD 用 `set IXRUN_MODEL_PATH=D:\models\MiniCPM5-1B`；Linux 用 `export ...`。）
 
 ### 0.3 运行
 
 ```powershell
-:: ① MiniCPM5-1B：零构建，直接跑（自动量化部署 + 整步图捕获）
+# ① MiniCPM5-1B：零构建，直接跑（自动量化部署 + 整步图捕获）
 python -m ixrun.cli chat --mode step-graph --codec gmm-stream
-:: ② Qwen3.8-27B：先一次性构建 UDCQ blob（~1h，之后 9 秒部署）
+# ② Qwen3.8-27B：先一次性构建 UDCQ blob（~1h，之后 9 秒部署）
 python -m experiments.qwen38_udcq.pack_q38_blob
 python -m ixrun.cli chat --mode udcq-spec --cache experiments\qwen38_udcq\q38_blob.pt
-:: ③ OpenAI 兼容服务
+# ③ OpenAI 兼容服务
 python -m ixrun.cli serve --mode step-graph --codec gsq --port 8000
 ```
 
