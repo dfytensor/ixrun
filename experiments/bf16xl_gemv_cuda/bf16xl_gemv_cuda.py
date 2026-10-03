@@ -23,22 +23,31 @@ __global__ void bf16xl_gemv_kernel(
     int n_gr, int sg)                     // groups/row, groups/supergroup
 {
     __syncthreads();                       // no smem state; keep layout
+    __shared__ float red[8][32];
     int lane = threadIdx.x & 31;
     int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    int jb0 = blockIdx.y * ((n_gr + gridDim.y - 1) / gridDim.y);
+    int jb1 = min(jb0 + (n_gr + gridDim.y - 1) / gridDim.y, n_gr);
     float acc = 0.f;
-    for (int jb = lane; jb < n_gr; jb += 32) {
+    for (int jb = jb0 + lane; jb < jb1; jb += 32) {
         long long gidx = (long long)r * n_gr + jb;
         const uint8_t* p = stream + gidx * 28;
+        uint32_t d[7];
+        #pragma unroll
+        for (int k = 0; k < 7; ++k) {
+            d[k] = *(const uint32_t*)(p + k * 4);
+        }
         int e = emax[gidx / sg];
         const __nv_bfloat16* x16 = x + jb * 16;
         float inner = 0.f;
         #pragma unroll
         for (int i = 0; i < 16; ++i) {
             int bo = i * 14;
-            const uint8_t* q = p + (bo >> 3);
-            uint32_t v = (uint32_t)q[0] | ((uint32_t)q[1] << 8)
-                | ((uint32_t)q[2] << 16);
-            int val = (int)((v >> (bo & 7)) & 0x3FFF);
+            int w = bo >> 5;
+            int sh = bo & 31;
+            uint32_t v24 = sh ? ((d[w] >> sh) | (d[w + 1] << (32 - sh)))
+                              : d[w];
+            int val = (int)(v24 & 0x3FFF);
             int delta = val >> 8;
             int m = (val >> 1) & 0x7F;
             int sign = val & 1;
@@ -55,7 +64,7 @@ __global__ void bf16xl_gemv_kernel(
         acc += __shfl_down_sync(0xffffffff, acc, off);
     }
     if (lane == 0) {
-        yf[r] = acc;
+        atomicAdd(&yf[r], acc);
     }
 }
 
@@ -63,14 +72,17 @@ torch::Tensor gemv(torch::Tensor x, torch::Tensor stream,
                    torch::Tensor emax, int64_t out_f, int64_t in_f,
                    int64_t kg)
 {
-    auto yf = torch::empty({out_f},
+    auto yf = torch::zeros({out_f},
         torch::dtype(torch::kFloat32).device(x.device()));
     int n_gr = (int)(in_f / 16);
     int sg = (int)(kg / 16);
     int wpb = 8;
+    int n_sp = n_gr / 96; if (n_sp < 1) n_sp = 1;
+    if (n_sp > 6) n_sp = 6;
     unsigned gx = (unsigned)(out_f / wpb);
+    dim3 grid(gx, (unsigned)n_sp);
     auto s0 = at::cuda::getCurrentCUDAStream();
-    bf16xl_gemv_kernel<<<gx, wpb * 32, 0, s0>>>(
+    bf16xl_gemv_kernel<<<grid, wpb * 32, 0, s0>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
         stream.data_ptr<uint8_t>(), emax.data_ptr<uint8_t>(),
         yf.data_ptr<float>(), n_gr, sg);
