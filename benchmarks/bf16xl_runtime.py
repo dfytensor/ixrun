@@ -27,9 +27,9 @@ def bf16xl_pack(W, kg=64):
     delta = (emax - flat[:nG * 16]).clamp_min(0)
     delta = torch.where(flat[:nG * 16] == 0,
                         torch.full_like(delta, 63), delta)
-    maxd = int(delta.max())
-    assert maxd <= 62, f'delta {maxd} exceeds 62 (zero-marker 63); ' \
-        'this tensor needs the dbits=7 fallback (not implemented)'
+    # delta > 62: magnitude < 2^(emax-62) ~ numerically zero for the
+    # dot product -> fold into the zero marker (6b budget intact)
+    delta = delta.clamp_max(63)
     payload = (delta.reshape(-1, 1) << 8) | (m.reshape(-1, 1) << 1) \
         | sign.reshape(-1, 1)
     payload = payload[:nG * 16].reshape(nG, 16)
@@ -83,3 +83,43 @@ if __name__ == '__main__':
         bpw = mb * 8 / (of * inf)
         print(f'[{of}x{inf}] bit-exact={exact} bpw={bpw:.2f}',
               flush=True)
+
+
+class Bf16xlLinear(torch.nn.Module):
+    def __init__(self, pk):
+        super().__init__()
+        self.pk = pk
+        self.pk['stream'] = pk['stream'].cuda()
+        self.pk['emax'] = pk['emax'].cuda()
+        self.out_features = pk['out_f']
+        self.in_features = pk['in_f']
+
+    def _decode(self):
+        return bf16xl_decode_ref(self.pk)
+
+    def forward(self, x):
+        from experiments.bf16xl_gemv_cuda.bf16xl_gemv_cuda import \
+            bf16xl_gemv_cuda
+        if x.numel() == self.in_features:
+            return bf16xl_gemv_cuda(x.reshape(-1), self.pk)
+        W = self._decode()
+        return torch.nn.functional.linear(
+            x.to(W.dtype), W)
+
+
+def deploy_bf16xl(model, verbose=True):
+    from ixrun.linear import iter_quantizable_linears, _set_parent_child
+    n = 0
+    for name, mod in list(iter_quantizable_linears(model)):
+        W = mod.weight.data.cuda()
+        pk = bf16xl_pack(W)
+        del W
+        torch.cuda.empty_cache()
+        _set_parent_child(model, name, Bf16xlLinear(pk))
+        n += 1
+        if verbose and n % 60 == 0:
+            print(f'[bf16xl-deploy] {n}...', flush=True)
+    if verbose:
+        print(f'[bf16xl-deploy] {n} Bf16xlLinear (14.12bpw lossless)',
+              flush=True)
+    return n

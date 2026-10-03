@@ -136,6 +136,11 @@ class StepGraphEngine:
             stats.update({'bpw': 5.5, 'codec': 'gsq'})
             if verbose:
                 print('[gsq] all linears wrapped (5.50bpw)', flush=True)
+        elif codec == 'bf16xl':
+            from benchmarks.bf16xl_runtime import deploy_bf16xl
+
+            stats['n_layers'] = deploy_bf16xl(model, verbose=verbose)
+            stats['bpw'] = 14.12
         elif codec != 'bf16':
             raise ValueError(f'unknown codec: {codec}')
         model = model.cuda()
