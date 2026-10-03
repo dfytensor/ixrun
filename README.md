@@ -7,7 +7,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| **压缩格式** | INT8-X 5.5bpw（int8 无损）/ PEAK-Q 10.6bpw（54dB 近无损）/ UDCQ 6bpw（4-bit 码本，ppl≈±0）/ **GMM 5-6bpw（贝叶斯高斯混合 + 残差补偿）** / TPAB / ixgs |
+| **压缩格式** | 六档编解码器全家桶：**GSQ 5.5bpw（学习码本×组 scale，带宽王）** / UDCQ 6bpw（27B 主力）/ **GMM 5-6bpw（贝叶斯高斯混合）** / **HPQ×scale 6.36bpw（块码本×组尺度质量强化）** / PEAK-Q 10.6bpw（54dB）/ **bf16xl 14.12bpw（真无损，逐 bit == bf16）** / INT8-X / ixgs |
 | **解码 kernel** | Triton fused decode+GEMV · 多 token GEMV（bit-exact，T=4 成本≈单 token）· **手写 CUDA GEMV**（~700GB/s，2.2× Triton）· CUDA mma 批量 |
 | **图执行** | CUDA-Graph 全步捕获（MiniCPM5 ~134 tok/s）；27B 验证图/链图多图管线（共享池、静态输出） |
 | **投机解码** | 队列架构 k=3 + 真-h MTP seed + 概率接受（温度兼容）；贪心 E=2.8 |
@@ -23,8 +23,19 @@
 | **PEAK-Q** | 10.6 | 54dB SNR，69% 元素 bit-exact | 近无损档 |
 | **UDCQ** | 6.0 | 4-bit 码本（分布自适应），ppl≈±0 | **27B 单卡主力** |
 | **GMM**（贝叶斯高斯混合）| 5.0-6.0 | K=32 6bpw ppl 57.92 ≈ UDCQ；+残差 8.5bpw == bf16 | 最省 bpw 档；流式 5.03bpw |
+| **GSQ**（组尺度量化）| **5.50** | K32 学习码本 + 对数 i8 组 scale，**ppl 57.9** | **带宽王：StepGraph 33.5 tok/s 全场最快** |
+| **HPQ×scale**（块码本×组尺度）| 6.36 | 混合部署 ppl 57.22；CUDA kernel 0.84-0.90× bf16 | 质量强化层（27B 支持点状注入）|
+| **bf16xl**（无损压缩 bf16）| 14.12 | **逐 bit == bf16（零误差）**；速度 ≈ bf16（137 tok/s 稳态）| 无损档：质量敏感部署 |
 | **ixgs** | 4.2 | per-group scale，25.4dB | 重尾权重/视频 DiT 方向 |
 | TPAB | 2-6 | tile 定长 | 原型 |
+
+### 量化研究体系（全部可复现，`benchmarks/`）
+
+同比特对标实验定界了设计空间：**学习码本（GSQ-kmeans）在 5.5bpw 同管线下
+比解析式级别（高斯分位数/NF4/分段+开方）好 7 ppl 以上**；bf16x 共享 emax
+证明指数元数据可无损压缩至 10.85bpw 但截断式进不了 sub-10bpw 档；
+int8 逐行在 8bpw 仍无敌（40.6dB）。负结果全部入库（segroot 165、
+NF4 65.4、bf16x-mb2 65.15）。
 
 GMM 要点：EM + Dirichlet 先验拟合分量（自动剪枝），**分量中心带符号 → 无 sign 流**，编码成
 UDCQ 兼容布局（sign 流全 1）即可零 kernel 改动复用全部 fused decode+GEMV 基础设施；
@@ -102,6 +113,10 @@ $env:UDCQ_CUDA_GEMV='1'          # 手写 CUDA kernel（贪心 15→34 tok/s 的
 python -m ixrun.cli chat --mode step-graph --codec udcq
 # GMM 流式整步图（141 tok/s @ 1.40GB —— 当前最快最省）
 python -m ixrun.cli chat --mode step-graph --codec gmm-stream
+# GSQ（5.5bpw 带宽王，裸测线 33.5 tok/s 全场最快）
+python -m ixrun.cli chat --mode step-graph --codec gsq
+# bf16xl（14.12bpw 真无损，逐 bit == bf16，稳态 ~137 tok/s）
+python -m ixrun.cli chat --mode step-graph --codec bf16xl
 
 # Qwen3.8-27B 投机解码（最快）
 python -m ixrun.cli chat --mode udcq-spec `
