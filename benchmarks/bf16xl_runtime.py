@@ -95,7 +95,11 @@ class Bf16xlLinear(torch.nn.Module):
         self.in_features = pk['in_f']
 
     def _decode(self):
-        return bf16xl_decode_ref(self.pk)
+        from experiments.bf16xl_gemv_cuda.bf16xl_gemv_cuda import _load
+        ext = _load()
+        return ext.decode(self.pk['stream'], self.pk['emax'],
+                          self.pk['out_f'], self.pk['in_f'],
+                          self.pk['kg'])
 
     def forward(self, x):
         from experiments.bf16xl_gemv_cuda.bf16xl_gemv_cuda import \

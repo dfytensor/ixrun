@@ -27,6 +27,7 @@ print(f'[{codec}] 128 tok in {t_tot:.2f}s wall (incl prefill+decode)')
 eng.hard_reset()
 t0 = time.time()
 eng.prefill(ids)
+torch.cuda.empty_cache()
 torch.cuda.synchronize()
 t_pf = time.time() - t0
 t0 = time.time()
