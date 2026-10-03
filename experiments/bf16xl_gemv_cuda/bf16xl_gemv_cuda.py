@@ -88,12 +88,71 @@ torch::Tensor gemv(torch::Tensor x, torch::Tensor stream,
         yf.data_ptr<float>(), n_gr, sg);
     return yf.to(torch::kBFloat16);
 }
+
+__global__ void bf16xl_decode_kernel(
+    const uint8_t* __restrict__ stream,
+    const uint8_t* __restrict__ emax,
+    __nv_bfloat16* __restrict__ W,
+    int n_gr, int sg, long long nG)
+{
+    long long gidx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gidx >= nG) {
+        return;
+    }
+    const uint8_t* p = stream + gidx * 28;
+    uint32_t d[7];
+    #pragma unroll
+    for (int k = 0; k < 7; ++k) {
+        d[k] = *(const uint32_t*)(p + k * 4);
+    }
+    int e = emax[gidx / sg];
+    int r = (int)(gidx / n_gr);
+    int jb = (int)(gidx % n_gr);
+    __nv_bfloat16* row = W + (long long)r * ((long long)n_gr * 16)
+                       + jb * 16;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        int bo = i * 14;
+        int w = bo >> 5;
+        int sh = bo & 31;
+        uint32_t v24 = sh ? ((d[w] >> sh) | (d[w + 1] << (32 - sh)))
+                          : d[w];
+        int val = (int)(v24 & 0x3FFF);
+        int delta = val >> 8;
+        int m = (val >> 1) & 0x7F;
+        int sign = val & 1;
+        int ee = (delta == 63) ? 0 : (e - delta);
+        uint16_t w16 = (uint16_t)((sign << 15) | (ee << 7) | m);
+        row[i] = *reinterpret_cast<__nv_bfloat16*>(&w16);
+    }
+}
+
+torch::Tensor decode(torch::Tensor stream, torch::Tensor emax,
+                     int64_t out_f, int64_t in_f, int64_t kg)
+{
+    auto W = torch::empty({out_f, in_f},
+        torch::dtype(torch::kBFloat16).device(stream.device()));
+    int n_gr = (int)(in_f / 16);
+    int sg = (int)(kg / 16);
+    long long nG = (long long)out_f * (in_f / 16);
+    long long thr = 256;
+    unsigned gx = (unsigned)((nG + thr - 1) / thr);
+    auto s0 = at::cuda::getCurrentCUDAStream();
+    bf16xl_decode_kernel<<<gx, (unsigned)thr, 0, s0>>>(
+        stream.data_ptr<uint8_t>(), emax.data_ptr<uint8_t>(),
+        reinterpret_cast<__nv_bfloat16*>(
+            W.view(torch::kUInt16).data_ptr()),
+        n_gr, sg, nG);
+    return W;
+}
 """
 
 _CPP_SRC = """
 torch::Tensor gemv(torch::Tensor x, torch::Tensor stream,
                    torch::Tensor emax, int64_t out_f, int64_t in_f,
                    int64_t kg);
+torch::Tensor decode(torch::Tensor stream, torch::Tensor emax,
+                     int64_t out_f, int64_t in_f, int64_t kg);
 """
 
 _EXT = None
@@ -103,10 +162,10 @@ def _load():
     global _EXT
     if _EXT is None:
         _EXT = load_inline(
-            name='bf16xl_gemv_cuda_v1',
+            name='bf16xl_gemv_cuda_v2',
             cpp_sources=[_CPP_SRC],
             cuda_sources=[_CUDA_SRC],
-            functions=['gemv'],
+            functions=['gemv', 'decode'],
             extra_cuda_cflags=['-O3', '--use_fast_math',
                                '-allow-unsupported-compiler'],
             verbose=False)
