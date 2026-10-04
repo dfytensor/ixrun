@@ -23,15 +23,17 @@ __global__ void gsq_gemv_kernel(
     const uint8_t* __restrict__ s_i8,    // [nR*nGr]
     float s_base, float s_step,
     float* __restrict__ yf,
-    int n_gr, int n_sp)
+    int n_gr)
 {
+    __shared__ float cb_sm[32];
+    for (int i = threadIdx.x; i < 32; i += blockDim.x) {
+        cb_sm[i] = cb[i];
+    }
+    __syncthreads();
     int lane = threadIdx.x & 31;
     int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
-    int per = (n_gr + n_sp - 1) / n_sp;
-    int jb0 = blockIdx.y * per;
-    int jb1 = min(jb0 + per, n_gr);
     float acc = 0.f;
-    for (int jb = jb0 + lane; jb < jb1; jb += 32) {
+    for (int jb = lane; jb < n_gr; jb += 32) {
         long long gidx = (long long)r * n_gr + jb;
         const uint8_t* p = codes + gidx * 10;
         uint32_t d0 = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
@@ -47,15 +49,15 @@ __global__ void gsq_gemv_kernel(
         #pragma unroll
         for (int i = 0; i < 12; ++i) {
             int c = (int)((lo >> (5 * i)) & 0x1F);
-            inner += cb[c] * __bfloat162float(x16[i]);
+            inner += cb_sm[c] * __bfloat162float(x16[i]);
         }
         int c12 = (int)(((lo >> 60)
             | ((unsigned long long)d2 << 4)) & 0x1F);
-        inner += cb[c12] * __bfloat162float(x16[12]);
+        inner += cb_sm[c12] * __bfloat162float(x16[12]);
         #pragma unroll
         for (int i = 0; i < 3; ++i) {
             int c = (int)((d2 >> (5 * i + 1)) & 0x1F);
-            inner += cb[c] * __bfloat162float(x16[13 + i]);
+            inner += cb_sm[c] * __bfloat162float(x16[13 + i]);
         }
         acc += inner * s;
     }
@@ -75,16 +77,13 @@ static void gsq_gemv_run(const __nv_bfloat16* x,
                          double s_base, double s_step,
                          float* yf, int out_f, int in_f) {
     int n_gr = in_f / 16;
-    int n_sp = n_gr / 96; if (n_sp < 1) n_sp = 1;
-    if (n_sp > 6) n_sp = 6;
     int wpb = 8;
     unsigned gx = (unsigned)(out_f / wpb);
-    dim3 grid(gx, (unsigned)n_sp);
     auto s0 = at::cuda::getCurrentCUDAStream();
-    gsq_gemv_kernel<<<grid, wpb * 32, 0, s0>>>(
+    gsq_gemv_kernel<<<gx, wpb * 32, 0, s0>>>(
         x, pk_codes.data_ptr<uint8_t>(), pk_cb.data_ptr<float>(),
         pk_s.data_ptr<uint8_t>(), (float)s_base, (float)s_step,
-        yf, n_gr, n_sp);
+        yf, n_gr);
 }
 
 __global__ void rmsnorm_kernel(const __nv_bfloat16* __restrict__ x,
