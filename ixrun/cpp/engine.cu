@@ -258,22 +258,23 @@ __global__ void rope_qk_kernel(__nv_bfloat16* q, __nv_bfloat16* k,
 // S=1 attention, one block per q-head. kv cache: bf16 [n_kv_heads][ctx][hd]
 __global__ void gqa_attn_kernel(
     const __nv_bfloat16* __restrict__ q,     // [n_heads, hd]
-    const __nv_bfloat16* __restrict__ kv,    // [n_kv_heads, ctx, hd]
+    const __nv_bfloat16* __restrict__ kv,    // [2*n_kv_heads, ctx, hd]
     __nv_bfloat16* __restrict__ out,         // [n_heads, hd]
     int pos, int n_heads, int n_kv_heads,
-    int head_dim, long long ctx) {
+    int head_dim, long long ctx, long long v_off) {
     int h = blockIdx.x;
     int kvh = n_kv_heads == n_heads ? h : h / (n_heads / n_kv_heads);
     int d0 = threadIdx.x;
     if (d0 >= head_dim) return;
+    const __nv_bfloat16* ksec = kv + kvh * ctx * head_dim;
+    const __nv_bfloat16* vsec = kv + v_off + kvh * ctx * head_dim;
     float inv_sqrt_hd = rsqrtf((float)head_dim);
     float maxs = -1e30f;
     for (int t = 0; t <= pos; ++t) {
         float s = 0.f;
         for (int d = 0; d < head_dim; ++d) {
             s += __bfloat162float(q[h * head_dim + d])
-               * __bfloat162float(kv[kvh * ctx * head_dim
-                                      + t * head_dim + d]);
+               * __bfloat162float(ksec[t * head_dim + d]);
         }
         s *= inv_sqrt_hd;
         if (s > maxs) maxs = s;
@@ -284,13 +285,132 @@ __global__ void gqa_attn_kernel(
         float s = 0.f;
         for (int d = 0; d < head_dim; ++d) {
             s += __bfloat162float(q[h * head_dim + d])
-               * __bfloat162float(kv[kvh * ctx * head_dim
-                                      + t * head_dim + d]);
+               * __bfloat162float(ksec[t * head_dim + d]);
         }
         s = expf(s * inv_sqrt_hd - maxs);
         denom += s;
-        sum += s * __bfloat162float(kv[kvh * ctx * head_dim
-                                       + t * head_dim + d0]);
+        sum += s * __bfloat162float(vsec[t * head_dim + d0]);
     }
     out[h * head_dim + d0] = __float2bfloat16(sum / denom);
+}
+// ---------------------------------------------------------------- //
+// C2: full decoder layer in one host call
+
+static torch::Tensor rmsn(torch::Tensor x, torch::Tensor w) {
+    int n = (int)x.numel();
+    auto out = torch::empty({n}, torch::dtype(torch::kBFloat16)
+                                     .device(x.device()));
+    rmsnorm_full<<<1, 256, 32 * sizeof(float)>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), n);
+    return out;
+}
+
+static torch::Tensor gsv(torch::Tensor x,
+                         torch::Tensor codes, torch::Tensor cb,
+                         torch::Tensor s8, double s_base, double s_step,
+                         int64_t out_f, int64_t in_f) {
+    auto yf = torch::zeros({out_f}, torch::dtype(torch::kFloat32)
+                                        .device(x.device()));
+    gsq_gemv_run(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+                 codes, cb, s8, s_base, s_step,
+                 yf.data_ptr<float>(), (int)out_f, (int)in_f);
+    return yf.to(torch::kBFloat16);
+}
+
+__global__ void add_kernel(const __nv_bfloat16* __restrict__ a,`n                           const __nv_bfloat16* __restrict__ b,`n                           __nv_bfloat16* __restrict__ out, int n);`n`n__global__ void cache_write_kernel(const __nv_bfloat16* __restrict__ src,
+                                   __nv_bfloat16* __restrict__ dst,
+                                   int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+
+torch::Tensor layer_forward(
+    torch::Tensor h, torch::Tensor in_nw, torch::Tensor post_nw,
+    torch::Tensor qc, torch::Tensor qcb, torch::Tensor qs,
+    double qb, double qst, int64_t qo, int64_t qi,
+    torch::Tensor kc, torch::Tensor kcb, torch::Tensor ks,
+    double kb, double kst, int64_t ko, int64_t ki,
+    torch::Tensor vc, torch::Tensor vcb, torch::Tensor vs,
+    double vb, double vst, int64_t vo, int64_t vi,
+    torch::Tensor oc, torch::Tensor ocb, torch::Tensor os8,
+    double ob, double ost, int64_t oo, int64_t oi,
+    torch::Tensor gc, torch::Tensor gcb, torch::Tensor gs8,
+    double gb, double gst, int64_t go, int64_t gi,
+    torch::Tensor uc, torch::Tensor ucb, torch::Tensor us8,
+    double ub, double ust, int64_t uo, int64_t ui,
+    torch::Tensor dc, torch::Tensor dcb, torch::Tensor ds8,
+    double db, double dst, int64_t dof, int64_t dif,
+    torch::Tensor kv_cache, int64_t pos, int64_t n_heads,
+    int64_t n_kv_heads, int64_t head_dim, int64_t ctx,
+    double theta_base)
+{
+    auto s0 = at::cuda::getCurrentCUDAStream();
+    auto xn = rmsn(h, in_nw);
+    auto q = gsv(xn, qc, qcb, qs, qb, qst, qo, qi);
+    auto k = gsv(xn, kc, kcb, ks, kb, kst, ko, ki);
+    auto v = gsv(xn, vc, vcb, vs, vb, vst, vo, vi);
+    int nh = (int)n_heads, hd = (int)head_dim;
+    rope_qk_kernel<<<nh, hd / 2, 0, s0>>>(
+        reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(k.data_ptr()),
+        (int)pos, nh, hd, (float)theta_base);
+    // write k/v into cache[kvh][pos]
+    int kvn = (int)n_kv_heads * hd;
+    for (int kvh = 0; kvh < (int)n_kv_heads; ++kvh) {
+        auto kdst = kv_cache.narrow(0, kvh, 1).narrow(1, pos, 1);
+        cache_write_kernel<<<(kvn + 255) / 256, 256, 0, s0>>>(
+            reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()) + kvh * hd,
+            reinterpret_cast<__nv_bfloat16*>(kdst.data_ptr()), hd);
+        cache_write_kernel<<<(kvn + 255) / 256, 256, 0, s0>>>(
+            reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()) + kvh * hd,
+            reinterpret_cast<__nv_bfloat16*>(
+                kv_cache.narrow(0, n_kv_heads + kvh, 1)
+                    .narrow(1, pos, 1).data_ptr()), hd);
+    }
+    auto attn = torch::empty({nh * hd},
+        torch::dtype(torch::kBFloat16).device(h.device()));
+    gqa_attn_kernel<<<nh, 256, 0, s0>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(attn.data_ptr()),
+        (int)pos, nh, (int)n_kv_heads, hd, ctx,`n        (long long)n_kv_heads * ctx * hd);
+    auto o = gsv(attn, oc, ocb, os8, ob, ost, oo, oi);
+    auto h1 = torch::empty_like(h);
+    {
+        // residual: h + o (bf16 add)
+        int n = (int)h.numel();
+        add_kernel<<<(n + 255) / 256, 256, 0, s0>>>(
+            reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(o.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(h1.data_ptr()), n);
+    }
+    auto xn2 = rmsn(h1, post_nw);
+    // mlp chain (same as mlp_forward body)
+    auto mg = gsv(xn2, gc, gcb, gs8, gb, gst, go, gi).to(torch::kFloat32);
+    auto mu = gsv(xn2, uc, ucb, us8, ub, ust, uo, ui).to(torch::kFloat32);
+    auto act = torch::empty({go}, torch::dtype(torch::kBFloat16)
+                                     .device(h.device()));
+    silu_mul_kernel<<<(go + 255) / 256, 256, 0, s0>>>(
+        mg.data_ptr<float>(), mu.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(act.data_ptr()), (int)go);
+    auto md = gsv(act, dc, dcb, ds8, db, dst, dof, dif);
+    auto h2 = torch::empty_like(h1);
+    add_kernel<<<((int)h1.numel() + 255) / 256, 256, 0, s0>>>(
+        reinterpret_cast<const __nv_bfloat16*>(h1.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(md.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(h2.data_ptr()),
+        (int)h1.numel());
+    return h2;
+}
+
+__global__ void add_kernel(const __nv_bfloat16* __restrict__ a,
+                           const __nv_bfloat16* __restrict__ b,
+                           __nv_bfloat16* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __float2bfloat16(__bfloat162float(a[i])
+                                  + __bfloat162float(b[i]));
+    }
 }
