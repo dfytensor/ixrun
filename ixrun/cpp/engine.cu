@@ -315,7 +315,7 @@ static torch::Tensor gsv(torch::Tensor x,
     gsq_gemv_run(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
                  codes, cb, s8, s_base, s_step,
                  yf.data_ptr<float>(), (int)out_f, (int)in_f);
-    return yf.to(torch::kBFloat16);
+    return yf;
 }
 
 __global__ void add_kernel(const __nv_bfloat16* __restrict__ a,
