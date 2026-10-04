@@ -7,7 +7,7 @@
 #include <cmath>
 
 __global__ void rope_qk_kernel(float* q, float* k, int pos,
-    int n_heads, int head_dim, float theta_base);
+    int n_heads, int n_kv_heads, int head_dim, float theta_base);
 __global__ void gqa_attn_kernel(const float* q,
     const __nv_bfloat16* kv, float* out, int pos, int n_heads,
     int n_kv_heads, int head_dim, long long ctx, long long v_off);
@@ -226,12 +226,14 @@ torch::Tensor rmsnorm_out(torch::Tensor x, torch::Tensor w) {
 }
 
 void rope_probe(torch::Tensor q, torch::Tensor k, int64_t pos,
-                int64_t n_heads, int64_t head_dim, double theta_base) {
+                int64_t n_heads, int64_t n_kv_heads, int64_t head_dim,
+                double theta_base) {
     auto s0 = at::cuda::getCurrentCUDAStream();
     rope_qk_kernel<<<(unsigned)n_heads, (unsigned)(head_dim / 2), 0,
                      s0>>>(
         q.data_ptr<float>(), k.data_ptr<float>(), (int)pos,
-        (int)n_heads, (int)head_dim, (float)theta_base);
+        (int)n_heads, (int)n_kv_heads, (int)head_dim,
+        (float)theta_base);
 }
 
 torch::Tensor attn_probe(torch::Tensor q, torch::Tensor kv,
@@ -269,8 +271,8 @@ torch::Tensor gsq_gemv_out(torch::Tensor x,
 // C2: RoPE + GQA S=1 attention + per-layer decode step
 
 __global__ void rope_qk_kernel(float* q, float* k,
-                               int pos, int n_heads, int head_dim,
-                               float theta_base) {
+                               int pos, int n_heads, int n_kv_heads,
+                               int head_dim, float theta_base) {
     int h = blockIdx.x;
     int i = threadIdx.x;                 // pairs: 2*i, 2*i+1
     if (i >= head_dim / 2) return;
@@ -282,10 +284,13 @@ __global__ void rope_qk_kernel(float* q, float* k,
     float q1 = q[off + 1];
     q[off] = q0 * c - q1 * s;
     q[off + 1] = q0 * s + q1 * c;
-    float k0 = k[off];
-    float k1 = k[off + 1];
-    k[off] = k0 * c - k1 * s;
-    k[off + 1] = k0 * s + k1 * c;
+    if (h < n_kv_heads) {                // k only has n_kv_heads rows!
+        int koff = h * head_dim + 2 * i;
+        float k0 = k[koff];
+        float k1 = k[koff + 1];
+        k[koff] = k0 * c - k1 * s;
+        k[koff + 1] = k0 * s + k1 * c;
+    }
 }
 
 // S=1 attention, one block per q-head. kv cache: bf16 [n_kv_heads][ctx][hd]
@@ -392,7 +397,7 @@ torch::Tensor layer_forward(
     int nh = (int)n_heads, hd = (int)head_dim;
     rope_qk_kernel<<<nh, hd / 2, 0, s0>>>(
         q.data_ptr<float>(), k.data_ptr<float>(),
-        (int)pos, nh, hd, (float)theta_base);
+        (int)pos, nh, (int)n_kv_heads, hd, (float)theta_base);
     // write k/v into cache[kvh][pos] (cache stays bf16)
     int kvn = (int)n_kv_heads * hd;
     auto k16 = k.to(torch::kBFloat16);

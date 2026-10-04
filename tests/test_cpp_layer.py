@@ -149,7 +149,7 @@ for pos in range(3):
                  bool(q1.float().isnan().any()),
                  k1.float().norm().item(),
                  bool(k1.float().isnan().any())), flush=True)
-        ext.rope_probe(q1, k1, 1, nh, hd, theta)
+        ext.rope_probe(q1, k1, 1, nh, nkv, hd, theta)
         print('S2 after rope: q nan=%s k nan=%s'
               % (bool(q1.float().isnan().any()),
                  bool(k1.float().isnan().any())), flush=True)

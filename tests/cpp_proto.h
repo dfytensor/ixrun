@@ -20,7 +20,8 @@ torch::Tensor layer_forward(
 
 torch::Tensor rmsnorm_out(torch::Tensor x, torch::Tensor w);
 void rope_probe(torch::Tensor q, torch::Tensor k, int64_t pos,
-                int64_t n_heads, int64_t head_dim, double theta_base);
+                int64_t n_heads, int64_t n_kv_heads, int64_t head_dim,
+                double theta_base);
 torch::Tensor attn_probe(torch::Tensor q, torch::Tensor kv,
                          int64_t pos, int64_t n_heads,
                          int64_t n_kv_heads, int64_t head_dim,
