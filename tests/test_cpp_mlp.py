@@ -34,7 +34,7 @@ torch::Tensor mlp_forward(torch::Tensor x, torch::Tensor norm_w,
                  torch::Tensor dc, torch::Tensor dcb, torch::Tensor ds,
                  double dbase, double dstep, int64_t dof, int64_t dif);
 '''
-ext = load_inline(name='ixrun_cpp_v1', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v2', cpp_sources=[proto],
                   cuda_sources=[src], functions=['mlp_forward'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],

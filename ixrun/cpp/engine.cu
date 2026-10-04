@@ -198,7 +198,6 @@ torch::Tensor mlp_forward(torch::Tensor x, torch::Tensor norm_w,
 
 __global__ void noop_kernel() {}
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("mlp_forward", &mlp_forward);
-    m.def("noop", []() { noop_kernel<<<1, 1>>>(); });
-}
+// NOTE: no PYBIND11_MODULE here - load_inline generates the binding
+// from cpp_sources declarations + functions=[...] (double definition
+// = LNK2005 PyInit / LNK1169).
