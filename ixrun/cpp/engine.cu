@@ -49,10 +49,13 @@ __global__ void gsq_gemv_kernel(
             int c = (int)((lo >> (5 * i)) & 0x1F);
             inner += cb[c] * __bfloat162float(x16[i]);
         }
+        int c12 = (int)(((lo >> 60)
+            | ((unsigned long long)d2 << 4)) & 0x1F);
+        inner += cb[c12] * __bfloat162float(x16[12]);
         #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            int c = (int)((d2 >> (5 * i)) & 0x1F);
-            inner += cb[c] * __bfloat162float(x16[12 + i]);
+        for (int i = 0; i < 3; ++i) {
+            int c = (int)((d2 >> (5 * i + 1)) & 0x1F);
+            inner += cb[c] * __bfloat162float(x16[13 + i]);
         }
         acc += inner * s;
     }
@@ -99,11 +102,14 @@ __global__ void rmsnorm_full(const __nv_bfloat16* __restrict__ x,
                              const __nv_bfloat16* __restrict__ w,
                              __nv_bfloat16* __restrict__ out, int n) {
     extern __shared__ float red[];
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    float v = i < n ? __bfloat162float(x[i]) : 0.f;
-    float sq = v * v;
+    float sq = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = __bfloat162float(x[i]);
+        sq += v * v;
+    }
     if (threadIdx.x < 32) red[threadIdx.x] = 0.f;
     __syncthreads();
+    #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
         sq += __shfl_down_sync(0xffffffff, sq, off);
     }
@@ -117,7 +123,7 @@ __global__ void rmsnorm_full(const __nv_bfloat16* __restrict__ x,
         red[0] = t / (float)n;
     }
     __syncthreads();
-    if (i < n) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
         float inv = rsqrtf(red[0] + 1e-5f);
         out[i] = __float2bfloat16(
             __bfloat162float(x[i]) * inv * __bfloat162float(w[i]));

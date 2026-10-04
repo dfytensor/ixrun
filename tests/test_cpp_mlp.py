@@ -80,6 +80,19 @@ u = (h @ Wu.float().t())
 act = g / (1 + torch.exp(-g)) * u
 y_ref = act @ Wd.float().t()
 
+hn0 = ext.rmsnorm_out(x, nw)
+h_ref = xr / torch.sqrt((xr * xr).mean() + 1e-5) * nw.float()
+r0 = ((hn0.float() - h_ref.float()).norm()
+      / h_ref.float().norm()).item()
+print(f'PRE  rmsnorm rel={r0:.4f}', flush=True)
+yg0 = ext.gsq_gemv_out(hn0, pk_g['codes5'].cuda(), pk_g['cb'].cuda(),
+                       pk_g['s_i8'].cuda(), pk_g['s_base'],
+                       pk_g['s_step'], pk_g['out_f'], pk_g['in_f'])
+g_ref = (h_ref @ Wg.float().t())
+r0b = ((yg0.float() - g_ref.float()).norm()
+       / g_ref.float().norm()).item()
+print(f'PRE  gate_gemv rel={r0b:.4f}', flush=True)
+
 y = ext.mlp_forward(x, nw,
                     pk_g['codes5'].cuda(), pk_g['cb'].cuda(),
                     pk_g['s_i8'].cuda(), pk_g['s_base'], pk_g['s_step'],
