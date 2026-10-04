@@ -93,15 +93,16 @@ class Bf16xlLinear(torch.nn.Module):
     def __init__(self, pk):
         super().__init__()
         self.pk = pk
-        self.pk['stream'] = pk['stream'].cuda()
-        self.pk['emax'] = pk['emax'].cuda()
+        for k in ('mant', 'delta', 'sgn', 'emax'):
+            self.pk[k] = pk[k].cuda()
         self.out_features = pk['out_f']
         self.in_features = pk['in_f']
 
     def _decode(self):
         from experiments.bf16xl_gemv_cuda.bf16xl_gemv_cuda import _load
         ext = _load()
-        return ext.decode(self.pk['stream'], self.pk['emax'],
+        return ext.decode(self.pk['mant'], self.pk['delta'],
+                          self.pk['sgn'], self.pk['emax'],
                           self.pk['out_f'], self.pk['in_f'],
                           self.pk['kg'])
 
