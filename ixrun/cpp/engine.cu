@@ -39,12 +39,14 @@ __global__ void gsq_gemv_kernel(
         uint32_t d1 = (uint32_t)p[4] | ((uint32_t)p[5] << 8)
             | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
         uint16_t d2 = (uint16_t)(p[8] | (p[9] << 8));
+        unsigned long long lo = (unsigned long long)d0
+            | ((unsigned long long)d1 << 32);
         float s = exp2f(s_base + (float)s_i8[gidx] * s_step);
         const __nv_bfloat16* x16 = x + jb * 16;
         float inner = 0.f;
         #pragma unroll
         for (int i = 0; i < 12; ++i) {
-            int c = (int)((d0 >> (5 * i)) & 0x1F);
+            int c = (int)((lo >> (5 * i)) & 0x1F);
             inner += cb[c] * __bfloat162float(x16[i]);
         }
         #pragma unroll
@@ -53,7 +55,6 @@ __global__ void gsq_gemv_kernel(
             inner += cb[c] * __bfloat162float(x16[12 + i]);
         }
         acc += inner * s;
-        (void)d1;
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -149,19 +150,25 @@ struct GsqP {
     int64_t out_f, in_f;
 };
 
-static void lin(const torch::Tensor& x_f32,
-                const GsqP& p, float* yf) {
+static void lin(const torch::Tensor& xb,
+                const torch::Tensor& codes, const torch::Tensor& cb,
+                const torch::Tensor& s8, double s_base, double s_step,
+                int64_t out_f, int64_t in_f, float* yf) {
     gsq_gemv_run(reinterpret_cast<const __nv_bfloat16*>(
-                     x_f32.data_ptr()),
-                 p.codes, p.cb, p.s, p.s_base, p.s_step,
-                 yf, (int)p.out_f, (int)p.in_f);
+                     xb.data_ptr()),
+                 codes, cb, s8, s_base, s_step,
+                 yf, (int)out_f, (int)in_f);
 }
 
 // full MLP: y = down( silu(gate(norm_x)) * up(norm_x) )
 // tensors: bf16 x [in], per-linear GSQ planes, norms.
-void mlp_forward(torch::Tensor x,
-                 torch::Tensor norm_w,
-                 GsqP gate, GsqP up, GsqP down) {
+torch::Tensor mlp_forward(torch::Tensor x, torch::Tensor norm_w,
+                 torch::Tensor gc, torch::Tensor gcb, torch::Tensor gs,
+                 double gb, double gst, int64_t go, int64_t gi,
+                 torch::Tensor uc, torch::Tensor ucb, torch::Tensor us,
+                 double ub, double ust, int64_t uo, int64_t ui,
+                 torch::Tensor dc, torch::Tensor dcb, torch::Tensor ds,
+                 double dbase, double dstep, int64_t dof, int64_t dif) {
     int in_f = (int)x.numel();
     auto xg = torch::empty({in_f},
         torch::dtype(torch::kBFloat16).device(x.device()));
@@ -170,13 +177,13 @@ void mlp_forward(torch::Tensor x,
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(norm_w.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(xg.data_ptr()), in_f);
-    int h = (int)gate.out_f;
+    int h = (int)go;
     auto gf = torch::empty({h}, torch::dtype(torch::kFloat32)
                                   .device(x.device()));
     auto uf = torch::empty({h}, torch::dtype(torch::kFloat32)
                                   .device(x.device()));
-    lin(xg, gate, gf.data_ptr<float>());
-    lin(xg, up, uf.data_ptr<float>());
+    lin(xg, gc, gcb, gs, gb, gst, go, gi, gf.data_ptr<float>());
+    lin(xg, uc, ucb, us, ub, ust, uo, ui, uf.data_ptr<float>());
     auto act = torch::empty({h}, torch::dtype(torch::kBFloat16)
                                    .device(x.device()));
     silu_mul_kernel<<<(h + 255) / 256, 256, 0, s0>>>(
@@ -184,7 +191,8 @@ void mlp_forward(torch::Tensor x,
         reinterpret_cast<__nv_bfloat16*>(act.data_ptr()), h);
     auto df32 = torch::empty({in_f}, torch::dtype(torch::kFloat32)
                                          .device(x.device()));
-    lin(act, down, df32.data_ptr<float>());
+    lin(act, dc, dcb, ds, dbase, dstep, dof, dif,
+        df32.data_ptr<float>());
     return df32.to(torch::kBFloat16);
 }
 
