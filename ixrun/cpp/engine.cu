@@ -230,3 +230,67 @@ torch::Tensor gsq_gemv_out(torch::Tensor x,
 // NOTE: no PYBIND11_MODULE here - load_inline generates the binding
 // from cpp_sources declarations + functions=[...] (double definition
 // = LNK2005 PyInit / LNK1169).
+
+// ---------------------------------------------------------------- //
+// C2: RoPE + GQA S=1 attention + per-layer decode step
+
+__global__ void rope_qk_kernel(__nv_bfloat16* q, __nv_bfloat16* k,
+                               int pos, int n_heads, int head_dim,
+                               float theta_base) {
+    int h = blockIdx.x;
+    int i = threadIdx.x;                 // pairs: 2*i, 2*i+1
+    if (i >= head_dim / 2) return;
+    float theta = pos / powf(theta_base,
+                             2.0f * i / (float)head_dim);
+    float c = cosf(theta), s = sinf(theta);
+    int off = h * head_dim + 2 * i;
+    float q0 = __bfloat162float(q[off]);
+    float q1 = __bfloat162float(q[off + 1]);
+    q[off] = __float2bfloat16(q0 * c - q1 * s);
+    q[off + 1] = __float2bfloat16(q0 * s + q1 * c);
+    float k0 = __bfloat162float(k[off]);
+    float k1 = __bfloat162float(k[off + 1]);
+    k[off] = __float2bfloat16(k0 * c - k1 * s);
+    k[off + 1] = __float2bfloat16(k0 * s + k1 * c);
+}
+
+.f; }
+// S=1 attention, one block per q-head. kv cache: bf16 [n_kv_heads][ctx][hd]
+__global__ void gqa_attn_kernel(
+    const __nv_bfloat16* __restrict__ q,     // [n_heads, hd]
+    const __nv_bfloat16* __restrict__ kv,    // [n_kv_heads, ctx, hd]
+    __nv_bfloat16* __restrict__ out,         // [n_heads, hd]
+    int pos, int n_heads, int n_kv_heads,
+    int head_dim, long long ctx) {
+    int h = blockIdx.x;
+    int kvh = n_kv_heads == n_heads ? h : h / (n_heads / n_kv_heads);
+    int d0 = threadIdx.x;
+    if (d0 >= head_dim) return;
+    float inv_sqrt_hd = rsqrtf((float)head_dim);
+    float maxs = -1e30f;
+    for (int t = 0; t <= pos; ++t) {
+        float s = 0.f;
+        for (int d = 0; d < head_dim; ++d) {
+            s += __bfloat162float(q[h * head_dim + d])
+               * __bfloat162float(kv[kvh * ctx * head_dim
+                                      + t * head_dim + d]);
+        }
+        s *= inv_sqrt_hd;
+        if (s > maxs) maxs = s;
+    }
+    float denom = 0.f;
+    float sum = 0.f;
+    for (int t = 0; t <= pos; ++t) {
+        float s = 0.f;
+        for (int d = 0; d < head_dim; ++d) {
+            s += __bfloat162float(q[h * head_dim + d])
+               * __bfloat162float(kv[kvh * ctx * head_dim
+                                      + t * head_dim + d]);
+        }
+        s = expf(s * inv_sqrt_hd - maxs);
+        denom += s;
+        sum += s * __bfloat162float(kv[kvh * ctx * head_dim
+                                       + t * head_dim + d0]);
+    }
+    out[h * head_dim + d0] = __float2bfloat16(sum / denom);
+}
