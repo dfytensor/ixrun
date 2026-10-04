@@ -198,6 +198,30 @@ torch::Tensor mlp_forward(torch::Tensor x, torch::Tensor norm_w,
 
 __global__ void noop_kernel() {}
 
+// stage probes for C1 numerical isolation
+torch::Tensor rmsnorm_out(torch::Tensor x, torch::Tensor w) {
+    int n = (int)x.numel();
+    auto out = torch::empty({n}, torch::dtype(torch::kBFloat16)
+                                     .device(x.device()));
+    rmsnorm_full<<<1, 256, 32 * sizeof(float)>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), n);
+    return out;
+}
+
+torch::Tensor gsq_gemv_out(torch::Tensor x,
+                           torch::Tensor codes, torch::Tensor cb,
+                           torch::Tensor s8, double s_base, double s_step,
+                           int64_t out_f, int64_t in_f) {
+    auto yf = torch::zeros({out_f}, torch::dtype(torch::kFloat32)
+                                        .device(x.device()));
+    gsq_gemv_run(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+                 codes, cb, s8, s_base, s_step,
+                 yf.data_ptr<float>(), (int)out_f, (int)in_f);
+    return yf.to(torch::kBFloat16);
+}
+
 // NOTE: no PYBIND11_MODULE here - load_inline generates the binding
 // from cpp_sources declarations + functions=[...] (double definition
 // = LNK2005 PyInit / LNK1169).

@@ -33,9 +33,14 @@ torch::Tensor mlp_forward(torch::Tensor x, torch::Tensor norm_w,
                  double ub, double ust, int64_t uo, int64_t ui,
                  torch::Tensor dc, torch::Tensor dcb, torch::Tensor ds,
                  double dbase, double dstep, int64_t dof, int64_t dif);
+torch::Tensor rmsnorm_out(torch::Tensor x, torch::Tensor w);
+torch::Tensor gsq_gemv_out(torch::Tensor x,
+                           torch::Tensor codes, torch::Tensor cb,
+                           torch::Tensor s8, double s_base, double s_step,
+                           int64_t out_f, int64_t in_f);
 '''
 ext = load_inline(name='ixrun_cpp_v2', cpp_sources=[proto],
-                  cuda_sources=[src], functions=['mlp_forward'],
+                  cuda_sources=[src], functions=['mlp_forward', 'rmsnorm_out', 'gsq_gemv_out'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
