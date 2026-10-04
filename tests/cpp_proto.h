@@ -17,3 +17,15 @@ torch::Tensor layer_forward(
     torch::Tensor kv_cache, int64_t pos, int64_t n_heads,
     int64_t n_kv_heads, int64_t head_dim, int64_t ctx,
     double theta_base);
+
+torch::Tensor rmsnorm_out(torch::Tensor x, torch::Tensor w);
+void rope_probe(torch::Tensor q, torch::Tensor k, int64_t pos,
+                int64_t n_heads, int64_t head_dim, double theta_base);
+torch::Tensor attn_probe(torch::Tensor q, torch::Tensor kv,
+                         int64_t pos, int64_t n_heads,
+                         int64_t n_kv_heads, int64_t head_dim,
+                         int64_t ctx, int64_t v_off);
+torch::Tensor gsq_gemv_out(torch::Tensor x,
+                   torch::Tensor codes, torch::Tensor cb,
+                   torch::Tensor s8, double s_base, double s_step,
+                   int64_t out_f, int64_t in_f);

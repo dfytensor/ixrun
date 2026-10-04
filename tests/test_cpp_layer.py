@@ -38,7 +38,7 @@ W = {k: gs_decode_ref(pks[k]).cuda() for k in names}
 src = open(r'E:\IXRUN\ixrun\cpp\engine.cu', encoding='utf-8').read()
 proto = open(r'E:\IXRUN\tests\cpp_proto.h', encoding='utf-8').read()
 ext = load_inline(name='ixrun_cpp_v4', cpp_sources=[proto],
-                  cuda_sources=[src], functions=['layer_forward'],
+                  cuda_sources=[src], functions=['layer_forward', 'rmsnorm_out', 'gsq_gemv_out', 'rope_probe', 'attn_probe'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
@@ -84,7 +84,15 @@ def ref_layer(h, pos, kc, vc):
     u = xn2 @ W['u'].float().t()
     act = g / (1 + torch.exp(-g)) * u
     d = act @ W['d'].float().t()
-    return (h1 + d).to(torch.bfloat16)
+    y = (h1 + d).to(torch.bfloat16)
+    if pos == 0:
+        print('REF norms: h=%.3f o=%.3f h1=%.3f act=%.3f d=%.3f y=%.3f'
+              % (h.float().norm().item(), o.norm().item(),
+                 h1.norm().item(), act.norm().item(), d.norm().item(),
+                 y.float().norm().item()), flush=True)
+        print('REF y[:4] =', [round(v, 4) for v in y.float()[:4].tolist()],
+              flush=True)
+    return y
 
 
 def cpp_layer(h, pos, kc):
