@@ -400,12 +400,7 @@ torch::Tensor layer_forward(
         mg.data_ptr<float>(), mu.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(act.data_ptr()), (int)go);
     auto md = gsv(act, dc, dcb, ds8, db, dst, dof, dif);
-    auto h2 = torch::empty_like(h1);
-    add_kernel<<<((int)h1.numel() + 255) / 256, 256, 0, s0>>>(
-        reinterpret_cast<const __nv_bfloat16*>(h1.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(md.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(h2.data_ptr()),
-        (int)h1.numel());
+    auto h2 = (h1.to(torch::kFloat32) + md).to(torch::kBFloat16);
     return h2;
 }
 
