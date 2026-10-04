@@ -49,29 +49,9 @@ torch.manual_seed(0)
 x = (torch.randn(1536, device='cuda') * 0.5).to(torch.bfloat16)
 
 
-def dref(pk):
-    cb = pk['cb'].cuda()
-    nG = pk['s_i8'].numel()
-    lo = pk['codes5'][:, 0:8].long().cuda()
-    lo64 = (lo * (1 << (8 * torch.arange(8, device=lo.device)))).sum(1)
-    hi = pk['codes5'][:, 8:10].long().cuda()
-    hi16 = (hi * (1 << (8 * torch.arange(2, device=hi.device)))).sum(1)
-    codes = torch.empty(nG, 16, dtype=torch.long, device='cuda')
-    a12 = torch.arange(12, device='cuda')
-    codes[:, :12] = ((lo64[:, None] >> (5 * a12)) & 0x1F)
-    codes[:, 12] = ((lo64 >> 60) | (hi16 << 4)) & 0x1F
-    codes[:, 13] = (hi16 >> 1) & 0x1F
-    codes[:, 14] = (hi16 >> 6) & 0x1F
-    codes[:, 15] = (hi16 >> 11) & 0x1F
-    s = torch.pow(2.0, pk['s_base'] + pk['s_i8'].float().cuda()
-                  * pk['s_step'])
-    rec = (cb[codes.reshape(-1)]
-           * s.reshape(-1, 1).expand(-1, 16).reshape(-1))
-    return rec.reshape(pk['out_f'], pk['in_f'])
-
-
-Wg, Wu = dref(pk_g), dref(pk_u)
-Wd = dref(pk_d)
+from benchmarks.gsq_runtime import gs_decode_ref
+Wg, Wu = gs_decode_ref(pk_g).cuda(), gs_decode_ref(pk_u).cuda()
+Wd = gs_decode_ref(pk_d).cuda()
 nw = norm.weight.data.cuda()
 xr = x.float()
 h = xr / torch.sqrt((xr * xr).mean() + 1e-5) * nw.float()
