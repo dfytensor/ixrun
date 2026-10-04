@@ -254,7 +254,6 @@ __global__ void rope_qk_kernel(__nv_bfloat16* q, __nv_bfloat16* k,
     k[off + 1] = __float2bfloat16(k0 * s + k1 * c);
 }
 
-.f; }
 // S=1 attention, one block per q-head. kv cache: bf16 [n_kv_heads][ctx][hd]
 __global__ void gqa_attn_kernel(
     const __nv_bfloat16* __restrict__ q,     // [n_heads, hd]
@@ -319,7 +318,11 @@ static torch::Tensor gsv(torch::Tensor x,
     return yf.to(torch::kBFloat16);
 }
 
-__global__ void add_kernel(const __nv_bfloat16* __restrict__ a,`n                           const __nv_bfloat16* __restrict__ b,`n                           __nv_bfloat16* __restrict__ out, int n);`n`n__global__ void cache_write_kernel(const __nv_bfloat16* __restrict__ src,
+__global__ void add_kernel(const __nv_bfloat16* __restrict__ a,
+                           const __nv_bfloat16* __restrict__ b,
+                           __nv_bfloat16* __restrict__ out, int n);
+
+__global__ void cache_write_kernel(const __nv_bfloat16* __restrict__ src,
                                    __nv_bfloat16* __restrict__ dst,
                                    int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -375,7 +378,8 @@ torch::Tensor layer_forward(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(attn.data_ptr()),
-        (int)pos, nh, (int)n_kv_heads, hd, ctx,`n        (long long)n_kv_heads * ctx * hd);
+        (int)pos, nh, (int)n_kv_heads, hd, ctx,
+        (long long)n_kv_heads * ctx * hd);
     auto o = gsv(attn, oc, ocb, os8, ob, ost, oo, oi);
     auto h1 = torch::empty_like(h);
     {
