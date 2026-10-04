@@ -132,6 +132,32 @@ for pos in range(3):
     h = (torch.randn(H, device='cuda') * 0.3).to(torch.bfloat16)
     y_ref = ref_layer(h, pos, kc_ref[:nkv], kc_ref[nkv:])
     y_cpp = cpp_layer(h, pos, kc_cpp)
+    if pos == 1:
+        xn1 = ext.rmsnorm_out(h, inw)
+        q1 = ext.gsq_gemv_out(xn1, pks['q']['codes5'].cuda(),
+                              pks['q']['cb'].cuda(),
+                              pks['q']['s_i8'].cuda(),
+                              pks['q']['s_base'], pks['q']['s_step'],
+                              pks['q']['out_f'], pks['q']['in_f'])
+        k1 = ext.gsq_gemv_out(xn1, pks['k']['codes5'].cuda(),
+                              pks['k']['cb'].cuda(),
+                              pks['k']['s_i8'].cuda(),
+                              pks['k']['s_base'], pks['k']['s_step'],
+                              pks['k']['out_f'], pks['k']['in_f'])
+        print('S1 xn norm=%.3f q norm=%.3f nan=%s k norm=%.3f nan=%s'
+              % (xn1.float().norm().item(), q1.float().norm().item(),
+                 bool(q1.float().isnan().any()),
+                 k1.float().norm().item(),
+                 bool(k1.float().isnan().any())), flush=True)
+        ext.rope_probe(q1, k1, 1, nh, hd, theta)
+        print('S2 after rope: q nan=%s k nan=%s'
+              % (bool(q1.float().isnan().any()),
+                 bool(k1.float().isnan().any())), flush=True)
+        a1 = ext.attn_probe(q1, kc_cpp, 1, nh, nkv, hd, CTX,
+                            nkv * CTX * hd)
+        print('S3 attn norm=%.3f nan=%s'
+              % (a1.float().norm().item(),
+                 bool(a1.float().isnan().any())), flush=True)
     rel = ((y_cpp.float() - y_ref.float()).norm()
            / y_ref.float().norm()).item()
     cn = bool(y_cpp.float().isnan().any())
