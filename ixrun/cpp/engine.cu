@@ -351,9 +351,9 @@ torch::Tensor layer_forward(
 {
     auto s0 = at::cuda::getCurrentCUDAStream();
     auto xn = rmsn(h, in_nw);
-    auto q = gsv(xn, qc, qcb, qs, qb, qst, qo, qi);
-    auto k = gsv(xn, kc, kcb, ks, kb, kst, ko, ki);
-    auto v = gsv(xn, vc, vcb, vs, vb, vst, vo, vi);
+    auto q = gsv(xn, qc, qcb, qs, qb, qst, qo, qi).to(torch::kBFloat16);
+    auto k = gsv(xn, kc, kcb, ks, kb, kst, ko, ki).to(torch::kBFloat16);
+    auto v = gsv(xn, vc, vcb, vs, vb, vst, vo, vi).to(torch::kBFloat16);
     int nh = (int)n_heads, hd = (int)head_dim;
     rope_qk_kernel<<<nh, hd / 2, 0, s0>>>(
         reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
