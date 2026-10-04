@@ -52,7 +52,7 @@ def rms(x, w):
 def rope_ref(t, pos):
     t = t.reshape(-1, hd)
     d = torch.arange(0, hd, 2, device=t.device).float()
-    th = pos / (theta ** (2 * d / hd))
+    th = pos / (theta ** (d / hd))
     c, s = torch.cos(th), torch.sin(th)
     out = t.clone()
     out[:, 0::2] = t[:, 0::2] * c - t[:, 1::2] * s
