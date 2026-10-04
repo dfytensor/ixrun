@@ -68,67 +68,98 @@ def argmax_pack(pk, h):
     return int(yf.float().argmax().item())
 
 
-# reference: Python GSQ StepGraph greedy
 eng = StepGraphEngine.from_pretrained(codec='gsq', verbose=False)
-ref_ids = []
 out = eng.generate(tok.decode(tok(prompt_ids)), max_new_tokens=12)
-ref_enc = tok(out, return_tensors='pt').input_ids[0].tolist()
-print('py-gsq gen:', ref_enc[:12], flush=True)
+ref_ids = tok(out, return_tensors='pt').input_ids[0].tolist()
+print('py-gsq ref ids:', ref_ids[:12], flush=True)
 del eng
 torch.cuda.empty_cache()
 
-# C++ chain greedy
-h = m.model.embed_tokens.weight.data.cuda()[prompt_ids[0]] \
-    .clone()
-kc = torch.zeros(2 * nkv, CTX, hd, dtype=torch.bfloat16,
-                 device='cuda')
-gen = [prompt_ids[0]]
-for step in range(12):
-    pos = step if step == 0 else step + len(prompt_ids) - 1 \
-        if False else step
-    pos = step
-    hh = h
+embed_w = m.model.embed_tokens.weight.data.cuda()
+fn_w = sd['model.norm'].weight.data.cuda()
+lh_pk = gs_pack(targets[-1][1].weight.data.cuda())
+lh_pk['codes5'] = lh_pk['codes5'].cuda()
+lh_pk['cb'] = lh_pk['cb'].cuda()
+lh_pk['s_i8'] = lh_pk['s_i8'].cuda()
+for pk in pks:
+    for k in ('codes5', 'cb', 's_i8'):
+        pk[k] = pk[k].cuda()
+
+n_layers = len(targets) // 7
+
+
+def cpp_next(h, pos):
+    hh = h.clone()
     for l in range(n_layers):
-        base = l * 7
+        b = l * 7
         hh = ext.layer_forward(
             hh, in_ws[l], post_ws[l],
-            pks[base + 0]['codes5'].cuda(), pks[base + 0]['cb'].cuda(),
-            pks[base + 0]['s_i8'].cuda(), pks[base + 0]['s_base'],
-            pks[base + 0]['s_step'], pks[base + 0]['out_f'],
-            pks[base + 0]['in_f'],
-            pks[base + 1]['codes5'].cuda(), pks[base + 1]['cb'].cuda(),
-            pks[base + 1]['s_i8'].cuda(), pks[base + 1]['s_base'],
-            pks[base + 1]['s_step'], pks[base + 1]['out_f'],
-            pks[base + 1]['in_f'],
-            pks[base + 2]['codes5'].cuda(), pks[base + 2]['cb'].cuda(),
-            pks[base + 2]['s_i8'].cuda(), pks[base + 2]['s_base'],
-            pks[base + 2]['s_step'], pks[base + 2]['out_f'],
-            pks[base + 2]['in_f'],
-            pks[base + 3]['codes5'].cuda(), pks[base + 3]['cb'].cuda(),
-            pks[base + 3]['s_i8'].cuda(), pks[base + 3]['s_base'],
-            pks[base + 3]['s_step'], pks[base + 3]['out_f'],
-            pks[base + 3]['in_f'],
-            pks[base + 4]['codes5'].cuda(), pks[base + 4]['cb'].cuda(),
-            pks[base + 4]['s_i8'].cuda(), pks[base + 4]['s_base'],
-            pks[base + 4]['s_step'], pks[base + 4]['out_f'],
-            pks[base + 4]['in_f'],
-            pks[base + 5]['codes5'].cuda(), pks[base + 5]['cb'].cuda(),
-            pks[base + 5]['s_i8'].cuda(), pks[base + 5]['s_base'],
-            pks[base + 5]['s_step'], pks[base + 5]['out_f'],
-            pks[base + 5]['in_f'],
-            pks[base + 6]['codes5'].cuda(), pks[base + 6]['cb'].cuda(),
-            pks[base + 6]['s_i8'].cuda(), pks[base + 6]['s_base'],
-            pks[base + 6]['s_step'], pks[base + 6]['out_f'],
-            pks[base + 6]['in_f'],
+            pks[b + 0]['codes5'], pks[b + 0]['cb'], pks[b + 0]['s_i8'],
+            pks[b + 0]['s_base'], pks[b + 0]['s_step'],
+            pks[b + 0]['out_f'], pks[b + 0]['in_f'],
+            pks[b + 1]['codes5'], pks[b + 1]['cb'], pks[b + 1]['s_i8'],
+            pks[b + 1]['s_base'], pks[b + 1]['s_step'],
+            pks[b + 1]['out_f'], pks[b + 1]['in_f'],
+            pks[b + 2]['codes5'], pks[b + 2]['cb'], pks[b + 2]['s_i8'],
+            pks[b + 2]['s_base'], pks[b + 2]['s_step'],
+            pks[b + 2]['out_f'], pks[b + 2]['in_f'],
+            pks[b + 3]['codes5'], pks[b + 3]['cb'], pks[b + 3]['s_i8'],
+            pks[b + 3]['s_base'], pks[b + 3]['s_step'],
+            pks[b + 3]['out_f'], pks[b + 3]['in_f'],
+            pks[b + 4]['codes5'], pks[b + 4]['cb'], pks[b + 4]['s_i8'],
+            pks[b + 4]['s_base'], pks[b + 4]['s_step'],
+            pks[b + 4]['out_f'], pks[b + 4]['in_f'],
+            pks[b + 5]['codes5'], pks[b + 5]['cb'], pks[b + 5]['s_i8'],
+            pks[b + 5]['s_base'], pks[b + 5]['s_step'],
+            pks[b + 5]['out_f'], pks[b + 5]['in_f'],
+            pks[b + 6]['codes5'], pks[b + 6]['cb'], pks[b + 6]['s_i8'],
+            pks[b + 6]['s_base'], pks[b + 6]['s_step'],
+            pks[b + 6]['out_f'], pks[b + 6]['in_f'],
             kc, pos, nh, nkv, hd, CTX, theta)
-    fn = sd['model.norm'].weight.data.cuda()
-    hnf = ext.rmsnorm_out(hh, fn)
-    lh = targets[-1][1]
-    lh_pk = gs_pack(lh.weight.data.cuda())
-    nxt = argmax_pack(lh_pk, hnf)
+    hnf = ext.rmsnorm_out(hh, fn_w)
+    return argmax_pack(lh_pk, hnf)
+
+
+h = embed_w[prompt_ids].squeeze(0)
+for i, t in enumerate(prompt_ids):
+    h = embed_w[t].clone()
+    pos = i
+    hh = h
+    for l in range(n_layers):
+        b = l * 7
+        hh = ext.layer_forward(
+            hh, in_ws[l], post_ws[l],
+            pks[b + 0]['codes5'], pks[b + 0]['cb'], pks[b + 0]['s_i8'],
+            pks[b + 0]['s_base'], pks[b + 0]['s_step'],
+            pks[b + 0]['out_f'], pks[b + 0]['in_f'],
+            pks[b + 1]['codes5'], pks[b + 1]['cb'], pks[b + 1]['s_i8'],
+            pks[b + 1]['s_base'], pks[b + 1]['s_step'],
+            pks[b + 1]['out_f'], pks[b + 1]['in_f'],
+            pks[b + 2]['codes5'], pks[b + 2]['cb'], pks[b + 2]['s_i8'],
+            pks[b + 2]['s_base'], pks[b + 2]['s_step'],
+            pks[b + 2]['out_f'], pks[b + 2]['in_f'],
+            pks[b + 3]['codes5'], pks[b + 3]['cb'], pks[b + 3]['s_i8'],
+            pks[b + 3]['s_base'], pks[b + 3]['s_step'],
+            pks[b + 3]['out_f'], pks[b + 3]['in_f'],
+            pks[b + 4]['codes5'], pks[b + 4]['cb'], pks[b + 4]['s_i8'],
+            pks[b + 4]['s_base'], pks[b + 4]['s_step'],
+            pks[b + 4]['out_f'], pks[b + 4]['in_f'],
+            pks[b + 5]['codes5'], pks[b + 5]['cb'], pks[b + 5]['s_i8'],
+            pks[b + 5]['s_base'], pks[b + 5]['s_step'],
+            pks[b + 5]['out_f'], pks[b + 5]['in_f'],
+            pks[b + 6]['codes5'], pks[b + 6]['cb'], pks[b + 6]['s_i8'],
+            pks[b + 6]['s_base'], pks[b + 6]['s_step'],
+            pks[b + 6]['out_f'], pks[b + 6]['in_f'],
+            kc, pos, nh, nkv, hd, CTX, theta)
+gen = []
+hh = h
+for step in range(12):
+    pos = len(prompt_ids) + step - 1
+    nxt = cpp_next(hh, pos)
     gen.append(nxt)
-    h = m.model.embed_tokens.weight.data.cuda()[nxt].clone()
-    print(f'step {step}: tok {nxt}', flush=True)
-print('C++ gen tail:', gen[-8:], flush=True)
-print('MATCH window' if gen[1:9] == ref_enc[:8] else 'CHECK vs py-gsq',
-      flush=True)
+    hh = embed_w[nxt].clone()
+print('C++ gen ids:', gen, flush=True)
+print('py ref ids :', ref_ids[:12], flush=True)
+match = sum(1 for a, b in zip(gen, ref_ids) if a == b)
+print(f'token match: {match}/12', flush=True)
+print(tok.decode(gen), flush=True)
