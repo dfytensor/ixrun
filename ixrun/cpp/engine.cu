@@ -392,8 +392,8 @@ torch::Tensor layer_forward(
     }
     auto xn2 = rmsn(h1, post_nw);
     // mlp chain (same as mlp_forward body)
-    auto mg = gsv(xn2, gc, gcb, gs8, gb, gst, go, gi).to(torch::kFloat32);
-    auto mu = gsv(xn2, uc, ucb, us8, ub, ust, uo, ui).to(torch::kFloat32);
+    auto mg = gsv(xn2, gc, gcb, gs8, gb, gst, go, gi);
+    auto mu = gsv(xn2, uc, ucb, us8, ub, ust, uo, ui);
     auto act = torch::empty({go}, torch::dtype(torch::kBFloat16)
                                      .device(h.device()));
     silu_mul_kernel<<<(go + 255) / 256, 256, 0, s0>>>(
