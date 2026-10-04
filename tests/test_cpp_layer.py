@@ -126,6 +126,10 @@ for pos in range(3):
     y_cpp = cpp_layer(h, pos, kc_cpp)
     rel = ((y_cpp.float() - y_ref.float()).norm()
            / y_ref.float().norm()).item()
-    print(f'pos{pos} rel={rel:.4f}', flush=True)
+    cn = bool(y_cpp.float().isnan().any())
+    rn = bool(y_ref.float().isnan().any())
+    print('pos%d rel=%.4f cpp_nan=%s ref_nan=%s cpp[:3]=%s' % (
+        pos, rel, cn, rn,
+        [round(v, 3) for v in y_cpp.float()[:3].tolist()]), flush=True)
     ok &= rel < 0.05
 print('PASS' if ok else 'FAIL', flush=True)
