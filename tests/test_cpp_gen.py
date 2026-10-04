@@ -6,6 +6,7 @@ import sys
 sys.path.insert(0, r'E:\IXRUN')
 import pandas  # noqa: F401
 import torch
+from torch.utils.cpp_extension import load_inline
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from ixrun.config import MODEL_PATH, DATASET_CACHE
@@ -52,12 +53,11 @@ ext = load_inline(name='ixrun_cpp_v4', cpp_sources=[proto],
 
 n_layers = len(targets) // 7
 names = [n for n, _ in targets]
-in_ws = [sd[names[l * 7] .rsplit('.', 1)[0].rsplit('.', 1)[0]
-          + '.input_layernorm'].weight.data.cuda()
+lay = names[0].rsplit('.', 3)[0]
+in_ws = [sd[lay + '.%d.input_layernorm' % l].weight.data.cuda()
          for l in range(n_layers)]
-post_ws = [sd[names[l * 7 + 3].rsplit('.', 1)[0]
-            + '.post_attention_layernorm'].weight.data.cuda()
-           for l in range(n_layers)]
+post_ws = [sd[lay + '.%d.post_attention_layernorm' % l]
+           .weight.data.cuda() for l in range(n_layers)]
 print(f'{n_layers} layers', flush=True)
 
 
@@ -69,7 +69,7 @@ def argmax_pack(pk, h):
 
 
 eng = StepGraphEngine.from_pretrained(codec='gsq', verbose=False)
-out = eng.generate(tok.decode(tok(prompt_ids)), max_new_tokens=12)
+out = eng.generate(tok.decode(prompt_ids), max_new_tokens=12)
 ref_ids = tok(out, return_tensors='pt').input_ids[0].tolist()
 print('py-gsq ref ids:', ref_ids[:12], flush=True)
 del eng
@@ -77,7 +77,7 @@ torch.cuda.empty_cache()
 
 embed_w = m.model.embed_tokens.weight.data.cuda()
 fn_w = sd['model.norm'].weight.data.cuda()
-lh_pk = gs_pack(targets[-1][1].weight.data.cuda())
+lh_pk = pks[-1]
 lh_pk['codes5'] = lh_pk['codes5'].cuda()
 lh_pk['cb'] = lh_pk['cb'].cuda()
 lh_pk['s_i8'] = lh_pk['s_i8'].cuda()
@@ -88,7 +88,7 @@ for pk in pks:
 n_layers = len(targets) // 7
 
 
-def cpp_next(h, pos):
+def cpp_next(h, pos, kc):
     hh = h.clone()
     for l in range(n_layers):
         b = l * 7
@@ -120,11 +120,11 @@ def cpp_next(h, pos):
     return argmax_pack(lh_pk, hnf)
 
 
-h = embed_w[prompt_ids].squeeze(0)
+kc_cpp = torch.zeros(2 * nkv, CTX, hd, dtype=torch.bfloat16,
+                     device='cuda')
+hh = None
 for i, t in enumerate(prompt_ids):
-    h = embed_w[t].clone()
-    pos = i
-    hh = h
+    hh = embed_w[t].clone()
     for l in range(n_layers):
         b = l * 7
         hh = ext.layer_forward(
@@ -150,16 +150,17 @@ for i, t in enumerate(prompt_ids):
             pks[b + 6]['codes5'], pks[b + 6]['cb'], pks[b + 6]['s_i8'],
             pks[b + 6]['s_base'], pks[b + 6]['s_step'],
             pks[b + 6]['out_f'], pks[b + 6]['in_f'],
-            kc, pos, nh, nkv, hd, CTX, theta)
-gen = []
-hh = h
-for step in range(12):
+            kc_cpp, i, nh, nkv, hd, CTX, theta)
+hnm = ext.rmsnorm_out(hh, fn_w)
+nxt = argmax_pack(lh_pk, hnm)
+gen = [nxt]
+for step in range(1, 12):
     pos = len(prompt_ids) + step - 1
-    nxt = cpp_next(hh, pos)
-    gen.append(nxt)
     hh = embed_w[nxt].clone()
+    nxt = cpp_next(hh, pos, kc_cpp)
+    gen.append(nxt)
 print('C++ gen ids:', gen, flush=True)
 print('py ref ids :', ref_ids[:12], flush=True)
-match = sum(1 for a, b in zip(gen, ref_ids) if a == b)
+match = sum(1 for a, b in zip(gen, ref_ids[:12]) if a == b)
 print(f'token match: {match}/12', flush=True)
 print(tok.decode(gen), flush=True)
