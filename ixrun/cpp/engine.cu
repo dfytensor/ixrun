@@ -257,10 +257,11 @@ torch::Tensor gsq_gemv_out(torch::Tensor x,
                            int64_t out_f, int64_t in_f) {
     auto yf = torch::zeros({out_f}, torch::dtype(torch::kFloat32)
                                         .device(x.device()));
-    gsq_gemv_run(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+    auto xf = x.to(torch::kFloat32);
+    gsq_gemv_run(xf.data_ptr<float>(),
                  codes, cb, s8, s_base, s_step,
                  yf.data_ptr<float>(), (int)out_f, (int)in_f);
-    return yf.to(torch::kBFloat16);
+    return yf;
 }
 
 // NOTE: no PYBIND11_MODULE here - load_inline generates the binding
