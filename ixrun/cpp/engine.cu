@@ -54,7 +54,7 @@ __global__ void gsq_gemv_kernel(
         unsigned long long lo = (unsigned long long)d0
             | ((unsigned long long)d1 << 32);
         float s = exp2f(s_base + (float)s_i8[gidx] * s_step);
-        const __nv_bfloat16* x16 = x + jb * 16;
+        const float* x16 = x + jb * 16;
         float inner = 0.f;
         #pragma unroll
         for (int i = 0; i < 12; ++i) {
@@ -139,6 +139,37 @@ __global__ void rmsnorm_full(const __nv_bfloat16* __restrict__ x,
     }
 }
 
+__global__ void rmsnorm_full_f32(const __nv_bfloat16* __restrict__ x,
+                             const __nv_bfloat16* __restrict__ w,
+                             float* __restrict__ out, int n) {
+    extern __shared__ float red[];
+    float sq = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = __bfloat162float(x[i]);
+        sq += v * v;
+    }
+    if (threadIdx.x < 32) red[threadIdx.x] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sq += __shfl_down_sync(0xffffffff, sq, off);
+    }
+    if ((threadIdx.x & 31) == 0) red[(threadIdx.x >> 5) & 31] = sq;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int k = 0; k < (int)(blockDim.x >> 5) && k < 32; ++k) {
+            t += red[k];
+        }
+        red[0] = t / (float)n;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float inv = rsqrtf(red[0] + 1e-5f);
+        out[i] = __bfloat162float(x[i]) * inv * __bfloat162float(w[i]);
+    }
+}
+
 __global__ void silu_mul_kernel(const float* __restrict__ a,
                                 const float* __restrict__ b,
                                 float* __restrict__ out, int n) {
@@ -169,8 +200,7 @@ static void lin(const torch::Tensor& xb,
                 const torch::Tensor& codes, const torch::Tensor& cb,
                 const torch::Tensor& s8, double s_base, double s_step,
                 int64_t out_f, int64_t in_f, float* yf) {
-    gsq_gemv_run(reinterpret_cast<const __nv_bfloat16*>(
-                     xb.data_ptr()),
+    gsq_gemv_run(xb.to(torch::kFloat32).data_ptr<float>(),
                  codes, cb, s8, s_base, s_step,
                  yf, (int)out_f, (int)in_f);
 }
@@ -186,12 +216,12 @@ torch::Tensor mlp_forward(torch::Tensor x, torch::Tensor norm_w,
                  double dbase, double dstep, int64_t dof, int64_t dif) {
     int in_f = (int)x.numel();
     auto xg = torch::empty({in_f},
-        torch::dtype(torch::kBFloat16).device(x.device()));
+        torch::dtype(torch::kFloat32).device(x.device()));
     auto s0 = at::cuda::getCurrentCUDAStream();
-    rmsnorm_full<<<1, 256, 32 * sizeof(float)>>>(
+    rmsnorm_full_f32<<<1, 256, 32 * sizeof(float)>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(norm_w.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(xg.data_ptr()), in_f);
+        xg.data_ptr<float>(), in_f);
     int h = (int)go;
     auto gf = torch::empty({h}, torch::dtype(torch::kFloat32)
                                   .device(x.device()));
@@ -352,8 +382,8 @@ static torch::Tensor gsv(torch::Tensor x,
                          int64_t out_f, int64_t in_f) {
     auto yf = torch::zeros({out_f}, torch::dtype(torch::kFloat32)
                                         .device(x.device()));
-    auto xb = x.to(torch::kBFloat16);
-    gsq_gemv_run(reinterpret_cast<const __nv_bfloat16*>(xb.data_ptr()),
+    auto xb = x.to(torch::kFloat32);
+    gsq_gemv_run(xb.data_ptr<float>(),
                  codes, cb, s8, s_base, s_step,
                  yf.data_ptr<float>(), (int)out_f, (int)in_f);
     return yf;
