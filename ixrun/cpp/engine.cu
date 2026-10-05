@@ -27,7 +27,7 @@ __device__ __forceinline__ uint32_t ld_u32(const uint8_t* p) {
 }
 
 __global__ void gsq_gemv_kernel(
-    const __nv_bfloat16* __restrict__ x,
+    const float* __restrict__ x,
     const uint8_t* __restrict__ codes,   // [nR*nGr, 10]
     const float* __restrict__ cb,        // [32]
     const uint8_t* __restrict__ s_i8,    // [nR*nGr]
@@ -59,15 +59,15 @@ __global__ void gsq_gemv_kernel(
         #pragma unroll
         for (int i = 0; i < 12; ++i) {
             int c = (int)((lo >> (5 * i)) & 0x1F);
-            inner += cb_sm[c] * __bfloat162float(x16[i]);
+            inner += cb_sm[c] * x16[i];
         }
         int c12 = (int)(((lo >> 60)
             | ((unsigned long long)d2 << 4)) & 0x1F);
-        inner += cb_sm[c12] * __bfloat162float(x16[12]);
+        inner += cb_sm[c12] * x16[12];
         #pragma unroll
         for (int i = 0; i < 3; ++i) {
             int c = (int)((d2 >> (5 * i + 1)) & 0x1F);
-            inner += cb_sm[c] * __bfloat162float(x16[13 + i]);
+            inner += cb_sm[c] * x16[13 + i];
         }
         acc += inner * s;
     }
@@ -80,7 +80,7 @@ __global__ void gsq_gemv_kernel(
     }
 }
 
-static void gsq_gemv_run(const __nv_bfloat16* x,
+static void gsq_gemv_run(const float* x,
                          const torch::Tensor& pk_codes,
                          const torch::Tensor& pk_cb,
                          const torch::Tensor& pk_s,
