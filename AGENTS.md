@@ -207,3 +207,19 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   synthetic data favors per-tensor.
 
 - **NEW kernel variants MUST pass a bit-exact unit test before deployment** (per-group GMM: G=8 variant was never bit-exact-verified — it produced 27B text degeneration while G=16 was fine; severe VRAM paging did NOT corrupt text, so degeneration = numerical bug in the new variant). Rule: any new tl.constexpr configuration (GROUP/BK/R/T) gets a decode-vs-reference bit-exact check on real shapes before touching a model.
+
+## C++ engine (ixrun/cpp) - 2026/9 session
+- engine.cu: GSQ GEMV (bit-exact port) + rmsnorm_f32 + rope + GQA S=1 attn
+  + mlp_forward + layer_forward, all fp32-internal with bf16 boundaries.
+  VALIDATED: 3-position chain memcheck-CLEAN, pos rel 0.062/0.079/0.091
+  vs fp32 ref = GSQ inherent tier (bf16-activation + 5.5bpw), ACCEPTED.
+- Iron rules: load_inline cpp_sources MUST declare every bound fn (empty
+  = C2065); NO PYBIND11_MODULE in the .cu (load_inline generates it =
+  LNK2005 PyInit); extension kernels launch on getCurrentCUDAStream
+  (legacy stream silently escapes graph capture); after ANY kernel-sign
+  or layout change bump the extension name (stale cache poisons);
+  pack/ref roundtrip test BEFORE blaming the kernel (the "halved codes"
+  was a decode-side weight typo arange(5) vs (1<<ar5)); gs_pack lm_head
+  reuses pks[-1] (weights are zeroed after pack - never re-pack).
+- Open: token-level gen harness (test_cpp_gen.py, pos indexing + ref
+  window alignment), then C3 host-loop perf (target 250 tg128).
