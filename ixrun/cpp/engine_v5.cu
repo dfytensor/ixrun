@@ -191,9 +191,24 @@ __global__ void cache_write(const float* src,
     if (i < n) dst[i] = __float2bfloat16(src[i]);
 }
 
-// ---------------- layer_forward (one call per layer) ---------------- //
-// Uses a static buffer pool: first call allocates, subsequent calls reuse.
-// Zero per-call allocations after warmup (C3 optimization).
+// ---------------- helper kernels (graph-safe, no ATen) --------------- //
+__global__ void cast_bf16_f32(const __nv_bfloat16* src,
+                              float* dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __bfloat162float(src[i]);
+}
+__global__ void cast_f32_bf16(const float* src,
+                              __nv_bfloat16* dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2bfloat16(src[i]);
+}
+__global__ void add_f32(const float* a, const float* b,
+                        float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] + b[i];
+}
+
+// ---------------- layer_forward (graph-safe, all raw kernels) -------- //
 torch::Tensor layer_forward(
     torch::Tensor h,           // bf16 [hidden] — previous layer output
     torch::Tensor in_nw,       // bf16 [hidden] — input_layernorm weight
@@ -223,33 +238,41 @@ torch::Tensor layer_forward(
     // ---- static buffer pool (allocated once, reused across calls) ----
     static torch::Tensor b_xn, b_q, b_k, b_v, b_attn, b_o,
                          b_h1f, b_xn2, b_mg, b_mu, b_act, b_md,
-                         b_h1bf;
+                         b_h1bf, b_hf, b_out;
     static int pool_init = 0;
     if (!pool_init) {
         int H = (int)h.numel();
-        b_xn  = torch::empty({H},   torch::kFloat32).to(dev, true);
-        b_q   = torch::empty({qo},  torch::kFloat32).to(dev, true);
-        b_k   = torch::empty({ko},  torch::kFloat32).to(dev, true);
-        b_v   = torch::empty({vo},  torch::kFloat32).to(dev, true);
-        b_attn= torch::empty({qo},  torch::kFloat32).to(dev, true);
-        b_o   = torch::empty({oo},  torch::kFloat32).to(dev, true);
-        b_h1f = torch::empty({H},   torch::kFloat32).to(dev, true);
-        b_h1bf= torch::empty({H},   torch::kBFloat16).to(dev, true);
-        b_xn2 = torch::empty({H},   torch::kFloat32).to(dev, true);
-        b_mg  = torch::empty({go},  torch::kFloat32).to(dev, true);
-        b_mu  = torch::empty({uo},  torch::kFloat32).to(dev, true);
-        b_act = torch::empty({go},  torch::kFloat32).to(dev, true);
-        b_md  = torch::empty({dof}, torch::kFloat32).to(dev, true);
+        auto opts_f = torch::TensorOptions()
+                        .dtype(torch::kFloat32).device(dev);
+        auto opts_b = torch::TensorOptions()
+                        .dtype(torch::kBFloat16).device(dev);
+        b_xn  = torch::empty({H},   opts_f);
+        b_q   = torch::empty({(long)qo},  opts_f);
+        b_k   = torch::empty({(long)ko},  opts_f);
+        b_v   = torch::empty({(long)vo},  opts_f);
+        b_attn= torch::empty({(long)qo},  opts_f);
+        b_o   = torch::empty({(long)oo},  opts_f);
+        b_h1f = torch::empty({H},   opts_f);
+        b_hf  = torch::empty({H},   opts_f);
+        b_h1bf= torch::empty({H},   opts_b);
+        b_xn2 = torch::empty({H},   opts_f);
+        b_mg  = torch::empty({(long)go},  opts_f);
+        b_mu  = torch::empty({(long)uo},  opts_f);
+        b_act = torch::empty({(long)go},  opts_f);
+        b_md  = torch::empty({(long)dof}, opts_f);
+        b_out = torch::empty({H},   opts_b);
         pool_init = 1;
     }
+    int H_n = (int)h.numel();
+    int nblk = (H_n + 255) / 256;
 
-    // 1. input norm (bf16 h → fp32 xn) — write into b_xn
+    // 1. input norm
     rmsnorm_kernel<<<1, 256, 0, st>>>(
         reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(in_nw.data_ptr()),
-        b_xn.data_ptr<float>(), (int)h.numel());
+        b_xn.data_ptr<float>(), H_n);
 
-    // 2. q/k/v GEMVs — write into b_q/b_k/b_v
+    // 2. q/k/v GEMVs
     gsq_gemv_kernel<<<(unsigned)(qo / 8), 256, 0, st>>>(
         b_xn.data_ptr<float>(), qc.data_ptr<uint8_t>(),
         qcb.data_ptr<float>(), qs.data_ptr<uint8_t>(),
@@ -266,53 +289,56 @@ torch::Tensor layer_forward(
         (float)vb, (float)vst, b_v.data_ptr<float>(),
         (int)(vi / 16));
 
-    // 3. rope in-place on b_q/b_k
+    // 3. rope
     rope_kernel<<<(unsigned)n_heads, (unsigned)(hd/2), 0, st>>>(
         b_q.data_ptr<float>(), b_k.data_ptr<float>(),
         (int)pos, (int)n_heads, (int)n_kv_heads, hd, (float)theta);
 
-    // 4. cache write (fp32 b_k/b_v → bf16 cache)
+    // 4. cache write (direct pointer math, no narrow())
+    auto kv_base = reinterpret_cast<__nv_bfloat16*>(kv_cache.data_ptr());
     for (int kvh = 0; kvh < (int)n_kv_heads; ++kvh) {
         cache_write<<<1, hd, 0, st>>>(
             b_k.data_ptr<float>() + kvh * hd,
-            reinterpret_cast<__nv_bfloat16*>(
-                kv_cache.narrow(0, kvh, 1).narrow(1, pos, 1)
-                    .data_ptr()), hd);
+            kv_base + kvh * (int)ctx * hd + (int)pos * hd, hd);
         cache_write<<<1, hd, 0, st>>>(
             b_v.data_ptr<float>() + kvh * hd,
-            reinterpret_cast<__nv_bfloat16*>(
-                kv_cache.narrow(0, n_kv_heads + kvh, 1)
-                    .narrow(1, pos, 1).data_ptr()), hd);
+            kv_base + ((int)n_kv_heads + kvh) * (int)ctx * hd
+                + (int)pos * hd, hd);
     }
 
-    // 5. attention (fp32 b_q, bf16 cache → fp32 b_attn)
+    // 5. attention
     attn_kernel<<<(unsigned)n_heads, (unsigned)hd, 0, st>>>(
         b_q.data_ptr<float>(),
         reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr()),
         b_attn.data_ptr<float>(), (int)pos,
         (int)n_heads, (int)n_kv_heads, hd, (int)ctx);
 
-    // 6. o_proj (fp32 b_attn → fp32 b_o)
+    // 6. o_proj
     gsq_gemv_kernel<<<(unsigned)(oo / 8), 256, 0, st>>>(
         b_attn.data_ptr<float>(), oc.data_ptr<uint8_t>(),
         ocb.data_ptr<float>(), os8.data_ptr<uint8_t>(),
         (float)ob, (float)ost, b_o.data_ptr<float>(),
         (int)(oi / 16));
 
-    // 7. residual: b_h1f = h.float() + b_o (element-wise add)
-    {
-        auto hf = h.to(torch::kFloat32);
-        at::add_out(b_h1f, hf, b_o);
-    }
+    // 7. residual: b_h1f = h_f32 + b_o (raw kernels)
+    cast_bf16_f32<<<nblk, 256, 0, st>>>(
+        reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()),
+        b_hf.data_ptr<float>(), H_n);
+    add_f32<<<nblk, 256, 0, st>>>(
+        b_hf.data_ptr<float>(), b_o.data_ptr<float>(),
+        b_h1f.data_ptr<float>(), H_n);
 
-    // 8. post norm: need bf16 copy of b_h1f first
-    b_h1bf.copy_(b_h1f);
+    // 8. post norm: bf16 copy of b_h1f → rmsnorm
+    cast_f32_bf16<<<nblk, 256, 0, st>>>(
+        b_h1f.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(b_h1bf.data_ptr()),
+        H_n);
     rmsnorm_kernel<<<1, 256, 0, st>>>(
         reinterpret_cast<const __nv_bfloat16*>(b_h1bf.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(post_nw.data_ptr()),
-        b_xn2.data_ptr<float>(), (int)h.numel());
+        b_xn2.data_ptr<float>(), H_n);
 
-    // 9. gate/up GEMVs
+    // 9-10. gate/up + silu
     gsq_gemv_kernel<<<(unsigned)(go / 8), 256, 0, st>>>(
         b_xn2.data_ptr<float>(), gc.data_ptr<uint8_t>(),
         gcb.data_ptr<float>(), gs8.data_ptr<uint8_t>(),
@@ -323,22 +349,26 @@ torch::Tensor layer_forward(
         ucb.data_ptr<float>(), us8.data_ptr<uint8_t>(),
         (float)ub, (float)ust, b_mu.data_ptr<float>(),
         (int)(ui / 16));
-
-    // 10. silu * up → b_act
     silu_kernel<<<(unsigned)((go + 255) / 256), 256, 0, st>>>(
         b_mg.data_ptr<float>(), b_mu.data_ptr<float>(),
         b_act.data_ptr<float>(), (int)go);
 
-    // 11. down GEMV → b_md
+    // 11. down GEMV
     gsq_gemv_kernel<<<(unsigned)(dof / 8), 256, 0, st>>>(
         b_act.data_ptr<float>(), dc.data_ptr<uint8_t>(),
         dcb.data_ptr<float>(), ds8.data_ptr<uint8_t>(),
         (float)db, (float)dst, b_md.data_ptr<float>(),
         (int)(dif / 16));
 
-    // 12. residual: result = (b_h1f + b_md).to(bf16)
-    b_h1f.add_(b_md);
-    return b_h1f.to(torch::kBFloat16);
+    // 12. residual: b_out = bf16(b_h1f + b_md) (in-place on b_h1f)
+    add_f32<<<nblk, 256, 0, st>>>(
+        b_h1f.data_ptr<float>(), b_md.data_ptr<float>(),
+        b_h1f.data_ptr<float>(), H_n);
+    cast_f32_bf16<<<nblk, 256, 0, st>>>(
+        b_h1f.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(b_out.data_ptr()), H_n);
+
+    return b_out;
 }
 
 // probe: rmsnorm exposed for final norm + lm_head chain
