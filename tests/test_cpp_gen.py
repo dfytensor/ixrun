@@ -23,7 +23,7 @@ H = cfg.hidden_size
 nh, nkv = cfg.num_attention_heads, cfg.num_key_value_heads
 hd = getattr(cfg, 'head_dim', H // nh)
 theta = float(getattr(cfg, 'rope_theta', 10000.0))
-CTX = 256
+CTX = 512
 
 sd = dict(m.named_modules())
 targets = list(iter_quantizable_linears(m))
@@ -77,7 +77,7 @@ torch.cuda.empty_cache()
 
 embed_w = m.model.embed_tokens.weight.data.cuda()
 fn_w = sd['model.norm'].weight.data.cuda()
-lh_pk = pks[-1]
+lh_pk = gs_pack(m.lm_head.weight.data.cuda())
 lh_pk['codes5'] = lh_pk['codes5'].cuda()
 lh_pk['cb'] = lh_pk['cb'].cuda()
 lh_pk['s_i8'] = lh_pk['s_i8'].cuda()
@@ -151,8 +151,8 @@ for i, t in enumerate(prompt_ids):
             pks[b + 6]['s_base'], pks[b + 6]['s_step'],
             pks[b + 6]['out_f'], pks[b + 6]['in_f'],
             kc_cpp, i, nh, nkv, hd, CTX, theta)
-hnm = ext.rmsnorm_out(hh, fn_w)
-nxt = argmax_pack(lh_pk, hnm)
+    hnm = ext.rmsnorm_out(hh, fn_w)
+    nxt = argmax_pack(lh_pk, hnm)
 gen = [nxt]
 for step in range(1, 12):
     pos = len(prompt_ids) + step - 1
