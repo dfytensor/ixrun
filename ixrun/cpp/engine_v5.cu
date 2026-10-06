@@ -111,21 +111,25 @@ static torch::Tensor rmsn(torch::Tensor x_bf16, torch::Tensor w_bf16) {
     return out;
 }
 
-// ---------------- rope (fp32 in-place, S=1) ---------------- //
+// ---------------- rope (fp32 in-place, rotate_half convention) ------ //
+// Llama/HF: rotate pairs (i, i+hd/2), NOT interleaved (2i, 2i+1)
 __global__ void rope_kernel(float* q, float* k,
                             int pos, int n_heads, int n_kv_heads,
                             int head_dim, float theta_base) {
     int h = blockIdx.x;
-    int i = threadIdx.x;
+    int i = threadIdx.x;  // i < hd/2
     if (i >= head_dim / 2) return;
     float th = pos / powf(theta_base, 2.0f*i / (float)head_dim);
     float c = cosf(th), s = sinf(th);
-    int off = h * head_dim + 2*i;
-    float q0=q[off], q1=q[off+1];
-    q[off] = q0*c - q1*s;  q[off+1] = q0*s + q1*c;
+    int base = h * head_dim;
+    // rotate_half: (base+i, base+i+hd/2)
+    int lo = base + i;
+    int hi = base + i + head_dim / 2;
+    float q0=q[lo], q1=q[hi];
+    q[lo] = q0*c - q1*s;  q[hi] = q0*s + q1*c;
     if (h < n_kv_heads) {
-        float k0=k[off], k1=k[off+1];
-        k[off] = k0*c - k1*s;  k[off+1] = k0*s + k1*c;
+        float k0=k[lo], k1=k[hi];
+        k[lo] = k0*c - k1*s;  k[hi] = k0*s + k1*c;
     }
 }
 
@@ -281,4 +285,19 @@ torch::Tensor layer_forward(
 
     // 12. residual: h2 = h1 + md → bf16
     return (h1 + md).to(torch::kBFloat16);
+}
+
+// probe: rmsnorm exposed for final norm + lm_head chain
+torch::Tensor rmsnorm_out(torch::Tensor x, torch::Tensor w) {
+    return rmsn(x, w);
+}
+
+// probe: raw gemv for lm_head
+torch::Tensor gemv_out(torch::Tensor x,
+                       torch::Tensor codes, torch::Tensor cb,
+                       torch::Tensor s_i8,
+                       double s_base, double s_step,
+                       int64_t out_f, int64_t in_f) {
+    return gsq_gemv(x, codes, cb, s_i8, s_base, s_step,
+                    out_f, in_f);
 }
