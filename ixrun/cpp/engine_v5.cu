@@ -553,6 +553,234 @@ int64_t generate_step(
     return tok_buf.item<int64_t>();
 }
 
+// ---------------- static-init generation (llama.cpp architecture) ------ //
+static bool g_init = false;
+static torch::Tensor g_embed, g_pos, g_fnw,
+                     g_lh_codes, g_lh_cb, g_lh_s;
+static double g_lh_base, g_lh_step, g_theta;
+static int64_t g_lh_out_f, g_lh_in_f, g_nheads, g_nkv, g_hd,
+               g_ctx, g_hidden;
+static std::vector<torch::Tensor> g_kcs, g_inws, g_postws,
+                                  g_codes, g_cbs, g_s;
+static std::vector<double> g_bases, g_steps;
+static std::vector<int64_t> g_outfs, g_infs;
+
+void init_model(
+    torch::Tensor embed_table, torch::Tensor pos_gpu,
+    std::vector<torch::Tensor> kv_caches,
+    std::vector<torch::Tensor> in_norms,
+    std::vector<torch::Tensor> post_norms,
+    torch::Tensor final_norm_w,
+    std::vector<torch::Tensor> codes,
+    std::vector<torch::Tensor> cbs,
+    std::vector<torch::Tensor> s_i8s,
+    std::vector<double> bases, std::vector<double> steps,
+    std::vector<int64_t> out_fs, std::vector<int64_t> in_fs,
+    torch::Tensor lh_codes, torch::Tensor lh_cb,
+    torch::Tensor lh_s, double lh_base, double lh_step,
+    int64_t lh_out_f, int64_t lh_in_f,
+    int64_t n_heads, int64_t n_kv_heads,
+    int64_t head_dim, int64_t ctx, double theta)
+{
+    g_embed = embed_table; g_pos = pos_gpu;
+    g_kcs = kv_caches; g_inws = in_norms; g_postws = post_norms;
+    g_fnw = final_norm_w;
+    g_codes = codes; g_cbs = cbs; g_s = s_i8s;
+    g_bases = bases; g_steps = steps;
+    g_outfs = out_fs; g_infs = in_fs;
+    g_lh_codes = lh_codes; g_lh_cb = lh_cb; g_lh_s = lh_s;
+    g_lh_base = lh_base; g_lh_step = lh_step;
+    g_lh_out_f = lh_out_f; g_lh_in_f = lh_in_f;
+    g_nheads = n_heads; g_nkv = n_kv_heads;
+    g_hd = head_dim; g_ctx = ctx; g_theta = theta;
+    g_hidden = in_norms[0].numel();
+    g_init = true;
+}
+
+int64_t step(int64_t token_id) {
+    if (!g_init) throw std::runtime_error("init_model not called");
+    auto st = at::cuda::getCurrentCUDAStream();
+
+    static torch::Tensor emb_buf, fn_buf, lg_buf, tok_buf;
+    if (!emb_buf.defined()) {
+        auto dev = g_embed.device();
+        emb_buf = torch::empty({g_hidden},
+            torch::TensorOptions().dtype(torch::kBFloat16)
+                .device(dev));
+        fn_buf = torch::empty({g_hidden},
+            torch::TensorOptions().dtype(torch::kFloat32)
+                .device(dev));
+        lg_buf = torch::empty({g_lh_out_f},
+            torch::TensorOptions().dtype(torch::kFloat32)
+                .device(dev));
+        tok_buf = torch::empty({1},
+            torch::TensorOptions().dtype(torch::kInt64)
+                .device(dev));
+    }
+
+    // embedding lookup
+    cudaMemcpyAsync(emb_buf.data_ptr(),
+        reinterpret_cast<const char*>(g_embed.data_ptr())
+            + token_id * g_hidden * 2,
+        g_hidden * 2, cudaMemcpyDeviceToDevice, st);
+
+    // set position
+    set_pos_kernel<<<1, 1, 0, st>>>(
+        reinterpret_cast<const int*>(g_pos.data_ptr()));
+
+    // 24 layers
+    auto h = emb_buf;
+    for (int l = 0; l < (int)g_kcs.size(); ++l) {
+        int b = l * 7;
+        h = layer_forward(
+            h, g_inws[l], g_postws[l],
+            g_codes[b], g_cbs[b], g_s[b],
+            g_bases[b], g_steps[b], g_outfs[b], g_infs[b],
+            g_codes[b+1], g_cbs[b+1], g_s[b+1],
+            g_bases[b+1], g_steps[b+1], g_outfs[b+1], g_infs[b+1],
+            g_codes[b+2], g_cbs[b+2], g_s[b+2],
+            g_bases[b+2], g_steps[b+2], g_outfs[b+2], g_infs[b+2],
+            g_codes[b+3], g_cbs[b+3], g_s[b+3],
+            g_bases[b+3], g_steps[b+3], g_outfs[b+3], g_infs[b+3],
+            g_codes[b+4], g_cbs[b+4], g_s[b+4],
+            g_bases[b+4], g_steps[b+4], g_outfs[b+4], g_infs[b+4],
+            g_codes[b+5], g_cbs[b+5], g_s[b+5],
+            g_bases[b+5], g_steps[b+5], g_outfs[b+5], g_infs[b+5],
+            g_codes[b+6], g_cbs[b+6], g_s[b+6],
+            g_bases[b+6], g_steps[b+6], g_outfs[b+6], g_infs[b+6],
+            g_kcs[l], g_nheads, g_nkv, g_hd, g_ctx, g_theta);
+    }
+
+    // final norm + lm_head + argmax
+    rmsnorm_kernel<<<1, 256, 0, st>>>(
+        reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(g_fnw.data_ptr()),
+        fn_buf.data_ptr<float>(), (int)g_hidden);
+    gsq_gemv_kernel<<<(unsigned)(g_lh_out_f / 8), 256, 0, st>>>(
+        fn_buf.data_ptr<float>(),
+        g_lh_codes.data_ptr<uint8_t>(),
+        g_lh_cb.data_ptr<float>(),
+        g_lh_s.data_ptr<uint8_t>(),
+        (float)g_lh_base, (float)g_lh_step,
+        lg_buf.data_ptr<float>(), (int)(g_lh_in_f / 16));
+    argmax_f32<<<1, 256, 0, st>>>(
+        lg_buf.data_ptr<float>(), (int)g_lh_out_f,
+        tok_buf.data_ptr<int64_t>());
+
+    return tok_buf.item<int64_t>();
+}
+
+// GPU-resident embedding lookup (no CPU sync for token_id)
+__global__ void pos_incr(int* pos) { (*pos)++; }
+
+__global__ void embed_lookup(const __nv_bfloat16* table,
+                             const int64_t* token,
+                             __nv_bfloat16* out, int hidden) {
+    int i = threadIdx.x;
+    if (i < hidden)
+        out[i] = table[token[0] * hidden + i];
+}
+
+// Batch generation: token stays on GPU, zero CPU sync per token
+std::vector<int64_t> generate_batch_fast(int64_t start_token,
+                                         int64_t n_tokens) {
+    if (!g_init) throw std::runtime_error("init_model not called");
+    auto st = at::cuda::getCurrentCUDAStream();
+    int nl = (int)g_kcs.size();
+
+    static torch::Tensor emb_buf, fn_buf, lg_buf,
+                           tok_gpu;
+    if (!emb_buf.defined()) {
+        auto dev = g_embed.device();
+        emb_buf = torch::empty({g_hidden},
+            torch::TensorOptions().dtype(torch::kBFloat16)
+                .device(dev));
+        fn_buf = torch::empty({g_hidden},
+            torch::TensorOptions().dtype(torch::kFloat32)
+                .device(dev));
+        lg_buf = torch::empty({g_lh_out_f},
+            torch::TensorOptions().dtype(torch::kFloat32)
+                .device(dev));
+        tok_gpu = torch::zeros({1},
+            torch::TensorOptions().dtype(torch::kInt64)
+                .device(dev));
+    }
+    tok_gpu.fill_(start_token);
+
+    for (int i = 0; i < (int)n_tokens; ++i) {
+        // increment position on GPU
+        pos_incr<<<1, 1, 0, st>>>(
+            reinterpret_cast<int*>(g_pos.data_ptr()));
+        // set device pos
+        set_pos_kernel<<<1, 1, 0, st>>>(
+            reinterpret_cast<const int*>(g_pos.data_ptr()));
+        // GPU-resident embedding lookup
+        embed_lookup<<<1, 256, 0, st>>>(
+            reinterpret_cast<const __nv_bfloat16*>(
+                g_embed.data_ptr()),
+            tok_gpu.data_ptr<int64_t>(),
+            reinterpret_cast<__nv_bfloat16*>(emb_buf.data_ptr()),
+            (int)g_hidden);
+        // 24 layers
+        auto h = emb_buf;
+        for (int l = 0; l < nl; ++l) {
+            int b = l * 7;
+            h = layer_forward(
+                h, g_inws[l], g_postws[l],
+                g_codes[b], g_cbs[b], g_s[b],
+                g_bases[b], g_steps[b], g_outfs[b], g_infs[b],
+                g_codes[b+1], g_cbs[b+1], g_s[b+1],
+                g_bases[b+1], g_steps[b+1],
+                g_outfs[b+1], g_infs[b+1],
+                g_codes[b+2], g_cbs[b+2], g_s[b+2],
+                g_bases[b+2], g_steps[b+2],
+                g_outfs[b+2], g_infs[b+2],
+                g_codes[b+3], g_cbs[b+3], g_s[b+3],
+                g_bases[b+3], g_steps[b+3],
+                g_outfs[b+3], g_infs[b+3],
+                g_codes[b+4], g_cbs[b+4], g_s[b+4],
+                g_bases[b+4], g_steps[b+4],
+                g_outfs[b+4], g_infs[b+4],
+                g_codes[b+5], g_cbs[b+5], g_s[b+5],
+                g_bases[b+5], g_steps[b+5],
+                g_outfs[b+5], g_infs[b+5],
+                g_codes[b+6], g_cbs[b+6], g_s[b+6],
+                g_bases[b+6], g_steps[b+6],
+                g_outfs[b+6], g_infs[b+6],
+                g_kcs[l], g_nheads, g_nkv, g_hd, g_ctx, g_theta);
+        }
+        // final norm + lm_head + argmax (all GPU)
+        rmsnorm_kernel<<<1, 256, 0, st>>>(
+            reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(
+                g_fnw.data_ptr()),
+            fn_buf.data_ptr<float>(), (int)g_hidden);
+        gsq_gemv_kernel<<<(unsigned)(g_lh_out_f / 8), 256, 0, st>>>(
+            fn_buf.data_ptr<float>(),
+            g_lh_codes.data_ptr<uint8_t>(),
+            g_lh_cb.data_ptr<float>(),
+            g_lh_s.data_ptr<uint8_t>(),
+            (float)g_lh_base, (float)g_lh_step,
+            lg_buf.data_ptr<float>(), (int)(g_lh_in_f / 16));
+        argmax_f32<<<1, 256, 0, st>>>(
+            lg_buf.data_ptr<float>(), (int)g_lh_out_f,
+            tok_gpu.data_ptr<int64_t>());
+    }
+    // SINGLE sync at the end: read final token
+    return {tok_gpu.item<int64_t>()};
+}
+
+std::vector<int64_t> generate_batch(int64_t start_token,
+                                    int64_t n_tokens) {
+    std::vector<int64_t> out;
+    int64_t tok = start_token;
+    for (int i = 0; i < (int)n_tokens; ++i) {
+        tok = step(tok);
+        out.push_back(tok);
+    }
+    return out;
+}
+
 static cudaGraphExec_t g_exec = nullptr;
 static cudaGraph_t g_graph = nullptr;
 static bool g_captured = false;
