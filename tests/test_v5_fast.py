@@ -65,16 +65,35 @@ void init_model(
     int64_t n_heads, int64_t n_kv_heads,
     int64_t head_dim, int64_t ctx, double theta);
 int64_t step(int64_t token_id);
+torch::Tensor decode_24(
+    torch::Tensor h_bf16, torch::Tensor pos_gpu,
+    std::vector<torch::Tensor> kv_caches,
+    std::vector<torch::Tensor> in_norms,
+    std::vector<torch::Tensor> post_norms,
+    std::vector<torch::Tensor> codes,
+    std::vector<torch::Tensor> cbs,
+    std::vector<torch::Tensor> s_i8s,
+    std::vector<double> bases, std::vector<double> steps,
+    std::vector<int64_t> out_fs, std::vector<int64_t> in_fs,
+    int64_t n_heads, int64_t n_kv_heads,
+    int64_t head_dim, int64_t ctx, double theta);
+torch::Tensor rmsnorm_out(torch::Tensor x, torch::Tensor w);
+torch::Tensor gemv_out(torch::Tensor x, torch::Tensor codes,
+    torch::Tensor cb, torch::Tensor s_i8,
+    double s_base, double s_step,
+    int64_t out_f, int64_t in_f);
 std::vector<int64_t> generate_batch(
     int64_t start_token, int64_t n_tokens);
 std::vector<int64_t> generate_batch_fast(
     int64_t start_token, int64_t n_tokens);
 '''
-ext = load_inline(name='ixrun_cpp_v5f', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v5j', cpp_sources=[proto],
                   cuda_sources=[src],
                   functions=['init_model', 'step',
                              'generate_batch',
-                             'generate_batch_fast'],
+                             'generate_batch_fast',
+                             'decode_24', 'rmsnorm_out',
+                             'gemv_out'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
@@ -118,16 +137,65 @@ t_pf = time.perf_counter() - t0
 print(f'prefill {len(prompt_ids)} tok in {t_pf:.2f}s '
       f'({len(prompt_ids)/t_pf:.1f} tok/s)', flush=True)
 
-# Generation (one int in, one int out)
-gen = [nxt]
+# --- PyTorch CUDA Graph wrapping C++ decode_24 (StepGraph architecture) ---
+# PyTorch handles WDDM memory pools; C++ handles 24-layer compute.
+# The key: decode_24's layer_forward uses STATIC buffers (no alloc after
+# warmup) + we update input/pos between replays via static Python tensors.
+
+static_input = torch.zeros(H, dtype=torch.bfloat16, device='cuda')
+graph_out = None
+
+# Warmup on side stream (initializes static buffers in layer_forward)
+s = torch.cuda.Stream()
+s.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(s):
+    for _ in range(3):
+        graph_out = ext.decode_24(static_input, pos_gpu, kcs,
+                                  in_ws, post_ws,
+                                  all_codes, all_cbs, all_s,
+                                  all_bases, all_steps,
+                                  all_out_f, all_in_f,
+                                  nh, nkv, hd, CTX, theta)
+torch.cuda.current_stream().wait_stream(s)
+
+# Capture with PyTorch CUDA graph
+g = torch.cuda.CUDAGraph()
+pos_gpu.fill_(256)
+with torch.cuda.graph(g):
+    graph_out = ext.decode_24(static_input, pos_gpu, kcs,
+                              in_ws, post_ws,
+                              all_codes, all_cbs, all_s,
+                              all_bases, all_steps,
+                              all_out_f, all_in_f,
+                              nh, nkv, hd, CTX, theta)
+print('pytorch CUDA graph captured!', flush=True)
+
+# Verify replay works with new input
+static_input.copy_(embed_w[nxt])
+pos_gpu.fill_(256)
+g.replay()
+torch.cuda.synchronize()
+print(f'graph out norm = {graph_out.float().norm().item():.4f}',
+      flush=True)
+
+# Benchmark: graph replay per token
+tokens = []
 t0 = time.perf_counter()
 for step_i in range(64):
     pos_gpu.fill_(len(prompt_ids) + step_i)
-    nxt = ext.step(nxt)
-    gen.append(nxt)
-t_gen = time.perf_counter() - t0
-print(f'gen 64 tok in {t_gen:.3f}s = {64/t_gen:.1f} tok/s', flush=True)
-print(f'text: {tok.decode(gen)}', flush=True)
+    g.replay()
+    torch.cuda.synchronize()
+    # argmax from graph output
+    hnm = ext.rmsnorm_out(graph_out, fn_w)
+    lg = ext.gemv_out(hnm, lh_pk['codes5'], lh_pk['cb'],
+                      lh_pk['s_i8'], lh_pk['s_base'],
+                      lh_pk['s_step'], lh_pk['out_f'], lh_pk['in_f'])
+    nxt2 = int(lg.float().argmax().item())
+    tokens.append(nxt2)
+    static_input.copy_(embed_w[nxt2])
+t_g = time.perf_counter() - t0
+print(f'py-graph 64 tok in {t_g:.3f}s = {64/t_g:.1f} tok/s', flush=True)
+print(f'text: {tok.decode(tokens)}', flush=True)
 
 # Batch mode fast (GPU-resident token, zero per-token sync)
 pos_gpu.fill_(len(prompt_ids))
