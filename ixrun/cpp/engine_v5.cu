@@ -446,7 +446,113 @@ torch::Tensor decode_24(
     return h;
 }
 
-// ---------------- CUDA Graph capture + replay -------------------------- //
+// device-side argmax (single-block reduction over logits)
+__global__ void argmax_f32(const float* logits, int n,
+                           int64_t* out) {
+    __shared__ float s_val[256];
+    __shared__ int s_idx[256];
+    int i = threadIdx.x;
+    float v = (i < n) ? logits[i] : -1e30f;
+    s_val[i] = v; s_idx[i] = i;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (i < off) {
+            if (s_val[i + off] > s_val[i]) {
+                s_val[i] = s_val[i + off];
+                s_idx[i] = s_idx[i + off];
+            }
+        }
+        __syncthreads();
+    }
+    if (i == 0) *out = (int64_t)s_idx[0];
+}
+
+// ---------------- full C++ generation step (zero Python per token) ---- //
+// Does: embedding lookup → 24 layers → final norm → lm_head → argmax
+// Returns next token_id. Python calls this once per token.
+int64_t generate_step(
+    int64_t token_id,
+    torch::Tensor embed_table,     // [vocab, hidden] bf16
+    torch::Tensor pos_gpu,         // [1] int32
+    std::vector<torch::Tensor> kv_caches,
+    std::vector<torch::Tensor> in_norms,
+    std::vector<torch::Tensor> post_norms,
+    std::vector<torch::Tensor> fn_w,   // [hidden] bf16 final norm
+    std::vector<torch::Tensor> codes,
+    std::vector<torch::Tensor> cbs,
+    std::vector<torch::Tensor> s_i8s,
+    std::vector<double> bases,
+    std::vector<double> steps,
+    std::vector<int64_t> out_fs,
+    std::vector<int64_t> in_fs,
+    // lm_head pack
+    torch::Tensor lh_codes, torch::Tensor lh_cb,
+    torch::Tensor lh_s, double lh_base, double lh_step,
+    int64_t lh_out_f, int64_t lh_in_f,
+    int64_t n_heads, int64_t n_kv_heads,
+    int64_t head_dim, int64_t ctx, double theta,
+    int64_t hidden)
+{
+    auto st = at::cuda::getCurrentCUDAStream();
+
+    // 1. embedding lookup: copy row token_id from embed_table
+    static torch::Tensor emb_buf;
+    if (!emb_buf.defined()) {
+        emb_buf = torch::empty({hidden},
+            torch::TensorOptions().dtype(torch::kBFloat16)
+                .device(embed_table.device()));
+    }
+    cudaMemcpyAsync(emb_buf.data_ptr(),
+        reinterpret_cast<const char*>(embed_table.data_ptr())
+            + token_id * hidden * 2,
+        hidden * 2, cudaMemcpyDeviceToDevice, st);
+
+    // 2. decode 24 layers
+    auto h = decode_24(emb_buf, pos_gpu, kv_caches, in_norms,
+                       post_norms, codes, cbs, s_i8s, bases,
+                       steps, out_fs, in_fs,
+                       n_heads, n_kv_heads, head_dim, ctx, theta);
+
+    // 3. final norm (bf16 in → fp32 out)
+    static torch::Tensor fn_buf;
+    if (!fn_buf.defined()) {
+        fn_buf = torch::empty({hidden},
+            torch::TensorOptions().dtype(torch::kFloat32)
+                .device(h.device()));
+    }
+    rmsnorm_kernel<<<1, 256, 0, st>>>(
+        reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(fn_w[0].data_ptr()),
+        fn_buf.data_ptr<float>(), (int)hidden);
+
+    // 4. lm_head GEMV
+    static torch::Tensor lg_buf;
+    if (!lg_buf.defined()) {
+        lg_buf = torch::empty({lh_out_f},
+            torch::TensorOptions().dtype(torch::kFloat32)
+                .device(h.device()));
+    }
+    gsq_gemv_kernel<<<(unsigned)(lh_out_f / 8), 256, 0, st>>>(
+        fn_buf.data_ptr<float>(), lh_codes.data_ptr<uint8_t>(),
+        lh_cb.data_ptr<float>(), lh_s.data_ptr<uint8_t>(),
+        (float)lh_base, (float)lh_step,
+        lg_buf.data_ptr<float>(), (int)(lh_in_f / 16));
+
+    // 5. argmax (device-side, single block reduction)
+    static torch::Tensor tok_buf;
+    if (!tok_buf.defined()) {
+        tok_buf = torch::empty({1},
+            torch::TensorOptions().dtype(torch::kInt64)
+                .device(h.device()));
+    }
+    argmax_f32<<<1, 256, 0, st>>>(
+        lg_buf.data_ptr<float>(), (int)lh_out_f,
+        tok_buf.data_ptr<int64_t>());
+
+    // 6. read result (one sync per token — unavoidable)
+    return tok_buf.item<int64_t>();
+}
+
 static cudaGraphExec_t g_exec = nullptr;
 static cudaGraph_t g_graph = nullptr;
 static bool g_captured = false;

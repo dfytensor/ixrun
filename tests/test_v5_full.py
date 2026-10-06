@@ -1,0 +1,130 @@
+# -*- coding: utf-8 -*-
+"""v5 full-C++ generation: single Python call per token."""
+import sys, time
+sys.path.insert(0, r'E:\IXRUN')
+import pandas  # noqa: F401
+import torch
+from torch.utils.cpp_extension import load_inline
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from ixrun.config import MODEL_PATH, DATASET_CACHE
+from ixrun.eval_utils import load_wikitext
+from ixrun.linear import iter_quantizable_linears
+from benchmarks.gsq_runtime import gs_pack
+
+m = AutoModelForCausalLM.from_pretrained(
+    MODEL_PATH, dtype=torch.bfloat16, trust_remote_code=True
+).eval().cuda()
+cfg = m.config
+H, nh = cfg.hidden_size, cfg.num_attention_heads
+nkv = cfg.num_key_value_heads
+hd = getattr(cfg, 'head_dim', H // nh)
+rs = getattr(cfg, 'rope_scaling', None) or {}
+theta = float(rs.get('rope_theta',
+                     getattr(cfg, 'rope_theta', 10000.0)))
+CTX = 512
+
+sd = dict(m.named_modules())
+targets = list(iter_quantizable_linears(m))
+names = [n for n, _ in targets]
+lay0 = names[0].rsplit('.', 3)[0]
+
+pks = []
+for name, mod in targets:
+    pk = gs_pack(mod.weight.data.cuda())
+    for k in ('codes5', 'cb', 's_i8'):
+        pk[k] = pk[k].cuda()
+    pks.append(pk)
+lh_pk = gs_pack(m.lm_head.weight.data.cuda())
+for k in ('codes5', 'cb', 's_i8'):
+    lh_pk[k] = lh_pk[k].cuda()
+embed_w = m.model.embed_tokens.weight.data.cuda()
+fn_w = sd['model.norm'].weight.data.cuda()
+in_ws = [sd[lay0 + f'.{l}.input_layernorm'].weight.data.cuda()
+         for l in range(24)]
+post_ws = [sd[lay0 + f'.{l}.post_attention_layernorm'].weight
+           .data.cuda() for l in range(24)]
+print(f'packed {len(pks)} + lm_head', flush=True)
+
+src = open(r'E:\IXRUN\ixrun\cpp\engine_v5.cu',
+           encoding='utf-8').read()
+proto = '''
+int64_t generate_step(
+    int64_t token_id, torch::Tensor embed_table,
+    torch::Tensor pos_gpu,
+    std::vector<torch::Tensor> kv_caches,
+    std::vector<torch::Tensor> in_norms,
+    std::vector<torch::Tensor> post_norms,
+    std::vector<torch::Tensor> fn_w,
+    std::vector<torch::Tensor> codes,
+    std::vector<torch::Tensor> cbs,
+    std::vector<torch::Tensor> s_i8s,
+    std::vector<double> bases, std::vector<double> steps,
+    std::vector<int64_t> out_fs, std::vector<int64_t> in_fs,
+    torch::Tensor lh_codes, torch::Tensor lh_cb,
+    torch::Tensor lh_s, double lh_base, double lh_step,
+    int64_t lh_out_f, int64_t lh_in_f,
+    int64_t n_heads, int64_t n_kv_heads,
+    int64_t head_dim, int64_t ctx, double theta,
+    int64_t hidden);
+'''
+ext = load_inline(name='ixrun_cpp_v5e', cpp_sources=[proto],
+                  cuda_sources=[src], functions=['generate_step'],
+                  extra_cuda_cflags=['-O3', '--use_fast_math',
+                                     '-allow-unsupported-compiler'],
+                  verbose=False)
+
+all_codes = [p['codes5'] for p in pks]
+all_cbs = [p['cb'] for p in pks]
+all_s = [p['s_i8'] for p in pks]
+all_bases = [p['s_base'] for p in pks]
+all_steps = [p['s_step'] for p in pks]
+all_out_f = [p['out_f'] for p in pks]
+all_in_f = [p['in_f'] for p in pks]
+
+tok = AutoTokenizer.from_pretrained(MODEL_PATH,
+                                    trust_remote_code=True)
+texts = load_wikitext(cache_dir=DATASET_CACHE)
+big = '\n'.join(texts)
+prompt_ids = tok(big[20000:21200],
+                 return_tensors='pt').input_ids[0, :256].cuda().tolist()
+print(f'prompt: {len(prompt_ids)} tokens', flush=True)
+
+pos_gpu = torch.zeros(1, dtype=torch.int32, device='cuda')
+kcs = [torch.zeros(2*nkv, CTX, hd, dtype=torch.bfloat16,
+                   device='cuda') for _ in range(24)]
+fn_w_list = [fn_w]
+
+# --- prefill (eager decode_24 via generate_step) ---
+t0 = time.perf_counter()
+nxt = prompt_ids[0]
+for i, t in enumerate(prompt_ids):
+    pos_gpu.fill_(i)
+    nxt = ext.generate_step(
+        t, embed_w, pos_gpu, kcs, in_ws, post_ws, fn_w_list,
+        all_codes, all_cbs, all_s, all_bases, all_steps,
+        all_out_f, all_in_f,
+        lh_pk['codes5'], lh_pk['cb'], lh_pk['s_i8'],
+        lh_pk['s_base'], lh_pk['s_step'],
+        lh_pk['out_f'], lh_pk['in_f'],
+        nh, nkv, hd, CTX, theta, H)
+t_pf = time.perf_counter() - t0
+print(f'prefill {len(prompt_ids)} tok in {t_pf:.2f}s '
+      f'({len(prompt_ids)/t_pf:.1f} tok/s)', flush=True)
+
+# --- generation ---
+gen = [nxt]
+t0 = time.perf_counter()
+for step in range(64):
+    pos_gpu.fill_(len(prompt_ids) + step)
+    nxt = ext.generate_step(
+        nxt, embed_w, pos_gpu, kcs, in_ws, post_ws, fn_w_list,
+        all_codes, all_cbs, all_s, all_bases, all_steps,
+        all_out_f, all_in_f,
+        lh_pk['codes5'], lh_pk['cb'], lh_pk['s_i8'],
+        lh_pk['s_base'], lh_pk['s_step'],
+        lh_pk['out_f'], lh_pk['in_f'],
+        nh, nkv, hd, CTX, theta, H)
+    gen.append(nxt)
+t_gen = time.perf_counter() - t0
+print(f'gen 64 tok in {t_gen:.3f}s = {64/t_gen:.1f} tok/s', flush=True)
+print(f'text: {tok.decode(gen)}', flush=True)
