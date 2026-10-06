@@ -90,7 +90,7 @@ std::vector<int64_t> generate_batch(
 std::vector<int64_t> generate_batch_fast(
     int64_t start_token, int64_t n_tokens);
 '''
-ext = load_inline(name='ixrun_cpp_v5k', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v5l', cpp_sources=[proto],
                   cuda_sources=[src],
                   functions=['init_model', 'step',
                              'generate_batch',
@@ -203,11 +203,17 @@ print(f'py-graph 64 tok in {t_g:.3f}s = {64/t_g:.1f} tok/s', flush=True)
 print(f'text: {tok.decode(tokens)}', flush=True)
 
 # --- FULL-GRAPH: step_graph in PyTorch CUDA graph, GPU-resident token ---
-# Warmup (init static buffers inside step_graph)
+# CRITICAL: delete the first graph to free capture resources
+del g
+torch.cuda.synchronize()
+torch.cuda.empty_cache()
+
+# Warmup step_graph (init static buffers inside)
 pos_gpu.fill_(256)
 s2 = torch.cuda.Stream()
 s2.wait_stream(torch.cuda.current_stream())
 with torch.cuda.stream(s2):
+    ext.set_start_token(nxt)
     for _ in range(3):
         ext.step_graph()
 torch.cuda.current_stream().wait_stream(s2)
