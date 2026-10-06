@@ -806,16 +806,9 @@ void step_graph() {
     }
     int nl = (int)g_kcs.size();
 
-    pos_incr<<<1, 1, 0, st>>>(
-        reinterpret_cast<int*>(g_pos.data_ptr()));
-    set_pos_kernel<<<1, 1, 0, st>>>(
-        reinterpret_cast<const int*>(g_pos.data_ptr()));
-    embed_lookup<<<1, (unsigned)g_hidden, 0, st>>>(
-        reinterpret_cast<const __nv_bfloat16*>(g_embed.data_ptr()),
-        g_tok_gpu.data_ptr<int64_t>(),
-        reinterpret_cast<__nv_bfloat16*>(g_emb_buf.data_ptr()),
-        (int)g_hidden);
-
+    // NO feedback loop: input is g_emb_buf (set from Python),
+    // output is g_tok_gpu (read from Python after replay).
+    // The 24 layers chain through layer_forward's static buffers.
     auto h = g_emb_buf;
     for (int l = 0; l < nl; ++l) {
         int b = l * 7;
@@ -853,9 +846,15 @@ void step_graph() {
         g_tok_gpu.data_ptr<int64_t>());
 }
 
+
 void set_start_token(int64_t token) {
     if (!g_bufs_init) step_graph();  // init buffers
     g_tok_gpu.fill_(token);
+}
+
+void set_input_embedding(torch::Tensor embedding) {
+    if (!g_bufs_init) step_graph();  // init buffers
+    g_emb_buf.copy_(embedding);
 }
 
 int64_t get_last_token() {

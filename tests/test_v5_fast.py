@@ -68,6 +68,7 @@ int64_t step(int64_t token_id);
 void step_graph();
 void set_start_token(int64_t token);
 int64_t get_last_token();
+void set_input_embedding(torch::Tensor embedding);
 torch::Tensor decode_24(
     torch::Tensor h_bf16, torch::Tensor pos_gpu,
     std::vector<torch::Tensor> kv_caches,
@@ -90,7 +91,7 @@ std::vector<int64_t> generate_batch(
 std::vector<int64_t> generate_batch_fast(
     int64_t start_token, int64_t n_tokens);
 '''
-ext = load_inline(name='ixrun_cpp_v5l', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v5o', cpp_sources=[proto],
                   cuda_sources=[src],
                   functions=['init_model', 'step',
                              'generate_batch',
@@ -98,7 +99,8 @@ ext = load_inline(name='ixrun_cpp_v5l', cpp_sources=[proto],
                              'decode_24', 'rmsnorm_out',
                              'gemv_out', 'step_graph',
                              'set_start_token',
-                             'get_last_token'],
+                             'get_last_token',
+                             'set_input_embedding'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
@@ -202,41 +204,44 @@ t_g = time.perf_counter() - t0
 print(f'py-graph 64 tok in {t_g:.3f}s = {64/t_g:.1f} tok/s', flush=True)
 print(f'text: {tok.decode(tokens)}', flush=True)
 
-# --- FULL-GRAPH: step_graph in PyTorch CUDA graph, GPU-resident token ---
-# CRITICAL: delete the first graph to free capture resources
+# --- FULL-GRAPH: 24 layers + norm + lm_head + argmax (no feedback loop) ---
 del g
 torch.cuda.synchronize()
 torch.cuda.empty_cache()
 
-# Warmup step_graph (init static buffers inside)
+# Initialize buffers on default stream
+ext.set_input_embedding(embed_w[nxt])
+torch.cuda.synchronize()
+
+# Warmup on side stream
 pos_gpu.fill_(256)
 s2 = torch.cuda.Stream()
 s2.wait_stream(torch.cuda.current_stream())
 with torch.cuda.stream(s2):
-    ext.set_start_token(nxt)
     for _ in range(3):
         ext.step_graph()
 torch.cuda.current_stream().wait_stream(s2)
 
-# Capture: the ENTIRE pipeline (embed→24layers→norm→lmhead→argmax→tok)
+# Capture
 g2 = torch.cuda.CUDAGraph()
 pos_gpu.fill_(256)
-ext.set_start_token(nxt)
+ext.set_input_embedding(embed_w[nxt])
+torch.cuda.synchronize()
 with torch.cuda.graph(g2):
     ext.step_graph()
-print('FULL graph captured (embed+24layers+lmhead+argmax)', flush=True)
+print('FULL graph captured!', flush=True)
 
-# Reset position and set start token for generation
-pos_gpu.fill_(len(prompt_ids))
-ext.set_start_token(nxt)
-
-# Generate: just graph.replay() per token — ZERO Python compute!
+# Generate: Python sets input embedding, graph does the rest
+gen_full = [nxt]
 t0 = time.perf_counter()
-for _ in range(64):
+for step_i in range(64):
+    pos_gpu.fill_(len(prompt_ids) + step_i)
     g2.replay()
-torch.cuda.synchronize()
+    torch.cuda.synchronize()
+    tok = ext.get_last_token()  # one sync read
+    gen_full.append(tok)
+    ext.set_input_embedding(embed_w[tok])  # set next input
 t_full = time.perf_counter() - t0
-last = ext.get_last_token()
 print(f'FULL-graph 64 tok in {t_full:.3f}s = '
       f'{64/t_full:.1f} tok/s', flush=True)
-print(f'last token: {last}', flush=True)
+print(f'text: {tok.decode(gen_full)}', flush=True)
