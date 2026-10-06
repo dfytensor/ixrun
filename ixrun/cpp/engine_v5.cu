@@ -192,99 +192,153 @@ __global__ void cache_write(const float* src,
 }
 
 // ---------------- layer_forward (one call per layer) ---------------- //
+// Uses a static buffer pool: first call allocates, subsequent calls reuse.
+// Zero per-call allocations after warmup (C3 optimization).
 torch::Tensor layer_forward(
     torch::Tensor h,           // bf16 [hidden] — previous layer output
     torch::Tensor in_nw,       // bf16 [hidden] — input_layernorm weight
     torch::Tensor post_nw,     // bf16 [hidden]
-    // q_proj pack
     torch::Tensor qc, torch::Tensor qcb, torch::Tensor qs,
     double qb, double qst, int64_t qo, int64_t qi,
-    // k_proj pack
     torch::Tensor kc, torch::Tensor kcb, torch::Tensor ks,
     double kb, double kst, int64_t ko, int64_t ki,
-    // v_proj pack
     torch::Tensor vc, torch::Tensor vcb, torch::Tensor vs,
     double vb, double vst, int64_t vo, int64_t vi,
-    // o_proj pack
     torch::Tensor oc, torch::Tensor ocb, torch::Tensor os8,
     double ob, double ost, int64_t oo, int64_t oi,
-    // gate pack
     torch::Tensor gc, torch::Tensor gcb, torch::Tensor gs8,
     double gb, double gst, int64_t go, int64_t gi,
-    // up pack
     torch::Tensor uc, torch::Tensor ucb, torch::Tensor us8,
     double ub, double ust, int64_t uo, int64_t ui,
-    // down pack
     torch::Tensor dc, torch::Tensor dcb, torch::Tensor ds8,
     double db, double dst, int64_t dof, int64_t dif,
-    // cache & dims
     torch::Tensor kv_cache, int64_t pos,
     int64_t n_heads, int64_t n_kv_heads,
     int64_t head_dim, int64_t ctx, double theta)
 {
     auto st = at::cuda::getCurrentCUDAStream();
     int hd = (int)head_dim;
+    auto dev = h.device();
 
-    // 1. input norm (bf16 h → fp32 xn)
-    auto xn = rmsn(h, in_nw);
-
-    // 2. q/k/v GEMVs (fp32 out)
-    auto q = gsq_gemv(xn, qc, qcb, qs, qb, qst, qo, qi);
-    auto k = gsq_gemv(xn, kc, kcb, ks, kb, kst, ko, ki);
-    auto v = gsq_gemv(xn, vc, vcb, vs, vb, vst, vo, vi);
-
-    // 3. rope in-place on fp32 q/k
-    rope_kernel<<<(unsigned)n_heads, (unsigned)(hd/2), 0, st>>>(
-        q.data_ptr<float>(), k.data_ptr<float>(),
-        (int)pos, (int)n_heads, (int)n_kv_heads, hd, (float)theta);
-
-    // 4. cache write (fp32 k/v → bf16 cache)
-    for (int kvh = 0; kvh < (int)n_kv_heads; ++kvh) {
-        auto kd = kv_cache.narrow(0, kvh, 1).narrow(1, pos, 1);
-        cache_write<<<1, hd, 0, st>>>(
-            k.data_ptr<float>() + kvh * hd,
-            reinterpret_cast<__nv_bfloat16*>(kd.data_ptr()), hd);
-        auto vd = kv_cache.narrow(0, n_kv_heads + kvh, 1)
-                     .narrow(1, pos, 1);
-        cache_write<<<1, hd, 0, st>>>(
-            v.data_ptr<float>() + kvh * hd,
-            reinterpret_cast<__nv_bfloat16*>(vd.data_ptr()), hd);
+    // ---- static buffer pool (allocated once, reused across calls) ----
+    static torch::Tensor b_xn, b_q, b_k, b_v, b_attn, b_o,
+                         b_h1f, b_xn2, b_mg, b_mu, b_act, b_md,
+                         b_h1bf;
+    static int pool_init = 0;
+    if (!pool_init) {
+        int H = (int)h.numel();
+        b_xn  = torch::empty({H},   torch::kFloat32).to(dev, true);
+        b_q   = torch::empty({qo},  torch::kFloat32).to(dev, true);
+        b_k   = torch::empty({ko},  torch::kFloat32).to(dev, true);
+        b_v   = torch::empty({vo},  torch::kFloat32).to(dev, true);
+        b_attn= torch::empty({qo},  torch::kFloat32).to(dev, true);
+        b_o   = torch::empty({oo},  torch::kFloat32).to(dev, true);
+        b_h1f = torch::empty({H},   torch::kFloat32).to(dev, true);
+        b_h1bf= torch::empty({H},   torch::kBFloat16).to(dev, true);
+        b_xn2 = torch::empty({H},   torch::kFloat32).to(dev, true);
+        b_mg  = torch::empty({go},  torch::kFloat32).to(dev, true);
+        b_mu  = torch::empty({uo},  torch::kFloat32).to(dev, true);
+        b_act = torch::empty({go},  torch::kFloat32).to(dev, true);
+        b_md  = torch::empty({dof}, torch::kFloat32).to(dev, true);
+        pool_init = 1;
     }
 
-    // 5. attention (fp32 q, bf16 cache → fp32 attn_out)
-    auto attn = torch::empty({n_heads * head_dim},
-        torch::dtype(torch::kFloat32).device(h.device()));
-    attn_kernel<<<(unsigned)n_heads, (unsigned)head_dim, 0, st>>>(
-        q.data_ptr<float>(),
+    // 1. input norm (bf16 h → fp32 xn) — write into b_xn
+    rmsnorm_kernel<<<1, 256, 0, st>>>(
+        reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(in_nw.data_ptr()),
+        b_xn.data_ptr<float>(), (int)h.numel());
+
+    // 2. q/k/v GEMVs — write into b_q/b_k/b_v
+    gsq_gemv_kernel<<<(unsigned)(qo / 8), 256, 0, st>>>(
+        b_xn.data_ptr<float>(), qc.data_ptr<uint8_t>(),
+        qcb.data_ptr<float>(), qs.data_ptr<uint8_t>(),
+        (float)qb, (float)qst, b_q.data_ptr<float>(),
+        (int)(qi / 16));
+    gsq_gemv_kernel<<<(unsigned)(ko / 8), 256, 0, st>>>(
+        b_xn.data_ptr<float>(), kc.data_ptr<uint8_t>(),
+        kcb.data_ptr<float>(), ks.data_ptr<uint8_t>(),
+        (float)kb, (float)kst, b_k.data_ptr<float>(),
+        (int)(ki / 16));
+    gsq_gemv_kernel<<<(unsigned)(vo / 8), 256, 0, st>>>(
+        b_xn.data_ptr<float>(), vc.data_ptr<uint8_t>(),
+        vcb.data_ptr<float>(), vs.data_ptr<uint8_t>(),
+        (float)vb, (float)vst, b_v.data_ptr<float>(),
+        (int)(vi / 16));
+
+    // 3. rope in-place on b_q/b_k
+    rope_kernel<<<(unsigned)n_heads, (unsigned)(hd/2), 0, st>>>(
+        b_q.data_ptr<float>(), b_k.data_ptr<float>(),
+        (int)pos, (int)n_heads, (int)n_kv_heads, hd, (float)theta);
+
+    // 4. cache write (fp32 b_k/b_v → bf16 cache)
+    for (int kvh = 0; kvh < (int)n_kv_heads; ++kvh) {
+        cache_write<<<1, hd, 0, st>>>(
+            b_k.data_ptr<float>() + kvh * hd,
+            reinterpret_cast<__nv_bfloat16*>(
+                kv_cache.narrow(0, kvh, 1).narrow(1, pos, 1)
+                    .data_ptr()), hd);
+        cache_write<<<1, hd, 0, st>>>(
+            b_v.data_ptr<float>() + kvh * hd,
+            reinterpret_cast<__nv_bfloat16*>(
+                kv_cache.narrow(0, n_kv_heads + kvh, 1)
+                    .narrow(1, pos, 1).data_ptr()), hd);
+    }
+
+    // 5. attention (fp32 b_q, bf16 cache → fp32 b_attn)
+    attn_kernel<<<(unsigned)n_heads, (unsigned)hd, 0, st>>>(
+        b_q.data_ptr<float>(),
         reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr()),
-        attn.data_ptr<float>(), (int)pos,
+        b_attn.data_ptr<float>(), (int)pos,
         (int)n_heads, (int)n_kv_heads, hd, (int)ctx);
 
-    // 6. o_proj (fp32 → fp32)
-    auto o = gsq_gemv(attn, oc, ocb, os8, ob, ost, oo, oi);
+    // 6. o_proj (fp32 b_attn → fp32 b_o)
+    gsq_gemv_kernel<<<(unsigned)(oo / 8), 256, 0, st>>>(
+        b_attn.data_ptr<float>(), oc.data_ptr<uint8_t>(),
+        ocb.data_ptr<float>(), os8.data_ptr<uint8_t>(),
+        (float)ob, (float)ost, b_o.data_ptr<float>(),
+        (int)(oi / 16));
 
-    // 7. residual: h1 = h + o (both cast to fp32)
-    auto h1 = h.to(torch::kFloat32) + o;
+    // 7. residual: b_h1f = h.float() + b_o (element-wise add)
+    {
+        auto hf = h.to(torch::kFloat32);
+        at::add_out(b_h1f, hf, b_o);
+    }
 
-    // 8. post norm (fp32 h1 → cast bf16 → fp32 xn2)
-    auto xn2 = rmsn(h1.to(torch::kBFloat16), post_nw);
+    // 8. post norm: need bf16 copy of b_h1f first
+    b_h1bf.copy_(b_h1f);
+    rmsnorm_kernel<<<1, 256, 0, st>>>(
+        reinterpret_cast<const __nv_bfloat16*>(b_h1bf.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(post_nw.data_ptr()),
+        b_xn2.data_ptr<float>(), (int)h.numel());
 
     // 9. gate/up GEMVs
-    auto mg = gsq_gemv(xn2, gc, gcb, gs8, gb, gst, go, gi);
-    auto mu = gsq_gemv(xn2, uc, ucb, us8, ub, ust, uo, ui);
+    gsq_gemv_kernel<<<(unsigned)(go / 8), 256, 0, st>>>(
+        b_xn2.data_ptr<float>(), gc.data_ptr<uint8_t>(),
+        gcb.data_ptr<float>(), gs8.data_ptr<uint8_t>(),
+        (float)gb, (float)gst, b_mg.data_ptr<float>(),
+        (int)(gi / 16));
+    gsq_gemv_kernel<<<(unsigned)(uo / 8), 256, 0, st>>>(
+        b_xn2.data_ptr<float>(), uc.data_ptr<uint8_t>(),
+        ucb.data_ptr<float>(), us8.data_ptr<uint8_t>(),
+        (float)ub, (float)ust, b_mu.data_ptr<float>(),
+        (int)(ui / 16));
 
-    // 10. silu * up
-    auto act = torch::empty({go},
-        torch::dtype(torch::kFloat32).device(h.device()));
-    silu_kernel<<<(unsigned)((go+255)/256), 256, 0, st>>>(
-        mg.data_ptr<float>(), mu.data_ptr<float>(),
-        act.data_ptr<float>(), (int)go);
+    // 10. silu * up → b_act
+    silu_kernel<<<(unsigned)((go + 255) / 256), 256, 0, st>>>(
+        b_mg.data_ptr<float>(), b_mu.data_ptr<float>(),
+        b_act.data_ptr<float>(), (int)go);
 
-    // 11. down GEMV
-    auto md = gsq_gemv(act, dc, dcb, ds8, db, dst, dof, dif);
+    // 11. down GEMV → b_md
+    gsq_gemv_kernel<<<(unsigned)(dof / 8), 256, 0, st>>>(
+        b_act.data_ptr<float>(), dc.data_ptr<uint8_t>(),
+        dcb.data_ptr<float>(), ds8.data_ptr<uint8_t>(),
+        (float)db, (float)dst, b_md.data_ptr<float>(),
+        (int)(dif / 16));
 
-    // 12. residual: h2 = h1 + md → bf16
-    return (h1 + md).to(torch::kBFloat16);
+    // 12. residual: result = (b_h1f + b_md).to(bf16)
+    b_h1f.add_(b_md);
+    return b_h1f.to(torch::kBFloat16);
 }
 
 // probe: rmsnorm exposed for final norm + lm_head chain
