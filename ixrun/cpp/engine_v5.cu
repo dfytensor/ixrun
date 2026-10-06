@@ -450,7 +450,8 @@ torch::Tensor decode_24(
 static cudaGraphExec_t g_exec = nullptr;
 static cudaGraph_t g_graph = nullptr;
 static bool g_captured = false;
-static torch::Tensor g_result;  // set by decode_24 (b_out from last layer)
+static torch::Tensor g_result;
+static torch::Tensor g_input;   // static input buffer (address baked in graph)
 
 void graph_capture(
     torch::Tensor h_bf16,
@@ -470,22 +471,32 @@ void graph_capture(
 {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-    // Warmup (initializes static buffers + compiles kernels)
-    auto r = decode_24(h_bf16, pos_gpu, kv_caches, in_norms,
-                       post_norms, codes, cbs, s_i8s, bases,
-                       steps, out_fs, in_fs,
-                       n_heads, n_kv_heads, head_dim, ctx, theta);
-    g_result = r;
+    // Create persistent input buffer (same address across all replays)
+    g_input = h_bf16.clone();
+
+    // Warmup (initializes static buffers, runs at current pos)
+    g_result = decode_24(g_input, pos_gpu, kv_caches, in_norms,
+                         post_norms, codes, cbs, s_i8s, bases,
+                         steps, out_fs, in_fs,
+                         n_heads, n_kv_heads, head_dim, ctx, theta);
     cudaStreamSynchronize(stream);
 
-    // Capture
+    // Capture (kernels reference g_input + pos_gpu at fixed addresses)
     cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-    decode_24(h_bf16, pos_gpu, kv_caches, in_norms, post_norms,
-              codes, cbs, s_i8s, bases, steps, out_fs, in_fs,
-              n_heads, n_kv_heads, head_dim, ctx, theta);
+    g_result = decode_24(g_input, pos_gpu, kv_caches, in_norms,
+                         post_norms, codes, cbs, s_i8s, bases,
+                         steps, out_fs, in_fs,
+                         n_heads, n_kv_heads, head_dim, ctx, theta);
     cudaStreamEndCapture(stream, &g_graph);
     cudaGraphInstantiate(&g_exec, g_graph, NULL, NULL, 0);
     g_captured = true;
+}
+
+void graph_set_input(torch::Tensor embedding) {
+    if (!g_captured || !g_input.defined()) {
+        throw std::runtime_error("graph not captured");
+    }
+    g_input.copy_(embedding);
 }
 
 torch::Tensor graph_replay() {
@@ -495,5 +506,5 @@ torch::Tensor graph_replay() {
     }
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     cudaGraphLaunch(g_exec, stream);
-    return g_result;  // static buffer written by the graph
+    return g_result;
 }

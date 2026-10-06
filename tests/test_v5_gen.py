@@ -61,6 +61,7 @@ void graph_capture(
     std::vector<int64_t> in_fs,
     int64_t n_heads, int64_t n_kv_heads,
     int64_t head_dim, int64_t ctx, double theta);
+void graph_set_input(torch::Tensor embedding);
 torch::Tensor graph_replay();
 torch::Tensor decode_24(
     torch::Tensor h_bf16, torch::Tensor pos_gpu,
@@ -104,7 +105,8 @@ ext = load_inline(name='ixrun_cpp_v5b', cpp_sources=[proto],
                   cuda_sources=[src],
                   functions=['layer_forward', 'rmsnorm_out',
                              'gemv_out', 'decode_24',
-                             'graph_capture', 'graph_replay'],
+                             'graph_capture', 'graph_set_input',
+                             'graph_replay'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
@@ -180,38 +182,36 @@ print(f'prefill {len(prompt_ids)} tok in {t_prefill:.2f}s '
       f'({len(prompt_ids)/t_prefill:.1f} tok/s)', flush=True)
 
 # --- CUDA graph capture + generation ---
-pos_gpu.fill_(256)  # next position after prefill
+# Save cache state (graph capture warmup pollutes it)
+cache_snapshots = [kc.clone() for kc in kcs]
+
+pos_gpu.fill_(256)
 ext.graph_capture(hh, pos_gpu, kcs, in_ws, post_ws,
                   all_codes, all_cbs, all_s,
                   all_bases, all_steps, all_out_f, all_in_f,
                   nh, nkv, hd, CTX, theta)
 print('graph captured', flush=True)
 
-# Warmup replay
-pos_gpu.fill_(256)
-ext.graph_replay()
-torch.cuda.synchronize()
+# Restore cache to post-prefill state
+for kc, snap in zip(kcs, cache_snapshots):
+    kc.copy_(snap)
+del cache_snapshots
+print('cache restored, graph ready', flush=True)
 
-t0 = time.time()
-nxt = argmax_lm(hh)
+# Generation with CUDA graph replay
+t0 = time.perf_counter()
+nxt = argmax_lm(hh)  # first token from prefill (eager, no graph needed)
 gen = [nxt]
 
-# For graph-based generation, we need to:
-# 1. Set the input (embedding of new token) in the static buffer
-# 2. Update pos_gpu
-# 3. Replay the graph
-# But the graph has the input h_bf16 baked at a fixed address.
-# We need a static input buffer. For now, use eager for gen.
 for step in range(1, 12):
-    pos_gpu.fill_(len(prompt_ids) + step - 1)
-    hh = embed_w[nxt].clone()
-    hh = ext.decode_24(hh, pos_gpu, kcs, in_ws, post_ws,
-                       all_codes, all_cbs, all_s,
-                       all_bases, all_steps, all_out_f, all_in_f,
-                       nh, nkv, hd, CTX, theta)
+    pos = len(prompt_ids) + step - 1
+    pos_gpu.fill_(pos)
+    ext.graph_set_input(embed_w[nxt])
+    hh = ext.graph_replay()
+    torch.cuda.synchronize()  # needed for argmax readback
     nxt = argmax_lm(hh)
     gen.append(nxt)
-t_gen = time.time() - t0
+t_gen = time.perf_counter() - t0
 print(f'gen 12 tok in {t_gen:.2f}s = {12/t_gen:.1f} tok/s', flush=True)
 print(f'C++ gen:    {gen}', flush=True)
 match = sum(1 for a, b_ in zip(gen, ref_ids) if a == b_)
