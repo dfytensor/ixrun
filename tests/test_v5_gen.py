@@ -208,7 +208,13 @@ for step in range(1, 12):
     pos_gpu.fill_(pos)
     ext.graph_set_input(embed_w[nxt])
     hh = ext.graph_replay()
-    torch.cuda.synchronize()  # needed for argmax readback
+    torch.cuda.synchronize()
+    if step <= 2:
+        in_n = embed_w[nxt].float().norm().item()
+        out_n = hh.float().norm().item()
+        out_nan = bool(hh.float().isnan().any())
+        print('  step%d: input_norm=%.4f out_norm=%.4f nan=%s'
+              % (step, in_n, out_n, out_nan), flush=True)
     nxt = argmax_lm(hh)
     gen.append(nxt)
 t_gen = time.perf_counter() - t0
