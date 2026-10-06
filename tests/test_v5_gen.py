@@ -185,8 +185,10 @@ print(f'prefill {len(prompt_ids)} tok in {t_prefill:.2f}s '
 # Save cache state (graph capture warmup pollutes it)
 cache_snapshots = [kc.clone() for kc in kcs]
 
+# Persistent input tensor — Python owns the address
+graph_input = hh.clone()  # same values as post-prefill hh
 pos_gpu.fill_(256)
-ext.graph_capture(hh, pos_gpu, kcs, in_ws, post_ws,
+ext.graph_capture(graph_input, pos_gpu, kcs, in_ws, post_ws,
                   all_codes, all_cbs, all_s,
                   all_bases, all_steps, all_out_f, all_in_f,
                   nh, nkv, hd, CTX, theta)
@@ -206,15 +208,14 @@ gen = [nxt]
 for step in range(1, 12):
     pos = len(prompt_ids) + step - 1
     pos_gpu.fill_(pos)
-    ext.graph_set_input(embed_w[nxt])
+    graph_input.copy_(embed_w[nxt])  # direct Python in-place update
     hh = ext.graph_replay()
     torch.cuda.synchronize()
     if step <= 2:
         in_n = embed_w[nxt].float().norm().item()
         out_n = hh.float().norm().item()
-        out_nan = bool(hh.float().isnan().any())
-        print('  step%d: input_norm=%.4f out_norm=%.4f nan=%s'
-              % (step, in_n, out_n, out_nan), flush=True)
+        print('  step%d: input_norm=%.4f out_norm=%.4f'
+              % (step, in_n, out_n), flush=True)
     nxt = argmax_lm(hh)
     gen.append(nxt)
 t_gen = time.perf_counter() - t0

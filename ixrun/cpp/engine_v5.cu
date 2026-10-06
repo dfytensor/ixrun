@@ -471,17 +471,18 @@ void graph_capture(
 {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-    // Create persistent input buffer (same address across all replays)
-    g_input = h_bf16.clone();
+    // Store REFERENCE (not clone) — Python owns the tensor and
+    // updates it in-place between replays. Address never changes.
+    g_input = h_bf16;
 
-    // Warmup (initializes static buffers, runs at current pos)
+    // Warmup (initializes static buffers)
     g_result = decode_24(g_input, pos_gpu, kv_caches, in_norms,
                          post_norms, codes, cbs, s_i8s, bases,
                          steps, out_fs, in_fs,
                          n_heads, n_kv_heads, head_dim, ctx, theta);
     cudaStreamSynchronize(stream);
 
-    // Capture (kernels reference g_input + pos_gpu at fixed addresses)
+    // Capture (same input address, same buffers)
     cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
     g_result = decode_24(g_input, pos_gpu, kv_caches, in_norms,
                          post_norms, codes, cbs, s_i8s, bases,
