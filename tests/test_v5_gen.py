@@ -47,6 +47,20 @@ print(f'packed {len(pks)} linears + lm_head', flush=True)
 src = open(r'E:\IXRUN\ixrun\cpp\engine_v5.cu',
            encoding='utf-8').read()
 proto = '''
+torch::Tensor decode_24(
+    torch::Tensor h_bf16,
+    std::vector<torch::Tensor> kv_caches,
+    std::vector<torch::Tensor> in_norms,
+    std::vector<torch::Tensor> post_norms,
+    std::vector<torch::Tensor> codes,
+    std::vector<torch::Tensor> cbs,
+    std::vector<torch::Tensor> s_i8s,
+    std::vector<double> bases,
+    std::vector<double> steps,
+    std::vector<int64_t> out_fs,
+    std::vector<int64_t> in_fs,
+    int64_t pos, int64_t n_heads, int64_t n_kv_heads,
+    int64_t head_dim, int64_t ctx, double theta);
 torch::Tensor layer_forward(
     torch::Tensor h, torch::Tensor in_nw, torch::Tensor post_nw,
     torch::Tensor qc, torch::Tensor qcb, torch::Tensor qs,
@@ -74,7 +88,7 @@ torch::Tensor gemv_out(torch::Tensor x, torch::Tensor codes,
 ext = load_inline(name='ixrun_cpp_v5b', cpp_sources=[proto],
                   cuda_sources=[src],
                   functions=['layer_forward', 'rmsnorm_out',
-                             'gemv_out'],
+                             'gemv_out', 'decode_24'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
@@ -123,14 +137,26 @@ print(f'py ref tail: {ref_ids}', flush=True)
 # C++ chain: prefill + gen (per-layer KV caches!)
 kcs = [torch.zeros(2*nkv, CTX, hd, dtype=torch.bfloat16,
                    device='cuda') for _ in range(24)]
+# pre-flatten pack args for decode_24
+all_codes = [p['codes5'] for p in pks]
+all_cbs = [p['cb'] for p in pks]
+all_s = [p['s_i8'] for p in pks]
+all_bases = [p['s_base'] for p in pks]
+all_steps = [p['s_step'] for p in pks]
+all_out_f = [p['out_f'] for p in pks]
+all_in_f = [p['in_f'] for p in pks]
+
 t0 = time.time()
 hh = None
 for i, t in enumerate(prompt_ids):
     hh = embed_w[t].clone()
-    for l in range(24):
-        hh = run_layer(hh, l, i, kcs[l])
+    hh = ext.decode_24(hh, kcs, in_ws, post_ws,
+                      all_codes, all_cbs, all_s,
+                      all_bases, all_steps, all_out_f, all_in_f,
+                      i, nh, nkv, hd, CTX, theta)
 t_prefill = time.time() - t0
-print(f'prefill {len(prompt_ids)} tok in {t_prefill:.2f}s', flush=True)
+print(f'prefill {len(prompt_ids)} tok in {t_prefill:.2f}s '
+      f'({len(prompt_ids)/t_prefill:.1f} tok/s)', flush=True)
 
 t0 = time.time()
 nxt = argmax_lm(hh)
@@ -138,8 +164,10 @@ gen = [nxt]
 for step in range(1, 12):
     pos = len(prompt_ids) + step - 1
     hh = embed_w[nxt].clone()
-    for l in range(24):
-        hh = run_layer(hh, l, pos, kcs[l])
+    hh = ext.decode_24(hh, kcs, in_ws, post_ws,
+                      all_codes, all_cbs, all_s,
+                      all_bases, all_steps, all_out_f, all_in_f,
+                      pos, nh, nkv, hd, CTX, theta)
     nxt = argmax_lm(hh)
     gen.append(nxt)
 t_gen = time.time() - t0

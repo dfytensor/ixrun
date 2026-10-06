@@ -301,3 +301,47 @@ torch::Tensor gemv_out(torch::Tensor x,
     return gsq_gemv(x, codes, cb, s_i8, s_base, s_step,
                     out_f, in_f);
 }
+
+// ---------------- C3: all-24-layers in one C++ call ------------------ //
+// Eliminates 24 Python→C++ round trips + pre-allocates intermediates.
+// kv_caches: [n_layers][2*nkv, ctx, hd] list of per-layer caches.
+torch::Tensor decode_24(
+    torch::Tensor h_bf16,
+    std::vector<torch::Tensor> kv_caches,
+    std::vector<torch::Tensor> in_norms,
+    std::vector<torch::Tensor> post_norms,
+    std::vector<torch::Tensor> codes,
+    std::vector<torch::Tensor> cbs,
+    std::vector<torch::Tensor> s_i8s,
+    std::vector<double> bases,
+    std::vector<double> steps,
+    std::vector<int64_t> out_fs,
+    std::vector<int64_t> in_fs,
+    int64_t pos, int64_t n_heads, int64_t n_kv_heads,
+    int64_t head_dim, int64_t ctx, double theta)
+{
+    int nl = (int)kv_caches.size();
+    auto h = h_bf16;
+    for (int l = 0; l < nl; ++l) {
+        int b = l * 7;
+        h = layer_forward(
+            h, in_norms[l], post_norms[l],
+            codes[b],   cbs[b],   s_i8s[b],
+            bases[b],   steps[b],   out_fs[b],   in_fs[b],
+            codes[b+1], cbs[b+1], s_i8s[b+1],
+            bases[b+1], steps[b+1], out_fs[b+1], in_fs[b+1],
+            codes[b+2], cbs[b+2], s_i8s[b+2],
+            bases[b+2], steps[b+2], out_fs[b+2], in_fs[b+2],
+            codes[b+3], cbs[b+3], s_i8s[b+3],
+            bases[b+3], steps[b+3], out_fs[b+3], in_fs[b+3],
+            codes[b+4], cbs[b+4], s_i8s[b+4],
+            bases[b+4], steps[b+4], out_fs[b+4], in_fs[b+4],
+            codes[b+5], cbs[b+5], s_i8s[b+5],
+            bases[b+5], steps[b+5], out_fs[b+5], in_fs[b+5],
+            codes[b+6], cbs[b+6], s_i8s[b+6],
+            bases[b+6], steps[b+6], out_fs[b+6], in_fs[b+6],
+            kv_caches[l], pos, n_heads, n_kv_heads,
+            head_dim, ctx, theta);
+    }
+    return h;
+}
