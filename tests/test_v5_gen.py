@@ -47,8 +47,8 @@ print(f'packed {len(pks)} linears + lm_head', flush=True)
 src = open(r'E:\IXRUN\ixrun\cpp\engine_v5.cu',
            encoding='utf-8').read()
 proto = '''
-torch::Tensor decode_24(
-    torch::Tensor h_bf16,
+void graph_capture(
+    torch::Tensor h_bf16, torch::Tensor pos_gpu,
     std::vector<torch::Tensor> kv_caches,
     std::vector<torch::Tensor> in_norms,
     std::vector<torch::Tensor> post_norms,
@@ -59,7 +59,22 @@ torch::Tensor decode_24(
     std::vector<double> steps,
     std::vector<int64_t> out_fs,
     std::vector<int64_t> in_fs,
-    int64_t pos, int64_t n_heads, int64_t n_kv_heads,
+    int64_t n_heads, int64_t n_kv_heads,
+    int64_t head_dim, int64_t ctx, double theta);
+torch::Tensor graph_replay();
+torch::Tensor decode_24(
+    torch::Tensor h_bf16, torch::Tensor pos_gpu,
+    std::vector<torch::Tensor> kv_caches,
+    std::vector<torch::Tensor> in_norms,
+    std::vector<torch::Tensor> post_norms,
+    std::vector<torch::Tensor> codes,
+    std::vector<torch::Tensor> cbs,
+    std::vector<torch::Tensor> s_i8s,
+    std::vector<double> bases,
+    std::vector<double> steps,
+    std::vector<int64_t> out_fs,
+    std::vector<int64_t> in_fs,
+    int64_t n_heads, int64_t n_kv_heads,
     int64_t head_dim, int64_t ctx, double theta);
 torch::Tensor layer_forward(
     torch::Tensor h, torch::Tensor in_nw, torch::Tensor post_nw,
@@ -77,7 +92,7 @@ torch::Tensor layer_forward(
     double ub, double ust, int64_t uo, int64_t ui,
     torch::Tensor dc, torch::Tensor dcb, torch::Tensor ds8,
     double db, double dst, int64_t dof, int64_t dif,
-    torch::Tensor kv_cache, int64_t pos,
+    torch::Tensor kv_cache,
     int64_t n_heads, int64_t n_kv_heads,
     int64_t head_dim, int64_t ctx, double theta);
 torch::Tensor rmsnorm_out(torch::Tensor x, torch::Tensor w);
@@ -88,7 +103,8 @@ torch::Tensor gemv_out(torch::Tensor x, torch::Tensor codes,
 ext = load_inline(name='ixrun_cpp_v5b', cpp_sources=[proto],
                   cuda_sources=[src],
                   functions=['layer_forward', 'rmsnorm_out',
-                             'gemv_out', 'decode_24'],
+                             'gemv_out', 'decode_24',
+                             'graph_capture', 'graph_replay'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
@@ -146,28 +162,53 @@ all_steps = [p['s_step'] for p in pks]
 all_out_f = [p['out_f'] for p in pks]
 all_in_f = [p['in_f'] for p in pks]
 
+# pos_gpu: int32 [1] tensor, updated between graph replays
+pos_gpu = torch.zeros(1, dtype=torch.int32, device='cuda')
+
+# --- prefill with eager decode_24 ---
 t0 = time.time()
 hh = None
 for i, t in enumerate(prompt_ids):
     hh = embed_w[t].clone()
-    hh = ext.decode_24(hh, kcs, in_ws, post_ws,
-                      all_codes, all_cbs, all_s,
-                      all_bases, all_steps, all_out_f, all_in_f,
-                      i, nh, nkv, hd, CTX, theta)
+    pos_gpu.fill_(i)
+    hh = ext.decode_24(hh, pos_gpu, kcs, in_ws, post_ws,
+                       all_codes, all_cbs, all_s,
+                       all_bases, all_steps, all_out_f, all_in_f,
+                       nh, nkv, hd, CTX, theta)
 t_prefill = time.time() - t0
 print(f'prefill {len(prompt_ids)} tok in {t_prefill:.2f}s '
       f'({len(prompt_ids)/t_prefill:.1f} tok/s)', flush=True)
 
+# --- CUDA graph capture + generation ---
+pos_gpu.fill_(256)  # next position after prefill
+ext.graph_capture(hh, pos_gpu, kcs, in_ws, post_ws,
+                  all_codes, all_cbs, all_s,
+                  all_bases, all_steps, all_out_f, all_in_f,
+                  nh, nkv, hd, CTX, theta)
+print('graph captured', flush=True)
+
+# Warmup replay
+pos_gpu.fill_(256)
+ext.graph_replay()
+torch.cuda.synchronize()
+
 t0 = time.time()
 nxt = argmax_lm(hh)
 gen = [nxt]
+
+# For graph-based generation, we need to:
+# 1. Set the input (embedding of new token) in the static buffer
+# 2. Update pos_gpu
+# 3. Replay the graph
+# But the graph has the input h_bf16 baked at a fixed address.
+# We need a static input buffer. For now, use eager for gen.
 for step in range(1, 12):
-    pos = len(prompt_ids) + step - 1
+    pos_gpu.fill_(len(prompt_ids) + step - 1)
     hh = embed_w[nxt].clone()
-    hh = ext.decode_24(hh, kcs, in_ws, post_ws,
-                      all_codes, all_cbs, all_s,
-                      all_bases, all_steps, all_out_f, all_in_f,
-                      pos, nh, nkv, hd, CTX, theta)
+    hh = ext.decode_24(hh, pos_gpu, kcs, in_ws, post_ws,
+                       all_codes, all_cbs, all_s,
+                       all_bases, all_steps, all_out_f, all_in_f,
+                       nh, nkv, hd, CTX, theta)
     nxt = argmax_lm(hh)
     gen.append(nxt)
 t_gen = time.time() - t0

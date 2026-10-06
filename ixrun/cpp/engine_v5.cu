@@ -8,6 +8,13 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cmath>
 
+// ---------------- device-side position (CUDA-graph parameterizable) --- //
+__device__ int d_pos = 0;
+
+__global__ void set_pos_kernel(const int* pos_gpu) {
+    d_pos = *pos_gpu;
+}
+
 // ---------------- GSQ GEMV (fp32 x, fp32 y) ---------------- //
 __global__ void gsq_gemv_kernel(
     const float* __restrict__ x,
@@ -111,14 +118,14 @@ static torch::Tensor rmsn(torch::Tensor x_bf16, torch::Tensor w_bf16) {
     return out;
 }
 
-// ---------------- rope (fp32 in-place, rotate_half convention) ------ //
-// Llama/HF: rotate pairs (i, i+hd/2), NOT interleaved (2i, 2i+1)
+// ---------------- rope (fp32 in-place, rotate_half, reads d_pos) ---- //
 __global__ void rope_kernel(float* q, float* k,
-                            int pos, int n_heads, int n_kv_heads,
+                            int n_heads, int n_kv_heads,
                             int head_dim, float theta_base) {
     int h = blockIdx.x;
-    int i = threadIdx.x;  // i < hd/2
+    int i = threadIdx.x;
     if (i >= head_dim / 2) return;
+    int pos = d_pos;
     float th = pos / powf(theta_base, 2.0f*i / (float)head_dim);
     float c = cosf(th), s = sinf(th);
     int base = h * head_dim;
@@ -136,12 +143,13 @@ __global__ void rope_kernel(float* q, float* k,
 // ---------------- attention (S=1, GQA) ---------------- //
 // kv_cache: bf16 [2*n_kv_heads, ctx, head_dim]
 __global__ void attn_kernel(
-    const float* __restrict__ q,          // [n_heads, hd]
-    const __nv_bfloat16* __restrict__ kv, // [2*nkv, ctx, hd]
-    float* __restrict__ out,              // [n_heads, hd]
-    int pos, int n_heads, int n_kv_heads,
+    const float* __restrict__ q,
+    const __nv_bfloat16* __restrict__ kv,
+    float* __restrict__ out,
+    int n_heads, int n_kv_heads,
     int head_dim, int ctx)
 {
+    int pos = d_pos;
     int h = blockIdx.x;
     int d = threadIdx.x;
     if (d >= head_dim) return;
@@ -185,10 +193,12 @@ __global__ void silu_kernel(const float* a, const float* b,
 }
 
 // ---------------- cache write (fp32 -> bf16) ---------------- //
+// cache_write: reads d_pos for destination offset (graph-safe)
 __global__ void cache_write(const float* src,
-                            __nv_bfloat16* dst, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __float2bfloat16(src[i]);
+                            __nv_bfloat16* dst_base, int hd) {
+    int i = threadIdx.x;
+    if (i < hd)
+        dst_base[d_pos * hd + i] = __float2bfloat16(src[i]);
 }
 
 // ---------------- helper kernels (graph-safe, no ATen) --------------- //
@@ -227,7 +237,7 @@ torch::Tensor layer_forward(
     double ub, double ust, int64_t uo, int64_t ui,
     torch::Tensor dc, torch::Tensor dcb, torch::Tensor ds8,
     double db, double dst, int64_t dof, int64_t dif,
-    torch::Tensor kv_cache, int64_t pos,
+    torch::Tensor kv_cache,
     int64_t n_heads, int64_t n_kv_heads,
     int64_t head_dim, int64_t ctx, double theta)
 {
@@ -289,28 +299,27 @@ torch::Tensor layer_forward(
         (float)vb, (float)vst, b_v.data_ptr<float>(),
         (int)(vi / 16));
 
-    // 3. rope
+    // 3. rope (reads d_pos)
     rope_kernel<<<(unsigned)n_heads, (unsigned)(hd/2), 0, st>>>(
         b_q.data_ptr<float>(), b_k.data_ptr<float>(),
-        (int)pos, (int)n_heads, (int)n_kv_heads, hd, (float)theta);
+        (int)n_heads, (int)n_kv_heads, hd, (float)theta);
 
-    // 4. cache write (direct pointer math, no narrow())
+    // 4. cache write (device-side pos via d_pos)
     auto kv_base = reinterpret_cast<__nv_bfloat16*>(kv_cache.data_ptr());
     for (int kvh = 0; kvh < (int)n_kv_heads; ++kvh) {
         cache_write<<<1, hd, 0, st>>>(
             b_k.data_ptr<float>() + kvh * hd,
-            kv_base + kvh * (int)ctx * hd + (int)pos * hd, hd);
+            kv_base + kvh * (int)ctx * hd, hd);
         cache_write<<<1, hd, 0, st>>>(
             b_v.data_ptr<float>() + kvh * hd,
-            kv_base + ((int)n_kv_heads + kvh) * (int)ctx * hd
-                + (int)pos * hd, hd);
+            kv_base + ((int)n_kv_heads + kvh) * (int)ctx * hd, hd);
     }
 
-    // 5. attention
+    // 5. attention (reads d_pos)
     attn_kernel<<<(unsigned)n_heads, (unsigned)hd, 0, st>>>(
         b_q.data_ptr<float>(),
         reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr()),
-        b_attn.data_ptr<float>(), (int)pos,
+        b_attn.data_ptr<float>(),
         (int)n_heads, (int)n_kv_heads, hd, (int)ctx);
 
     // 6. o_proj
@@ -391,6 +400,7 @@ torch::Tensor gemv_out(torch::Tensor x,
 // kv_caches: [n_layers][2*nkv, ctx, hd] list of per-layer caches.
 torch::Tensor decode_24(
     torch::Tensor h_bf16,
+    torch::Tensor pos_gpu,       // [1] int32 GPU tensor
     std::vector<torch::Tensor> kv_caches,
     std::vector<torch::Tensor> in_norms,
     std::vector<torch::Tensor> post_norms,
@@ -401,11 +411,17 @@ torch::Tensor decode_24(
     std::vector<double> steps,
     std::vector<int64_t> out_fs,
     std::vector<int64_t> in_fs,
-    int64_t pos, int64_t n_heads, int64_t n_kv_heads,
+    int64_t n_heads, int64_t n_kv_heads,
     int64_t head_dim, int64_t ctx, double theta)
 {
     int nl = (int)kv_caches.size();
     auto h = h_bf16;
+    auto st = at::cuda::getCurrentCUDAStream().stream();
+
+    // Update device-side position (graph-safe: pos_gpu is a fixed buffer)
+    set_pos_kernel<<<1, 1, 0, st>>>(
+        reinterpret_cast<const int*>(pos_gpu.data_ptr()));
+
     for (int l = 0; l < nl; ++l) {
         int b = l * 7;
         h = layer_forward(
@@ -424,8 +440,60 @@ torch::Tensor decode_24(
             bases[b+5], steps[b+5], out_fs[b+5], in_fs[b+5],
             codes[b+6], cbs[b+6], s_i8s[b+6],
             bases[b+6], steps[b+6], out_fs[b+6], in_fs[b+6],
-            kv_caches[l], pos, n_heads, n_kv_heads,
+            kv_caches[l], n_heads, n_kv_heads,
             head_dim, ctx, theta);
     }
     return h;
+}
+
+// ---------------- CUDA Graph capture + replay -------------------------- //
+static cudaGraphExec_t g_exec = nullptr;
+static cudaGraph_t g_graph = nullptr;
+static bool g_captured = false;
+static torch::Tensor g_result;  // set by decode_24 (b_out from last layer)
+
+void graph_capture(
+    torch::Tensor h_bf16,
+    torch::Tensor pos_gpu,
+    std::vector<torch::Tensor> kv_caches,
+    std::vector<torch::Tensor> in_norms,
+    std::vector<torch::Tensor> post_norms,
+    std::vector<torch::Tensor> codes,
+    std::vector<torch::Tensor> cbs,
+    std::vector<torch::Tensor> s_i8s,
+    std::vector<double> bases,
+    std::vector<double> steps,
+    std::vector<int64_t> out_fs,
+    std::vector<int64_t> in_fs,
+    int64_t n_heads, int64_t n_kv_heads,
+    int64_t head_dim, int64_t ctx, double theta)
+{
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    // Warmup (initializes static buffers + compiles kernels)
+    auto r = decode_24(h_bf16, pos_gpu, kv_caches, in_norms,
+                       post_norms, codes, cbs, s_i8s, bases,
+                       steps, out_fs, in_fs,
+                       n_heads, n_kv_heads, head_dim, ctx, theta);
+    g_result = r;
+    cudaStreamSynchronize(stream);
+
+    // Capture
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+    decode_24(h_bf16, pos_gpu, kv_caches, in_norms, post_norms,
+              codes, cbs, s_i8s, bases, steps, out_fs, in_fs,
+              n_heads, n_kv_heads, head_dim, ctx, theta);
+    cudaStreamEndCapture(stream, &g_graph);
+    cudaGraphInstantiate(&g_exec, g_graph, NULL, NULL, 0);
+    g_captured = true;
+}
+
+torch::Tensor graph_replay() {
+    if (!g_captured) {
+        throw std::runtime_error(
+            "graph not captured - call graph_capture first");
+    }
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaGraphLaunch(g_exec, stream);
+    return g_result;  // static buffer written by the graph
 }
