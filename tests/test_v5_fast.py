@@ -65,6 +65,9 @@ void init_model(
     int64_t n_heads, int64_t n_kv_heads,
     int64_t head_dim, int64_t ctx, double theta);
 int64_t step(int64_t token_id);
+void step_graph();
+void set_start_token(int64_t token);
+int64_t get_last_token();
 torch::Tensor decode_24(
     torch::Tensor h_bf16, torch::Tensor pos_gpu,
     std::vector<torch::Tensor> kv_caches,
@@ -87,13 +90,15 @@ std::vector<int64_t> generate_batch(
 std::vector<int64_t> generate_batch_fast(
     int64_t start_token, int64_t n_tokens);
 '''
-ext = load_inline(name='ixrun_cpp_v5j', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v5k', cpp_sources=[proto],
                   cuda_sources=[src],
                   functions=['init_model', 'step',
                              'generate_batch',
                              'generate_batch_fast',
                              'decode_24', 'rmsnorm_out',
-                             'gemv_out'],
+                             'gemv_out', 'step_graph',
+                             'set_start_token',
+                             'get_last_token'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
@@ -197,12 +202,35 @@ t_g = time.perf_counter() - t0
 print(f'py-graph 64 tok in {t_g:.3f}s = {64/t_g:.1f} tok/s', flush=True)
 print(f'text: {tok.decode(tokens)}', flush=True)
 
-# Batch mode fast (GPU-resident token, zero per-token sync)
+# --- FULL-GRAPH: step_graph in PyTorch CUDA graph, GPU-resident token ---
+# Warmup (init static buffers inside step_graph)
+pos_gpu.fill_(256)
+s2 = torch.cuda.Stream()
+s2.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(s2):
+    for _ in range(3):
+        ext.step_graph()
+torch.cuda.current_stream().wait_stream(s2)
+
+# Capture: the ENTIRE pipeline (embed→24layers→norm→lmhead→argmax→tok)
+g2 = torch.cuda.CUDAGraph()
+pos_gpu.fill_(256)
+ext.set_start_token(nxt)
+with torch.cuda.graph(g2):
+    ext.step_graph()
+print('FULL graph captured (embed+24layers+lmhead+argmax)', flush=True)
+
+# Reset position and set start token for generation
 pos_gpu.fill_(len(prompt_ids))
-torch.cuda.synchronize()
+ext.set_start_token(nxt)
+
+# Generate: just graph.replay() per token — ZERO Python compute!
 t0 = time.perf_counter()
-fast_out = ext.generate_batch_fast(gen[-1], 64)
+for _ in range(64):
+    g2.replay()
 torch.cuda.synchronize()
-t_fast = time.perf_counter() - t0
-print(f'fast-batch 64 tok in {t_fast:.3f}s = '
-      f'{64/t_fast:.1f} tok/s', flush=True)
+t_full = time.perf_counter() - t0
+last = ext.get_last_token()
+print(f'FULL-graph 64 tok in {t_full:.3f}s = '
+      f'{64/t_full:.1f} tok/s', flush=True)
+print(f'last token: {last}', flush=True)

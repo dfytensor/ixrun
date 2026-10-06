@@ -781,6 +781,88 @@ std::vector<int64_t> generate_batch(int64_t start_token,
     return out;
 }
 
+// Single-step, ALL-GPU, no .item() — PyTorch CUDA graph compatible.
+static torch::Tensor g_emb_buf, g_fn_buf, g_lg_buf, g_tok_gpu;
+static bool g_bufs_init = false;
+
+void step_graph() {
+    if (!g_init) throw std::runtime_error("init_model not called");
+    auto st = at::cuda::getCurrentCUDAStream();
+    if (!g_bufs_init) {
+        auto dev = g_embed.device();
+        g_emb_buf = torch::empty({g_hidden},
+            torch::TensorOptions().dtype(torch::kBFloat16)
+                .device(dev));
+        g_fn_buf = torch::empty({g_hidden},
+            torch::TensorOptions().dtype(torch::kFloat32)
+                .device(dev));
+        g_lg_buf = torch::empty({g_lh_out_f},
+            torch::TensorOptions().dtype(torch::kFloat32)
+                .device(dev));
+        g_tok_gpu = torch::zeros({1},
+            torch::TensorOptions().dtype(torch::kInt64)
+                .device(dev));
+        g_bufs_init = true;
+    }
+    int nl = (int)g_kcs.size();
+
+    pos_incr<<<1, 1, 0, st>>>(
+        reinterpret_cast<int*>(g_pos.data_ptr()));
+    set_pos_kernel<<<1, 1, 0, st>>>(
+        reinterpret_cast<const int*>(g_pos.data_ptr()));
+    embed_lookup<<<1, (unsigned)g_hidden, 0, st>>>(
+        reinterpret_cast<const __nv_bfloat16*>(g_embed.data_ptr()),
+        g_tok_gpu.data_ptr<int64_t>(),
+        reinterpret_cast<__nv_bfloat16*>(g_emb_buf.data_ptr()),
+        (int)g_hidden);
+
+    auto h = g_emb_buf;
+    for (int l = 0; l < nl; ++l) {
+        int b = l * 7;
+        h = layer_forward(
+            h, g_inws[l], g_postws[l],
+            g_codes[b], g_cbs[b], g_s[b],
+            g_bases[b], g_steps[b], g_outfs[b], g_infs[b],
+            g_codes[b+1], g_cbs[b+1], g_s[b+1],
+            g_bases[b+1], g_steps[b+1], g_outfs[b+1], g_infs[b+1],
+            g_codes[b+2], g_cbs[b+2], g_s[b+2],
+            g_bases[b+2], g_steps[b+2], g_outfs[b+2], g_infs[b+2],
+            g_codes[b+3], g_cbs[b+3], g_s[b+3],
+            g_bases[b+3], g_steps[b+3], g_outfs[b+3], g_infs[b+3],
+            g_codes[b+4], g_cbs[b+4], g_s[b+4],
+            g_bases[b+4], g_steps[b+4], g_outfs[b+4], g_infs[b+4],
+            g_codes[b+5], g_cbs[b+5], g_s[b+5],
+            g_bases[b+5], g_steps[b+5], g_outfs[b+5], g_infs[b+5],
+            g_codes[b+6], g_cbs[b+6], g_s[b+6],
+            g_bases[b+6], g_steps[b+6], g_outfs[b+6], g_infs[b+6],
+            g_kcs[l], g_nheads, g_nkv, g_hd, g_ctx, g_theta);
+    }
+    rmsnorm_kernel<<<1, 256, 0, st>>>(
+        reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(g_fnw.data_ptr()),
+        g_fn_buf.data_ptr<float>(), (int)g_hidden);
+    gsq_gemv_kernel<<<(unsigned)(g_lh_out_f / 8), 256, 0, st>>>(
+        g_fn_buf.data_ptr<float>(),
+        g_lh_codes.data_ptr<uint8_t>(),
+        g_lh_cb.data_ptr<float>(),
+        g_lh_s.data_ptr<uint8_t>(),
+        (float)g_lh_base, (float)g_lh_step,
+        g_lg_buf.data_ptr<float>(), (int)(g_lh_in_f / 16));
+    argmax_f32<<<1, 256, 0, st>>>(
+        g_lg_buf.data_ptr<float>(), (int)g_lh_out_f,
+        g_tok_gpu.data_ptr<int64_t>());
+}
+
+void set_start_token(int64_t token) {
+    if (!g_bufs_init) step_graph();  // init buffers
+    g_tok_gpu.fill_(token);
+}
+
+int64_t get_last_token() {
+    if (!g_bufs_init) throw std::runtime_error("no tokens generated");
+    return g_tok_gpu.item<int64_t>();
+}
+
 static cudaGraphExec_t g_exec = nullptr;
 static cudaGraph_t g_graph = nullptr;
 static bool g_captured = false;
