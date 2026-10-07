@@ -770,6 +770,155 @@ torch::Tensor gated_rmsnorm_out(torch::Tensor o, torch::Tensor z,
     return out;
 }
 
+// ---------------- Stage 4 step 3a: GDN layer step --------------------- //
+__global__ void gdn_recurrent_kernel(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ S,
+    float* __restrict__ out, int dk, int dv);
+
+__global__ void repeat_heads_kernel(const float* src, float* dst,
+                                    int dk, int rep) {
+    int j = blockIdx.x;      // output head (nv); HF repeat_interleave:
+    int i = threadIdx.x;     // out head j uses src head j/rep
+    if (i < dk)
+        dst[(long long)j * dk + i]
+            = src[(long long)(j / rep) * dk + i];
+}
+__global__ void sigmoid_kernel(const float* x, float* y, int n) {
+    int i = threadIdx.x;
+    if (i < n) y[i] = 1.f / (1.f + expf(-x[i]));
+}
+__global__ void ggate_kernel(const float* a, const float* A_log,
+                             const float* dt_bias, float* g,
+                             int n) {
+    int i = threadIdx.x;
+    if (i < n) {
+        float x = a[i] + dt_bias[i];
+        float sp = (x > 20.f) ? x : log1pf(expf(x));
+        g[i] = -expf(A_log[i]) * sp;
+    }
+}
+__global__ void scale_kernel(float* x, float c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= c;
+}
+
+torch::Tensor gdn_layer_step(
+    torch::Tensor h, torch::Tensor cb,
+    torch::Tensor qkv_i, torch::Tensor qkv_s, torch::Tensor qkv_sc,
+    torch::Tensor z_i,   torch::Tensor z_s,   torch::Tensor z_sc,
+    torch::Tensor b_i,   torch::Tensor b_s,   torch::Tensor b_sc,
+    torch::Tensor a_i,   torch::Tensor a_s,   torch::Tensor a_sc,
+    torch::Tensor o_i,   torch::Tensor o_s,   torch::Tensor o_sc,
+    torch::Tensor conv_w, torch::Tensor conv_b,
+    torch::Tensor A_log, torch::Tensor dt_bias,
+    torch::Tensor norm_w,
+    torch::Tensor conv_state, torch::Tensor S,
+    int64_t nv, int64_t nk, int64_t dk, int64_t dv)
+{
+    auto st = at::cuda::getCurrentCUDAStream();
+    int hidden = (int)h.numel();
+    int key_dim = (int)(nk * dk);
+    int value_dim = (int)(nv * dv);
+    int conv_dim = key_dim * 2 + value_dim;
+    int GROUP = 16;
+    auto f32 = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(h.device());
+
+    static torch::Tensor qkv, z, bo, ao, mq, qi, ki, vr, qh, kh,
+                          beta, gvec, o, zr, out;
+    static bool init = false;
+    if (!init) {
+        qkv  = torch::empty({conv_dim}, f32);
+        z    = torch::empty({value_dim}, f32);
+        bo   = torch::empty({nv}, f32);
+        ao   = torch::empty({nv}, f32);
+        mq   = torch::empty({conv_dim}, f32);
+        qi   = torch::empty({nv, dk}, f32);
+        ki   = torch::empty({nv, dk}, f32);
+        vr   = torch::empty({nv, dv}, f32);
+        qh   = torch::empty({nv, dk}, f32);
+        kh   = torch::empty({nv, dk}, f32);
+        beta = torch::empty({nv}, f32);
+        gvec = torch::empty({nv}, f32);
+        o    = torch::empty({nv, dv}, f32);
+        zr   = torch::empty({nv, dv}, f32);
+        out  = torch::empty({hidden}, f32);
+        init = true;
+    }
+
+    udcq_gemv_kernel<<<(unsigned)conv_dim, 256, 0, st>>>(
+        h.data_ptr<float>(), qkv_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(qkv_s.data_ptr()),
+        qkv_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        qkv.data_ptr<float>(), hidden, GROUP);
+    udcq_gemv_kernel<<<(unsigned)value_dim, 256, 0, st>>>(
+        h.data_ptr<float>(), z_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(z_s.data_ptr()),
+        z_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        z.data_ptr<float>(), hidden, GROUP);
+    udcq_gemv_kernel<<<(unsigned)nv, 256, 0, st>>>(
+        h.data_ptr<float>(), b_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(b_s.data_ptr()),
+        b_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        bo.data_ptr<float>(), hidden, GROUP);
+    udcq_gemv_kernel<<<(unsigned)nv, 256, 0, st>>>(
+        h.data_ptr<float>(), a_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(a_s.data_ptr()),
+        a_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        ao.data_ptr<float>(), hidden, GROUP);
+
+    conv1d_update_kernel<<<(conv_dim + 255) / 256, 256, 0, st>>>(
+        qkv.data_ptr<float>(), conv_state.data_ptr<float>(),
+        conv_w.data_ptr<float>(), conv_b.data_ptr<float>(),
+        mq.data_ptr<float>(), 3, 4, 1);
+
+    // z -> [nv,dv] rows BEFORE gated norm (pitfall 1)
+    cudaMemcpyAsync(zr.data_ptr<float>(), z.data_ptr<float>(),
+                    value_dim * sizeof(float),
+                    cudaMemcpyDeviceToDevice, st);
+    repeat_heads_kernel<<<(unsigned)nv, dk, 0, st>>>(
+        mq.data_ptr<float>(), qi.data_ptr<float>(), dk,
+        (int)(nv / nk));
+    repeat_heads_kernel<<<(unsigned)nv, dk, 0, st>>>(
+        mq.data_ptr<float>() + key_dim, ki.data_ptr<float>(), dk,
+        (int)(nv / nk));
+    cudaMemcpyAsync(vr.data_ptr<float>(),
+        mq.data_ptr<float>() + 2 * key_dim,
+        value_dim * sizeof(float), cudaMemcpyDeviceToDevice, st);
+    l2norm_kernel<<<nv, 256, 0, st>>>(
+        qi.data_ptr<float>(), qh.data_ptr<float>(), dk);
+    l2norm_kernel<<<nv, 256, 0, st>>>(
+        ki.data_ptr<float>(), kh.data_ptr<float>(), dk);
+    scale_kernel<<<(nv * dk + 255) / 256, 256, 0, st>>>(
+        qh.data_ptr<float>(), 1.0f / std::sqrt((float)dk), nv * dk);
+    sigmoid_kernel<<<1, 256, 0, st>>>(
+        bo.data_ptr<float>(), beta.data_ptr<float>(), nv);
+    ggate_kernel<<<1, 256, 0, st>>>(
+        ao.data_ptr<float>(), A_log.data_ptr<float>(),
+        dt_bias.data_ptr<float>(), gvec.data_ptr<float>(), nv);
+
+    gdn_recurrent_kernel<<<nv, 256, 0, st>>>(
+        qh.data_ptr<float>(), kh.data_ptr<float>(),
+        vr.data_ptr<float>(), gvec.data_ptr<float>(),
+        beta.data_ptr<float>(), S.data_ptr<float>(),
+        o.data_ptr<float>(), dk, dv);
+    // separate out buffer — gated norm must NOT alias (pitfall 2)
+    static torch::Tensor on;
+    if (!init) {}
+    if (!on.defined()) on = torch::empty({nv, dv}, f32);
+    gated_rmsnorm_kernel<<<nv, 256, 0, st>>>(
+        o.data_ptr<float>(), zr.data_ptr<float>(),
+        norm_w.data_ptr<float>(), on.data_ptr<float>(), dv, 1e-6f);
+    udcq_gemv_kernel<<<(unsigned)hidden, 256, 0, st>>>(
+        on.view(-1).data_ptr<float>(), o_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(o_s.data_ptr()),
+        o_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        out.data_ptr<float>(), value_dim, GROUP);
+    return out;
+}
+
 // ---------------- GDN recurrent (27B stage 3a) ----------------------- //
 // torch_recurrent_gated_delta_rule for S=1 decode step, per head:
 //   S = S*exp(g); kv_mem[j] = sum_i S[i][j]*k[i];
