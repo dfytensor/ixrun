@@ -666,6 +666,52 @@ torch::Tensor conv1d_update_out(torch::Tensor x,
     return out;
 }
 
+// gated rmsnorm (Qwen3_5RMSNormGated): out[i] = (w[i]*o[i]*inv) * silu(z[i])
+// inv = rsqrt(mean(o^2)+eps) per row; one block per row.
+__global__ void gated_rmsnorm_kernel(const float* __restrict__ o,
+                                     const float* __restrict__ z,
+                                     const float* __restrict__ w,
+                                     float* __restrict__ out,
+                                     int d, float eps) {
+    __shared__ float red[32];
+    const float* orow = o + (long long)blockIdx.x * d;
+    const float* zrow = z + (long long)blockIdx.x * d;
+    float* orow_out = out + (long long)blockIdx.x * d;
+    float sq = 0.f;
+    for (int i = threadIdx.x; i < d; i += blockDim.x)
+        sq += orow[i] * orow[i];
+    if (threadIdx.x < 32) red[threadIdx.x] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        sq += __shfl_down_sync(0xffffffff, sq, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sq;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int k = 0; k < (int)(blockDim.x >> 5); ++k) t += red[k];
+        red[0] = rsqrtf(t / (float)d + eps);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float g = zrow[i];
+        float s = g / (1.f + expf(-g));
+        orow_out[i] = (w[i] * orow[i] * red[0]) * s;
+    }
+}
+
+torch::Tensor gated_rmsnorm_out(torch::Tensor o, torch::Tensor z,
+                                torch::Tensor w, double eps) {
+    int R = (int)o.size(0), d = (int)o.size(1);
+    auto out = torch::empty_like(o);
+    gated_rmsnorm_kernel<<<R, 256, 0,
+                           at::cuda::getCurrentCUDAStream()>>>(
+        o.data_ptr<float>(), z.data_ptr<float>(),
+        w.data_ptr<float>(), out.data_ptr<float>(),
+        d, (float)eps);
+    return out;
+}
+
 // ---------------- GDN recurrent (27B stage 3a) ----------------------- //
 // torch_recurrent_gated_delta_rule for S=1 decode step, per head:
 //   S = S*exp(g); kv_mem[j] = sum_i S[i][j]*k[i];
