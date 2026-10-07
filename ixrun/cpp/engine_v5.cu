@@ -535,6 +535,62 @@ torch::Tensor gemv_v2_out(torch::Tensor x,
                        out_f, in_f);
 }
 
+// ---------------- UDCQ GEMV (27B format port, stage 1) ---------------- //
+// w = sign * scale_g * CB[idx]; byte-aligned nibbles, pure LUT walk.
+// Gate: rel-err vs fp64 decode reference (fp32 reorder noise tier).
+__global__ void udcq_gemv_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ idx,
+    const uint32_t* __restrict__ sign,
+    const float* __restrict__ scale,           // f16->f32 at init
+    const float* __restrict__ cb,              // [16] fp32
+    float* __restrict__ y,
+    int in_f, int GROUP)
+{
+    __shared__ float red[32];
+    int r = blockIdx.x;
+    long long base = (long long)r * in_f;
+    float acc = 0.f;
+    for (int j = threadIdx.x; j < in_f; j += blockDim.x) {
+        long long o = base + j;
+        uint8_t b = idx[o >> 1];
+        int nib = (o & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
+        float sc = scale[o / GROUP];
+        uint32_t sw = sign[o >> 5];
+        float sgn = ((sw >> (o & 31)) & 1u) ? 1.f : -1.f;
+        acc += cb[nib] * sc * sgn * x[j];
+    }
+    if (threadIdx.x < 32) red[threadIdx.x] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int k = 0; k < (int)(blockDim.x >> 5); ++k) t += red[k];
+        y[r] = t;
+    }
+}
+
+torch::Tensor udcq_gemv_out(torch::Tensor x,
+                            torch::Tensor idx, torch::Tensor sign,
+                            torch::Tensor scale, torch::Tensor cb,
+                            int64_t out_f, int64_t in_f,
+                            int64_t group) {
+    auto y = torch::zeros({out_f}, torch::dtype(torch::kFloat32)
+                                         .device(x.device()));
+    udcq_gemv_kernel<<<(unsigned)out_f, 256, 0,
+                       at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(), idx.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(sign.data_ptr()),
+        scale.data_ptr<float>(),
+        cb.data_ptr<float>(), y.data_ptr<float>(),
+        (int)in_f, (int)group);
+    return y;
+}
+
 // split-K GEMV: each row split across S warps (contiguous chunks),
 // partials summed in warp order (deterministic). NOTE: reduction
 // order differs from v2/v3 -> NOT bit-exact vs them; gate = rel-err
