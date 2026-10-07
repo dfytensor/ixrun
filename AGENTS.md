@@ -247,3 +247,28 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
 - Open: GEMV kernel optimization (no vectorized uint4 loads, fp32 x
   re-reads; 25.6 tok/s is kernel-bound not launch-bound) → target 50+;
   prefill still per-token eager (~5s/128tok); C4 dual-format bf16xl.
+- **ATTENTION V2 + full ladder (bf41f81/7409466/86eb40b/16b67a3/8e35088)**:
+  attn_kernel_v2 = threads split the t-range, score computed ONCE to
+  smem, block-max warp-reduce (rounding-free = exact), weighted-sum
+  reads smem weights with identical t-order -> BIT-EXACT, 26 -> 295
+  tok/s (11.4x). v1 was re-reading the whole KV 128x per head (9.6GB
+  per token — THAT was the 38ms mystery, never the GEMVs). Batch
+  prefill prefill_tokens(): one C++ call, no per-token pybind/.item()
+  sync (240 tok/s). GEMV v2 (smem-x staging) bit-exact, 2.5x on
+  lm_head shape only. CppGsqEngine (ixrun/cpp_engine.py) = production
+  wrapper: generate/chat/serve all wired (--mode cpp-gsq), E2E gate
+  tests/test_cpp_engine_e2e.py 64/64. Final: prefill 246, decode
+  296 tok/s (~llama.cpp parity territory on this box).
+- **Pinned-buffer race**: a host loop writing a reused pinned buffer
+  + cudaMemcpyAsync = the copy reads AT EXECUTION TIME, next
+  iteration's write races in. Kernel args are captured AT ENQUEUE —
+  pass position values as kernel args (write_pos_kernel), never via
+  shared pinned memory.
+- **Warmup/throwaway-position rule (bug-2 class, structural)**: any
+  warmup/dummy step must run at a position >= generation start
+  (wrapper seeds ctx-16) — pollution there is rewritten-before-read;
+  at a stale g_pos it clobbers the last REAL prefill slot silently.
+- Polish queue for cpp-gsq: per-request max_tokens clamp in facade,
+  chat-template stop tokens (<|im_end|> leaks; eos_token_id mismatch),
+  streaming chunk-boundary token dedup; batched-GEMM prefill is the
+  next big perf play (format-level, 10B-group packing blocks uint4).
