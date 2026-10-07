@@ -2241,122 +2241,13 @@ torch::Tensor sf_get_fn() {
     return g_fn_buf.cpu();
 }
 
-// ---------------- CUDA Graph with raw cudaMalloc input (WDDM-safe) ---- //
-static cudaGraphExec_t raw_exec = nullptr;
-static cudaGraph_t raw_graph = nullptr;
-static bool raw_captured = false;
-static float* raw_input = nullptr;
-static float* raw_output = nullptr;
-static int raw_n = 0;
-
-__global__ void copy_kernel(const float* src, float* dst, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = src[i] * 2.0f;
-}
-
-void raw_graph_init(int64_t n) {
-    raw_n = (int)n;
-    if (raw_input) cudaFree(raw_input);
-    if (raw_output) cudaFree(raw_output);
-    cudaMalloc(&raw_input, raw_n * sizeof(float));
-    cudaMalloc(&raw_output, raw_n * sizeof(float));
-    cudaMemset(raw_input, 0, raw_n * sizeof(float));
-    cudaMemset(raw_output, 0, raw_n * sizeof(float));
-}
-
-void raw_graph_set_input(torch::Tensor data) {
-    cudaMemcpy(raw_input, data.data_ptr<float>(),
-               raw_n * sizeof(float),
-               cudaMemcpyDeviceToDevice);
-}
-
-torch::Tensor raw_graph_get_output() {
-    return torch::from_blob(raw_output, {raw_n},
-        torch::TensorOptions().dtype(torch::kFloat32)
-            .device(torch::kCUDA)).clone();
-}
-
-void raw_graph_capture() {
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    copy_kernel<<<1, 256, 0, stream>>>(
-        raw_input, raw_output, raw_n);
-    cudaStreamSynchronize(stream);
-    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-    copy_kernel<<<1, 256, 0, stream>>>(
-        raw_input, raw_output, raw_n);
-    cudaStreamEndCapture(stream, &raw_graph);
-    cudaGraphInstantiate(&raw_exec, raw_graph, NULL, NULL, 0);
-    raw_captured = true;
-}
-
-void raw_graph_replay() {
-    if (!raw_captured) throw std::runtime_error("not captured");
-    cudaGraphLaunch(raw_exec,
-                    at::cuda::getCurrentCUDAStream().stream());
-}
-
 static cudaGraphExec_t g_exec = nullptr;
 static cudaGraph_t g_graph = nullptr;
 static bool g_captured = false;
 static torch::Tensor g_result;
 static torch::Tensor g_input;   // static input buffer (address baked in graph)
 
-void graph_capture(
-    torch::Tensor h_bf16,
-    torch::Tensor pos_gpu,
-    std::vector<torch::Tensor> kv_caches,
-    std::vector<torch::Tensor> in_norms,
-    std::vector<torch::Tensor> post_norms,
-    std::vector<torch::Tensor> codes,
-    std::vector<torch::Tensor> cbs,
-    std::vector<torch::Tensor> s_i8s,
-    std::vector<double> bases,
-    std::vector<double> steps,
-    std::vector<int64_t> out_fs,
-    std::vector<int64_t> in_fs,
-    int64_t n_heads, int64_t n_kv_heads,
-    int64_t head_dim, int64_t ctx, double theta)
-{
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-    // Store REFERENCE (not clone) — Python owns the tensor and
-    // updates it in-place between replays. Address never changes.
-    g_input = h_bf16;
-
-    // Warmup (initializes static buffers)
-    g_result = decode_24(g_input, pos_gpu, kv_caches, in_norms,
-                         post_norms, codes, cbs, s_i8s, bases,
-                         steps, out_fs, in_fs,
-                         n_heads, n_kv_heads, head_dim, ctx, theta);
-    cudaStreamSynchronize(stream);
-
-    // Capture (same input address, same buffers)
-    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-    g_result = decode_24(g_input, pos_gpu, kv_caches, in_norms,
-                         post_norms, codes, cbs, s_i8s, bases,
-                         steps, out_fs, in_fs,
-                         n_heads, n_kv_heads, head_dim, ctx, theta);
-    cudaStreamEndCapture(stream, &g_graph);
-    cudaGraphInstantiate(&g_exec, g_graph, NULL, NULL, 0);
-    g_captured = true;
-}
-
-void graph_set_input(torch::Tensor embedding) {
-    if (!g_captured || !g_input.defined()) {
-        throw std::runtime_error("graph not captured");
-    }
-    g_input.copy_(embedding);
-}
-
-torch::Tensor graph_replay() {
-    if (!g_captured) {
-        throw std::runtime_error(
-            "graph not captured - call graph_capture first");
-    }
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    cudaGraphLaunch(g_exec, stream);
-    return g_result;
-}
 
 // ---------------- Stage 4 step 4: full GDN decoder layer -------------- //
 // Wraps the gated gdn_layer_step CORE with decoder semantics:
@@ -2587,7 +2478,7 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
         h = hcur;
         torch::Tensor hn = hcur.norm();
         s27_hnorm.push_back(hn.item<float>());
-        s27_layer_h.push_back(hcur.clone());
+        // s27_layer_h.push_back(hcur.clone());  // AV probe off
     }
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h.data_ptr<float>(), s27_fnw.data_ptr<float>(),
@@ -2615,6 +2506,7 @@ torch::Tensor s27_get_hnorm() {
 }
 
 torch::Tensor s27_get_layer_h() {
+    return torch::zeros({1});  // AV probe off
     return torch::stack(s27_layer_h).cpu();
 }
 
