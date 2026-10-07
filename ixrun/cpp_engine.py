@@ -40,11 +40,12 @@ torch::Tensor sf_get_hist(int64_t from, int64_t n);
 '''
 
 
-def _build_ext():
+def _build_ext(suffix=''):
     src = open(os.path.join(_CPP_DIR, 'engine_v5.cu'),
                encoding='utf-8').read()
     return load_inline(
-        name=_EXT_NAME, cpp_sources=[_PROTO], cuda_sources=[src],
+        name=_EXT_NAME + suffix, cpp_sources=[_PROTO],
+        cuda_sources=[src],
         functions=['init_model', 'step', 'prefill_tokens',
                    'prefill_batch',
                    'sf_step_graph', 'sf_seed', 'sf_get_hist'],
@@ -56,13 +57,17 @@ def _build_ext():
 class CppGsqEngine:
     """GSQ 5.5bpw C++ engine. Build from a HF bf16 causal LM."""
 
-    def __init__(self, model, ctx=512):
+    def __init__(self, model, ctx=512, instance=0):
         import time
         from ixrun.linear import iter_quantizable_linears
         from benchmarks.gsq_runtime import gs_pack
 
         self.model = model
         self.ctx = ctx
+        # instance suffix: separate extension module = separate C++
+        # statics (g_pos/tok/kcs) -> N engines run independently
+        # (weights duplicated ~0.7GB each; fine for B=2-4 on 24GB)
+        self.ext = _build_ext(f'_{instance}' if instance else '')
         cfg = model.config
         self.nh = cfg.num_attention_heads
         self.nkv = cfg.num_key_value_heads
@@ -100,7 +105,6 @@ class CppGsqEngine:
                                 dtype=torch.bfloat16,
                                 device='cuda')
                     for _ in range(self.nl)]
-        self.ext = _build_ext()
         self.ext.init_model(
             self.embed_w, self.pos_gpu, self.kcs, in_ws, post_ws,
             fn_w,
