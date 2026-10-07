@@ -446,14 +446,18 @@ torch::Tensor decode_24(
     return h;
 }
 
-// device-side argmax (single-block reduction over logits)
+// device-side argmax (single-block, grid-stride over full vocab)
 __global__ void argmax_f32(const float* logits, int n,
                            int64_t* out) {
     __shared__ float s_val[256];
     __shared__ int s_idx[256];
     int i = threadIdx.x;
-    float v = (i < n) ? logits[i] : -1e30f;
-    s_val[i] = v; s_idx[i] = i;
+    float bv = -1e30f; int bi = 0;
+    for (int j = i; j < n; j += 256) {
+        float v = logits[j];
+        if (v > bv) { bv = v; bi = j; }
+    }
+    s_val[i] = bv; s_idx[i] = bi;
     __syncthreads();
     for (int off = 128; off > 0; off >>= 1) {
         if (i < off) {
@@ -597,29 +601,40 @@ void init_model(
     g_init = true;
 }
 
+// shared output buffers (used by step, step_graph, sf_step_graph
+// so eager and graph paths are bit-comparable)
+static torch::Tensor g_emb_buf, g_fn_buf, g_lg_buf, g_tok_gpu,
+                     g_tok_hist;
+static bool g_bufs_init = false;
+
+static void ensure_g_bufs() {
+    if (g_bufs_init) return;
+    auto dev = g_embed.device();
+    g_emb_buf = torch::empty({g_hidden},
+        torch::TensorOptions().dtype(torch::kBFloat16)
+            .device(dev));
+    g_fn_buf = torch::empty({g_hidden},
+        torch::TensorOptions().dtype(torch::kFloat32)
+            .device(dev));
+    g_lg_buf = torch::empty({g_lh_out_f},
+        torch::TensorOptions().dtype(torch::kFloat32)
+            .device(dev));
+    g_tok_gpu = torch::zeros({1},
+        torch::TensorOptions().dtype(torch::kInt64)
+            .device(dev));
+    g_tok_hist = torch::zeros({g_ctx},
+        torch::TensorOptions().dtype(torch::kInt64)
+            .device(dev));
+    g_bufs_init = true;
+}
+
 int64_t step(int64_t token_id) {
     if (!g_init) throw std::runtime_error("init_model not called");
     auto st = at::cuda::getCurrentCUDAStream();
-
-    static torch::Tensor emb_buf, fn_buf, lg_buf, tok_buf;
-    if (!emb_buf.defined()) {
-        auto dev = g_embed.device();
-        emb_buf = torch::empty({g_hidden},
-            torch::TensorOptions().dtype(torch::kBFloat16)
-                .device(dev));
-        fn_buf = torch::empty({g_hidden},
-            torch::TensorOptions().dtype(torch::kFloat32)
-                .device(dev));
-        lg_buf = torch::empty({g_lh_out_f},
-            torch::TensorOptions().dtype(torch::kFloat32)
-                .device(dev));
-        tok_buf = torch::empty({1},
-            torch::TensorOptions().dtype(torch::kInt64)
-                .device(dev));
-    }
+    ensure_g_bufs();
 
     // embedding lookup
-    cudaMemcpyAsync(emb_buf.data_ptr(),
+    cudaMemcpyAsync(g_emb_buf.data_ptr(),
         reinterpret_cast<const char*>(g_embed.data_ptr())
             + token_id * g_hidden * 2,
         g_hidden * 2, cudaMemcpyDeviceToDevice, st);
@@ -629,7 +644,7 @@ int64_t step(int64_t token_id) {
         reinterpret_cast<const int*>(g_pos.data_ptr()));
 
     // 24 layers
-    auto h = emb_buf;
+    auto h = g_emb_buf;
     for (int l = 0; l < (int)g_kcs.size(); ++l) {
         int b = l * 7;
         h = layer_forward(
@@ -655,19 +670,19 @@ int64_t step(int64_t token_id) {
     rmsnorm_kernel<<<1, 256, 0, st>>>(
         reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(g_fnw.data_ptr()),
-        fn_buf.data_ptr<float>(), (int)g_hidden);
+        g_fn_buf.data_ptr<float>(), (int)g_hidden);
     gsq_gemv_kernel<<<(unsigned)(g_lh_out_f / 8), 256, 0, st>>>(
-        fn_buf.data_ptr<float>(),
+        g_fn_buf.data_ptr<float>(),
         g_lh_codes.data_ptr<uint8_t>(),
         g_lh_cb.data_ptr<float>(),
         g_lh_s.data_ptr<uint8_t>(),
         (float)g_lh_base, (float)g_lh_step,
-        lg_buf.data_ptr<float>(), (int)(g_lh_in_f / 16));
+        g_lg_buf.data_ptr<float>(), (int)(g_lh_in_f / 16));
     argmax_f32<<<1, 256, 0, st>>>(
-        lg_buf.data_ptr<float>(), (int)g_lh_out_f,
-        tok_buf.data_ptr<int64_t>());
+        g_lg_buf.data_ptr<float>(), (int)g_lh_out_f,
+        g_tok_gpu.data_ptr<int64_t>());
 
-    return tok_buf.item<int64_t>();
+    return g_tok_gpu.item<int64_t>();
 }
 
 // GPU-resident embedding lookup (no CPU sync for token_id)
@@ -676,9 +691,15 @@ __global__ void pos_incr(int* pos) { (*pos)++; }
 __global__ void embed_lookup(const __nv_bfloat16* table,
                              const int64_t* token,
                              __nv_bfloat16* out, int hidden) {
-    int i = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < hidden)
         out[i] = table[token[0] * hidden + i];
+}
+
+// record token into history at current d_pos (for batch reading)
+__global__ void tok_record_kernel(const int64_t* tok,
+                                  int64_t* hist) {
+    hist[d_pos] = tok[0];
 }
 
 // Batch generation: token stays on GPU, zero CPU sync per token
@@ -715,7 +736,7 @@ std::vector<int64_t> generate_batch_fast(int64_t start_token,
         set_pos_kernel<<<1, 1, 0, st>>>(
             reinterpret_cast<const int*>(g_pos.data_ptr()));
         // GPU-resident embedding lookup
-        embed_lookup<<<1, 256, 0, st>>>(
+        embed_lookup<<<(unsigned)((g_hidden + 255) / 256), 256, 0, st>>>(
             reinterpret_cast<const __nv_bfloat16*>(
                 g_embed.data_ptr()),
             tok_gpu.data_ptr<int64_t>(),
@@ -782,29 +803,17 @@ std::vector<int64_t> generate_batch(int64_t start_token,
 }
 
 // Single-step, ALL-GPU, no .item() — PyTorch CUDA graph compatible.
-static torch::Tensor g_emb_buf, g_fn_buf, g_lg_buf, g_tok_gpu;
-static bool g_bufs_init = false;
-
+// BUGFIX: set_pos_kernel was MISSING here — replays ran at the
+// stale d_pos left by the last eager step() (position corruption).
 void step_graph() {
     if (!g_init) throw std::runtime_error("init_model not called");
     auto st = at::cuda::getCurrentCUDAStream();
-    if (!g_bufs_init) {
-        auto dev = g_embed.device();
-        g_emb_buf = torch::empty({g_hidden},
-            torch::TensorOptions().dtype(torch::kBFloat16)
-                .device(dev));
-        g_fn_buf = torch::empty({g_hidden},
-            torch::TensorOptions().dtype(torch::kFloat32)
-                .device(dev));
-        g_lg_buf = torch::empty({g_lh_out_f},
-            torch::TensorOptions().dtype(torch::kFloat32)
-                .device(dev));
-        g_tok_gpu = torch::zeros({1},
-            torch::TensorOptions().dtype(torch::kInt64)
-                .device(dev));
-        g_bufs_init = true;
-    }
+    ensure_g_bufs();
     int nl = (int)g_kcs.size();
+
+    // sync device position from g_pos (graph-safe: fixed buffer)
+    set_pos_kernel<<<1, 1, 0, st>>>(
+        reinterpret_cast<const int*>(g_pos.data_ptr()));
 
     // NO feedback loop: input is g_emb_buf (set from Python),
     // output is g_tok_gpu (read from Python after replay).
@@ -848,18 +857,124 @@ void step_graph() {
 
 
 void set_start_token(int64_t token) {
-    if (!g_bufs_init) step_graph();  // init buffers
+    ensure_g_bufs();  // pure alloc, no kernels
     g_tok_gpu.fill_(token);
 }
 
 void set_input_embedding(torch::Tensor embedding) {
-    if (!g_bufs_init) step_graph();  // init buffers
+    ensure_g_bufs();  // pure alloc, no kernels
     g_emb_buf.copy_(embedding);
 }
 
 int64_t get_last_token() {
     if (!g_bufs_init) throw std::runtime_error("no tokens generated");
     return g_tok_gpu.item<int64_t>();
+}
+
+// ---------------- SELF-FEEDING graph (zero Python per token) ---------- //
+// The graph closes the loop ON GPU through static buffers:
+//   set_pos(g_pos) -> embed_lookup(g_tok_gpu -> g_emb_buf)
+//   -> 24 layers -> final norm -> lm_head -> argmax -> g_tok_gpu
+//   -> tok_record(hist[d_pos]) -> pos_incr(g_pos)
+// Each replay = 1 full token. Python: seed once, replay N, read hist.
+void sf_step_graph() {
+    if (!g_init) throw std::runtime_error("init_model not called");
+    auto st = at::cuda::getCurrentCUDAStream();
+    ensure_g_bufs();
+    int nl = (int)g_kcs.size();
+
+    // 1. d_pos = *g_pos (graph-safe: fixed buffer address)
+    set_pos_kernel<<<1, 1, 0, st>>>(
+        reinterpret_cast<const int*>(g_pos.data_ptr()));
+
+    // 2. embedding lookup from GPU-resident token
+    embed_lookup<<<(unsigned)((g_hidden + 255) / 256), 256, 0, st>>>(
+        reinterpret_cast<const __nv_bfloat16*>(g_embed.data_ptr()),
+        g_tok_gpu.data_ptr<int64_t>(),
+        reinterpret_cast<__nv_bfloat16*>(g_emb_buf.data_ptr()),
+        (int)g_hidden);
+
+    // 3. 24 layers
+    auto h = g_emb_buf;
+    for (int l = 0; l < nl; ++l) {
+        int b = l * 7;
+        h = layer_forward(
+            h, g_inws[l], g_postws[l],
+            g_codes[b], g_cbs[b], g_s[b],
+            g_bases[b], g_steps[b], g_outfs[b], g_infs[b],
+            g_codes[b+1], g_cbs[b+1], g_s[b+1],
+            g_bases[b+1], g_steps[b+1], g_outfs[b+1], g_infs[b+1],
+            g_codes[b+2], g_cbs[b+2], g_s[b+2],
+            g_bases[b+2], g_steps[b+2], g_outfs[b+2], g_infs[b+2],
+            g_codes[b+3], g_cbs[b+3], g_s[b+3],
+            g_bases[b+3], g_steps[b+3], g_outfs[b+3], g_infs[b+3],
+            g_codes[b+4], g_cbs[b+4], g_s[b+4],
+            g_bases[b+4], g_steps[b+4], g_outfs[b+4], g_infs[b+4],
+            g_codes[b+5], g_cbs[b+5], g_s[b+5],
+            g_bases[b+5], g_steps[b+5], g_outfs[b+5], g_infs[b+5],
+            g_codes[b+6], g_cbs[b+6], g_s[b+6],
+            g_bases[b+6], g_steps[b+6], g_outfs[b+6], g_infs[b+6],
+            g_kcs[l], g_nheads, g_nkv, g_hd, g_ctx, g_theta);
+    }
+
+    // 4. final norm
+    rmsnorm_kernel<<<1, 256, 0, st>>>(
+        reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(g_fnw.data_ptr()),
+        g_fn_buf.data_ptr<float>(), (int)g_hidden);
+
+    // 5. lm_head GEMV
+    gsq_gemv_kernel<<<(unsigned)(g_lh_out_f / 8), 256, 0, st>>>(
+        g_fn_buf.data_ptr<float>(),
+        g_lh_codes.data_ptr<uint8_t>(),
+        g_lh_cb.data_ptr<float>(),
+        g_lh_s.data_ptr<uint8_t>(),
+        (float)g_lh_base, (float)g_lh_step,
+        g_lg_buf.data_ptr<float>(), (int)(g_lh_in_f / 16));
+
+    // 6. argmax -> g_tok_gpu (feeds NEXT replay's embed_lookup)
+    argmax_f32<<<1, 256, 0, st>>>(
+        g_lg_buf.data_ptr<float>(), (int)g_lh_out_f,
+        g_tok_gpu.data_ptr<int64_t>());
+
+    // 7. record token history (batch read later, zero per-token sync)
+    tok_record_kernel<<<1, 1, 0, st>>>(
+        g_tok_gpu.data_ptr<int64_t>(),
+        g_tok_hist.data_ptr<int64_t>());
+
+    // 8. advance position for next replay
+    pos_incr<<<1, 1, 0, st>>>(
+        reinterpret_cast<int*>(g_pos.data_ptr()));
+}
+
+void sf_seed(int64_t token, int64_t pos) {
+    // PURE init: allocate buffers WITHOUT running any kernels.
+    // (The old lazy sf_step_graph() call ran at the STALE g_pos,
+    //  clobbering the last real cache slot with token-0 garbage.)
+    ensure_g_bufs();
+    g_tok_gpu.fill_(token);
+    g_pos.fill_((int32_t)pos);
+}
+
+torch::Tensor sf_get_hist(int64_t from, int64_t n) {
+    if (!g_bufs_init) throw std::runtime_error("no history");
+    return g_tok_hist.narrow(0, from, n).cpu();
+}
+
+torch::Tensor sf_get_tok() {
+    return g_tok_gpu.cpu();
+}
+
+torch::Tensor sf_get_emb() {
+    return g_emb_buf.cpu();
+}
+
+torch::Tensor sf_get_lg() {
+    return g_lg_buf.cpu();
+}
+
+torch::Tensor sf_get_fn() {
+    return g_fn_buf.cpu();
 }
 
 // ---------------- CUDA Graph with raw cudaMalloc input (WDDM-safe) ---- //
