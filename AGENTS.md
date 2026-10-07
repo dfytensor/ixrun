@@ -208,6 +208,30 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
 
 - **NEW kernel variants MUST pass a bit-exact unit test before deployment** (per-group GMM: G=8 variant was never bit-exact-verified — it produced 27B text degeneration while G=16 was fine; severe VRAM paging did NOT corrupt text, so degeneration = numerical bug in the new variant). Rule: any new tl.constexpr configuration (GROUP/BK/R/T) gets a decode-vs-reference bit-exact check on real shapes before touching a model.
 
+## 27B C++ port (2026/10 session) — pieces all gated, Stage 4 = assembly
+- All in engine_v5.cu, each with its own gate test, zero exceptions:
+  UDCQ gemv/gemm (fp64 1e-7 tier; BUG: pack scale is f16 — kernel
+  must take f32, convert at init, else rel-err 1.0); GDN recurrent
+  core (3.97e-7 vs HF torch_recurrent_gated_delta_rule; q,k need
+  L2norm + q pre-scale 1/sqrt(dk) HOST-side); l2norm (bit-exact);
+  conv1d_update (state bit-exact); gated_rmsnorm (Qwen3_5RMSNormGated
+  = (w*o*rsqrt(mean+eps))*silu(z)); FULL GDN LAYER assembled
+  (test_gdn_layer.py, 2.5e-7 first try — spec in
+  docs/gdn_layer_spec.md). UDCQ GEMM T-amortizes 55->11.7us/tok.
+- split-K verdict: NO-DEPLOY (x-restaging/bandwidth-bound, not
+  occupancy; order-preserving pipelining neutral — nvcc already
+  hoists). GEMV ~22us = format floor; decode gains only via spec dec.
+- Multi-instance engines: instance=N -> suffixed module = separate
+  statics, gate PASSED (test_cpp_multi_instance.py). Weights dup
+  0.7GB/instance.
+- Stage 4 remaining: 27B engine assembly (64-layer hybrid scheduler,
+  safetensors per-layer loader, UDCQ packs) + MTP spec decode
+  (round4b queue semantics + prefill_batch verify chain). Full-attn
+  layers reuse attn_v2/rmsnorm/rope unchanged.
+- engine_v5.cu is 2100+ lines with ~350 dead/research lines; staged
+  hygiene plan in docs/engine_v5_refactor_plan.md (execute Step 1
+  first — zero-semantics dead code removal, no ext-name bump).
+
 ## C++ engine (ixrun/cpp) - 2026/10 session
 - engine_v5.cu: GSQ GEMV (bit-exact port) + rmsnorm_f32 + rope + GQA S=1 attn
   + mlp_forward + layer_forward, all fp32-internal with bf16 boundaries.
