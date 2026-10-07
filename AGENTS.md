@@ -243,6 +243,17 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   (c) bisect the SOURCE with direct nvcc -c runs on the cached
   cuda.cu (ninja bypass, locate the offending construct).
   Bisect logic + ground truth (HF top1 ' Paris') committed.
+- nvcc AV FORENSICS round 2 (post-reboot): fwd-decl removal ->
+  CLEAN "identifier undefined" error (no AV!) => the fwd DECL
+  of attn_layer_step (36 torch::Tensor params) IS the cudafe
+  trigger; single-decl + fresh cache dir (s4h) still AV =>
+  not dir poisoning. PS IndexOf surgery on the .cu EMPTYED the
+  file once (git checkout saved it) — NEVER do substring
+  surgery on engine_v5.cu via PS, edit tool only.
+  UNBLOCK = split source (Step 3): move 27B scheduler+layer fns
+  to engine_27b.cu where step27 sits AFTER its callees (no fwd
+  decls needed at all). That both fixes the AV and completes
+  the hygiene plan.
 - Step 4 (decode_64 scheduler) DESIGN CORRECTION before coding:
   the two layer fns have ASYMMETRIC contracts — attn_layer_step
   includes norms/residuals/mlp, gdn_layer_step is bare-core (norms/
