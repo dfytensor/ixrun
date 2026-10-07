@@ -4,6 +4,7 @@
 // all kernels on current stream, no split-K (keep it simple first).
 #include <torch/extension.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cstdint>
 #include <ATen/cuda/CUDAContext.h>
 #include <cmath>
@@ -542,7 +543,7 @@ __global__ void udcq_gemv_kernel(
     const float* __restrict__ x,
     const uint8_t* __restrict__ idx,
     const uint32_t* __restrict__ sign,
-    const float* __restrict__ scale,           // f16->f32 at init
+    const __half* __restrict__ scale,          // f16-resident
     const float* __restrict__ cb,              // [16] fp32
     float* __restrict__ y,
     int in_f, int GROUP)
@@ -555,7 +556,7 @@ __global__ void udcq_gemv_kernel(
         long long o = base + j;
         uint8_t b = idx[o >> 1];
         int nib = (o & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
-        float sc = scale[o / GROUP];
+        float sc = __half2float(scale[o / GROUP]);
         uint32_t sw = sign[o >> 5];
         float sgn = ((sw >> (o & 31)) & 1u) ? 1.f : -1.f;
         acc += cb[nib] * sc * sgn * x[j];
@@ -585,7 +586,7 @@ torch::Tensor udcq_gemv_out(torch::Tensor x,
                        at::cuda::getCurrentCUDAStream()>>>(
         x.data_ptr<float>(), idx.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(sign.data_ptr()),
-        scale.data_ptr<float>(),
+        reinterpret_cast<const __half*>(scale.data_ptr()),
         cb.data_ptr<float>(), y.data_ptr<float>(),
         (int)in_f, (int)group);
     return y;
@@ -597,7 +598,7 @@ __global__ void udcq_gemm_kernel(
     const float* __restrict__ x,
     const uint8_t* __restrict__ idx,
     const uint32_t* __restrict__ sign,
-    const float* __restrict__ scale,
+    const __half* __restrict__ scale,
     const float* __restrict__ cb,
     float* __restrict__ y,
     int in_f, int out_f, int GROUP)
@@ -612,7 +613,7 @@ __global__ void udcq_gemm_kernel(
         long long o = base + j;
         uint8_t b = idx[o >> 1];
         int nib = (o & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
-        float sc = scale[o / GROUP];
+        float sc = __half2float(scale[o / GROUP]);
         uint32_t sw = sign[o >> 5];
         float sgn = ((sw >> (o & 31)) & 1u) ? 1.f : -1.f;
         acc += cb[nib] * sc * sgn * xt[j];
@@ -644,7 +645,7 @@ torch::Tensor udcq_gemm_out(torch::Tensor x2d,
                        at::cuda::getCurrentCUDAStream()>>>(
         x2d.data_ptr<float>(), idx.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(sign.data_ptr()),
-        scale.data_ptr<float>(), cb.data_ptr<float>(),
+        reinterpret_cast<const __half*>(scale.data_ptr()), cb.data_ptr<float>(),
         y.data_ptr<float>(), (int)in_f, (int)out_f, (int)group);
     return y;
 }
@@ -925,22 +926,22 @@ torch::Tensor gdn_layer_step(
     udcq_gemv_kernel<<<(unsigned)conv_dim, 256, 0, st>>>(
         h.data_ptr<float>(), qkv_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(qkv_s.data_ptr()),
-        qkv_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        reinterpret_cast<const __half*>(qkv_sc.data_ptr()), cb.data_ptr<float>(),
         qkv.data_ptr<float>(), hidden, GROUP);
     udcq_gemv_kernel<<<(unsigned)value_dim, 256, 0, st>>>(
         h.data_ptr<float>(), z_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(z_s.data_ptr()),
-        z_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        reinterpret_cast<const __half*>(z_sc.data_ptr()), cb.data_ptr<float>(),
         z.data_ptr<float>(), hidden, GROUP);
     udcq_gemv_kernel<<<(unsigned)nv, 256, 0, st>>>(
         h.data_ptr<float>(), b_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(b_s.data_ptr()),
-        b_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        reinterpret_cast<const __half*>(b_sc.data_ptr()), cb.data_ptr<float>(),
         bo.data_ptr<float>(), hidden, GROUP);
     udcq_gemv_kernel<<<(unsigned)nv, 256, 0, st>>>(
         h.data_ptr<float>(), a_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(a_s.data_ptr()),
-        a_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        reinterpret_cast<const __half*>(a_sc.data_ptr()), cb.data_ptr<float>(),
         ao.data_ptr<float>(), hidden, GROUP);
 
     conv1d_update_kernel<<<(conv_dim + 255) / 256, 256, 0, st>>>(
@@ -988,7 +989,7 @@ torch::Tensor gdn_layer_step(
     udcq_gemv_kernel<<<(unsigned)hidden, 256, 0, st>>>(
         on.view(-1).data_ptr<float>(), o_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(o_s.data_ptr()),
-        o_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        reinterpret_cast<const __half*>(o_sc.data_ptr()), cb.data_ptr<float>(),
         out.data_ptr<float>(), value_dim, GROUP);
     return out;
 }
@@ -2587,7 +2588,8 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
     udcq_gemv_kernel<<<(unsigned)vocab, 256, 0, st>>>(
         fn.data_ptr<float>(), s27_lh_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(s27_lh_s.data_ptr()),
-        s27_lh_sc.data_ptr<float>(), s27_cb.data_ptr<float>(),
+        reinterpret_cast<const __half*>(s27_lh_sc.data_ptr()),
+        s27_cb.data_ptr<float>(),
         lg.data_ptr<float>(), hidden, GROUP);
     argmax_f32<<<1, 256, 0, st>>>(
         lg.data_ptr<float>(), (int)vocab,
@@ -2667,7 +2669,7 @@ torch::Tensor attn_layer_step(
     udcq_gemv_kernel<<<(unsigned)(nh * hd * 2), 256, 0, st>>>(
         xn.data_ptr<float>(), q_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(q_s.data_ptr()),
-        q_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        reinterpret_cast<const __half*>(q_sc.data_ptr()), cb.data_ptr<float>(),
         q2.data_ptr<float>(), hidden, GROUP);
     // fused per-head gate: q2 [nh,512] -> q [nh,256] + gate [nh,256]
     chunk_qgate_kernel<<<(unsigned)nh, (unsigned)hd, 0, st>>>(
@@ -2676,12 +2678,12 @@ torch::Tensor attn_layer_step(
     udcq_gemv_kernel<<<(unsigned)(nkv * hd), 256, 0, st>>>(
         xn.data_ptr<float>(), k_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(k_s.data_ptr()),
-        k_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        reinterpret_cast<const __half*>(k_sc.data_ptr()), cb.data_ptr<float>(),
         k2.data_ptr<float>(), hidden, GROUP);
     udcq_gemv_kernel<<<(unsigned)(nkv * hd), 256, 0, st>>>(
         xn.data_ptr<float>(), v_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(v_s.data_ptr()),
-        v_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        reinterpret_cast<const __half*>(v_sc.data_ptr()), cb.data_ptr<float>(),
         v2.data_ptr<float>(), hidden, GROUP);
     rmsnorm_fw_kernel<<<nh, 256, 0, st>>>(
         qh.data_ptr<float>(), q_norm_w.data_ptr<float>(),
@@ -2711,7 +2713,7 @@ torch::Tensor attn_layer_step(
     udcq_gemv_kernel<<<(unsigned)hidden, 256, 0, st>>>(
         att.data_ptr<float>(), o_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(o_s.data_ptr()),
-        o_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        reinterpret_cast<const __half*>(o_sc.data_ptr()), cb.data_ptr<float>(),
         o.data_ptr<float>(), nh * hd, GROUP);
     add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
         h.data_ptr<float>(), o.data_ptr<float>(),
@@ -2722,12 +2724,12 @@ torch::Tensor attn_layer_step(
     udcq_gemv_kernel<<<(unsigned)inter, 256, 0, st>>>(
         xn2.data_ptr<float>(), g_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(g_s.data_ptr()),
-        g_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        reinterpret_cast<const __half*>(g_sc.data_ptr()), cb.data_ptr<float>(),
         mg.data_ptr<float>(), hidden, GROUP);
     udcq_gemv_kernel<<<(unsigned)inter, 256, 0, st>>>(
         xn2.data_ptr<float>(), u_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(u_s.data_ptr()),
-        u_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        reinterpret_cast<const __half*>(u_sc.data_ptr()), cb.data_ptr<float>(),
         mu.data_ptr<float>(), hidden, GROUP);
     silu_kernel<<<(unsigned)((inter + 255) / 256), 256, 0, st>>>(
         mg.data_ptr<float>(), mu.data_ptr<float>(),
@@ -2735,7 +2737,7 @@ torch::Tensor attn_layer_step(
     udcq_gemv_kernel<<<(unsigned)hidden, 256, 0, st>>>(
         act.data_ptr<float>(), d_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(d_s.data_ptr()),
-        d_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        reinterpret_cast<const __half*>(d_sc.data_ptr()), cb.data_ptr<float>(),
         md.data_ptr<float>(), inter, GROUP);
     add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
         h1.data_ptr<float>(), md.data_ptr<float>(),

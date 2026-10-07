@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Step 4b smoke gate: init27+step27 on a 4-layer mini schedule
 (3 GDN + 1 attn). Checks: runs, deterministic, states advance."""
 import sys
@@ -23,7 +23,7 @@ void init27(torch::Tensor cb,
     int64_t hidden, int64_t inter, int64_t ctx);
 int64_t step27(torch::Tensor h, int64_t pos, double theta);
 '''
-ext = load_inline(name='ixrun_cpp_v5s4f', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v5s4g', cpp_sources=[proto],
                   cuda_sources=[src],
                   functions=['init27', 'step27'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
@@ -40,7 +40,7 @@ def mkpack(of, inf):
             torch.randint(-2**31, 2**31 - 1, (of * inf // 32,),
                           dtype=torch.int32, device='cuda'),
             (torch.randn(of * inf // 16, generator=g,
-                         device='cuda') * 0.01).float())
+                         device='cuda') * 0.01).half())
 
 cb = torch.randn(16, generator=g, device='cuda').float()
 packs, nw1, nw2, gex, gnorm, aex = [], [], [], [], [], []
@@ -75,7 +75,7 @@ lh = mkpack(248320, hidden)
 ext.init27(cb, packs, nw1, nw2, gex, gnorm, aex, fnw,
            *lh, ATTN, hidden, inter, ctx)
 
-# 8 greedy tokens, twice — determinism
+# 8 greedy tokens, twice 鈥?determinism
 def run8():
     toks = []
     for p in range(8):
@@ -89,10 +89,10 @@ t1 = run8()
 g2 = torch.Generator(device='cuda').manual_seed(53)
 # rebuild generator state for identical h sequence is awkward;
 # instead: second pass reuses the same h list implicitly via
-# same seed chain — simplest determinism check: rerun with
+# same seed chain 鈥?simplest determinism check: rerun with
 # a fresh init-free call reusing recorded h's is skipped; here
 # just verify tokens are valid ids and states advanced.
 print('tokens:', t1, flush=True)
 assert all(0 <= t < 248320 for t in t1)
-assert len(set(t1)) > 1, 'all tokens identical — suspicious'
+assert len(set(t1)) > 1, 'all tokens identical 鈥?suspicious'
 print('STEP 4b SMOKE GATE PASSED', flush=True)
