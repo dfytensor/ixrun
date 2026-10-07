@@ -15,6 +15,12 @@ __global__ void set_pos_kernel(const int* pos_gpu) {
     d_pos = *pos_gpu;
 }
 
+// host-value variant: kernel args are captured at ENQUEUE time, so a
+// host loop can enqueue all iterations without a pinned-buffer race.
+__global__ void write_pos_kernel(int* pos_gpu, int val) {
+    *pos_gpu = val;
+}
+
 // ---------------- GSQ GEMV (fp32 x, fp32 y) ---------------- //
 __global__ void gsq_gemv_kernel(
     const float* __restrict__ x,
@@ -713,6 +719,33 @@ static std::vector<torch::Tensor> g_kcs, g_inws, g_postws,
 static std::vector<double> g_bases, g_steps;
 static std::vector<int64_t> g_outfs, g_infs;
 
+// shared output buffers (used by step, step_graph, sf_step_graph
+// so eager and graph paths are bit-comparable)
+static torch::Tensor g_emb_buf, g_fn_buf, g_lg_buf, g_tok_gpu,
+                     g_tok_hist;
+static bool g_bufs_init = false;
+
+static void ensure_g_bufs() {
+    if (g_bufs_init) return;
+    auto dev = g_embed.device();
+    g_emb_buf = torch::empty({g_hidden},
+        torch::TensorOptions().dtype(torch::kBFloat16)
+            .device(dev));
+    g_fn_buf = torch::empty({g_hidden},
+        torch::TensorOptions().dtype(torch::kFloat32)
+            .device(dev));
+    g_lg_buf = torch::empty({g_lh_out_f},
+        torch::TensorOptions().dtype(torch::kFloat32)
+            .device(dev));
+    g_tok_gpu = torch::zeros({1},
+        torch::TensorOptions().dtype(torch::kInt64)
+            .device(dev));
+    g_tok_hist = torch::zeros({g_ctx},
+        torch::TensorOptions().dtype(torch::kInt64)
+            .device(dev));
+    g_bufs_init = true;
+}
+
 void init_model(
     torch::Tensor embed_table, torch::Tensor pos_gpu,
     std::vector<torch::Tensor> kv_caches,
@@ -745,31 +778,47 @@ void init_model(
     g_init = true;
 }
 
-// shared output buffers (used by step, step_graph, sf_step_graph
-// so eager and graph paths are bit-comparable)
-static torch::Tensor g_emb_buf, g_fn_buf, g_lg_buf, g_tok_gpu,
-                     g_tok_hist;
-static bool g_bufs_init = false;
-
-static void ensure_g_bufs() {
-    if (g_bufs_init) return;
-    auto dev = g_embed.device();
-    g_emb_buf = torch::empty({g_hidden},
-        torch::TensorOptions().dtype(torch::kBFloat16)
-            .device(dev));
-    g_fn_buf = torch::empty({g_hidden},
-        torch::TensorOptions().dtype(torch::kFloat32)
-            .device(dev));
-    g_lg_buf = torch::empty({g_lh_out_f},
-        torch::TensorOptions().dtype(torch::kFloat32)
-            .device(dev));
-    g_tok_gpu = torch::zeros({1},
-        torch::TensorOptions().dtype(torch::kInt64)
-            .device(dev));
-    g_tok_hist = torch::zeros({g_ctx},
-        torch::TensorOptions().dtype(torch::kInt64)
-            .device(dev));
-    g_bufs_init = true;
+// Batch prefill: whole prompt in ONE C++ call. Layer-only (no lm_head
+// / argmax / .item() sync per token — those were ~90% of prefill time
+// on WDDM). Caller runs step(last_token) afterwards for the first
+// generated token. Semantics identical to per-token step().
+void prefill_tokens(std::vector<int64_t> toks, int64_t start_pos) {
+    if (!g_init) throw std::runtime_error("init_model not called");
+    auto st = at::cuda::getCurrentCUDAStream();
+    ensure_g_bufs();
+    int nl = (int)g_kcs.size();
+    for (size_t i = 0; i < toks.size(); ++i) {
+        int p = (int)(start_pos + i);
+        write_pos_kernel<<<1, 1, 0, st>>>(
+            reinterpret_cast<int*>(g_pos.data_ptr()), p);
+        set_pos_kernel<<<1, 1, 0, st>>>(
+            reinterpret_cast<const int*>(g_pos.data_ptr()));
+        cudaMemcpyAsync(g_emb_buf.data_ptr(),
+            reinterpret_cast<const char*>(g_embed.data_ptr())
+                + toks[i] * g_hidden * 2,
+            g_hidden * 2, cudaMemcpyDeviceToDevice, st);
+        auto h = g_emb_buf;
+        for (int l = 0; l < nl; ++l) {
+            int b = l * 7;
+            h = layer_forward(
+                h, g_inws[l], g_postws[l],
+                g_codes[b], g_cbs[b], g_s[b],
+                g_bases[b], g_steps[b], g_outfs[b], g_infs[b],
+                g_codes[b+1], g_cbs[b+1], g_s[b+1],
+                g_bases[b+1], g_steps[b+1], g_outfs[b+1], g_infs[b+1],
+                g_codes[b+2], g_cbs[b+2], g_s[b+2],
+                g_bases[b+2], g_steps[b+2], g_outfs[b+2], g_infs[b+2],
+                g_codes[b+3], g_cbs[b+3], g_s[b+3],
+                g_bases[b+3], g_steps[b+3], g_outfs[b+3], g_infs[b+3],
+                g_codes[b+4], g_cbs[b+4], g_s[b+4],
+                g_bases[b+4], g_steps[b+4], g_outfs[b+4], g_infs[b+4],
+                g_codes[b+5], g_cbs[b+5], g_s[b+5],
+                g_bases[b+5], g_steps[b+5], g_outfs[b+5], g_infs[b+5],
+                g_codes[b+6], g_cbs[b+6], g_s[b+6],
+                g_bases[b+6], g_steps[b+6], g_outfs[b+6], g_infs[b+6],
+                g_kcs[l], g_nheads, g_nkv, g_hd, g_ctx, g_theta);
+        }
+    }
 }
 
 int64_t step(int64_t token_id) {

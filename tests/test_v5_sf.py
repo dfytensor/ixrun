@@ -66,14 +66,16 @@ void init_model(
     int64_t n_heads, int64_t n_kv_heads,
     int64_t head_dim, int64_t ctx, double theta);
 int64_t step(int64_t token_id);
+void prefill_tokens(std::vector<int64_t> toks, int64_t start_pos);
 void sf_step_graph();
 void sf_seed(int64_t token, int64_t pos);
 torch::Tensor sf_get_hist(int64_t from, int64_t n);
 '''
-ext = load_inline(name='ixrun_cpp_v5sf8', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v5sf9', cpp_sources=[proto],
                   cuda_sources=[src],
                   functions=['init_model', 'step', 'sf_step_graph',
-                             'sf_seed', 'sf_get_hist'],
+                             'sf_seed', 'sf_get_hist',
+                             'prefill_tokens'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
@@ -112,10 +114,9 @@ NGEN = 64
 def prefill_and_gen():
     for kc in kcs:
         kc.zero_()
-    nxt = prompt_ids[0]
-    for i, t in enumerate(prompt_ids):
-        pos_gpu.fill_(i)
-        nxt = ext.step(t)
+    ext.prefill_tokens(prompt_ids[:-1], 0)
+    pos_gpu.fill_(len(prompt_ids) - 1)
+    nxt = ext.step(prompt_ids[-1])
     out = []
     tok_cur = nxt
     for g in range(NGEN):
@@ -132,11 +133,14 @@ print(f'ref prefill+gen: {t_ref:.1f}s', flush=True)
 # ---------- B. reset state, warmup + capture self-feeding graph ----------
 for kc in kcs:
     kc.zero_()
-nxt = prompt_ids[0]
-for i, t in enumerate(prompt_ids):
-    pos_gpu.fill_(i)
-    nxt = ext.step(t)
-print(f're-prefilled, nxt={nxt}', flush=True)
+t0 = time.perf_counter()
+ext.prefill_tokens(prompt_ids[:-1], 0)
+pos_gpu.fill_(len(prompt_ids) - 1)
+nxt = ext.step(prompt_ids[-1])
+torch.cuda.synchronize()
+t_pf = time.perf_counter() - t0
+print(f'batch prefill {len(prompt_ids)} tok in {t_pf:.2f}s '
+      f'({len(prompt_ids)/t_pf:.0f} tok/s)', flush=True)
 
 ext.sf_seed(nxt, len(prompt_ids))   # seed before warmup
 torch.cuda.synchronize()
@@ -182,10 +186,9 @@ if d is not None:
 # ---------- C2. ref generated AFTER graph (transient check) ----------
 for kc in kcs:
     kc.zero_()
-nxt2 = prompt_ids[0]
-for i, t in enumerate(prompt_ids):
-    pos_gpu.fill_(i)
-    nxt2 = ext.step(t)
+ext.prefill_tokens(prompt_ids[:-1], 0)
+pos_gpu.fill_(len(prompt_ids) - 1)
+nxt2 = ext.step(prompt_ids[-1])
 ref2 = []
 t_ = nxt2
 for g in range(NGEN):
