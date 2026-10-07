@@ -24,10 +24,11 @@ void init27(torch::Tensor cb,
     int64_t hidden, int64_t inter, int64_t ctx);
 int64_t step27(torch::Tensor h, int64_t pos, double theta);
 torch::Tensor s27_get_lg();
+    torch::Tensor s27_get_hnorm();
 '''
 ext = load_inline(name='ixrun_cpp_v5s4g', cpp_sources=[proto],
                   cuda_sources=[src],
-                  functions=['init27', 'step27', 's27_get_lg'],
+                  functions=['init27', 'step27', 's27_get_lg', 's27_get_hnorm'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
@@ -103,6 +104,7 @@ for pos, t in enumerate(ids):
     if pos == len(ids) - 1:
         lg = ext.s27_get_lg()
         top = torch.topk(lg, 5)
+        print('h-norms:', [round(x, 1) for x in ext.s27_get_hnorm().tolist()], flush=True)
         print(f'logits: max {lg.max():.3f} min {lg.min():.3f} '
               f'nan {torch.isnan(lg).any().item()}',
               flush=True)
@@ -119,6 +121,8 @@ for pos, t in enumerate(ids):
         print(f'HF  top5: {htop.indices.tolist()}', flush=True)
         print(f'HF  vals: {[round(v, 2) for v in htop.values.tolist()]}',
               flush=True)
+        hn = ext.s27_get_hnorm().tolist()
+        print('h-norms:', [round(x, 1) for x in hn], flush=True)
         cos = torch.nn.functional.cosine_similarity(
             lg, hf_lg, dim=0).item()
         print(f'cosine(cpp, hf): {cos:.4f}', flush=True)

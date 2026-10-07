@@ -2443,6 +2443,7 @@ static std::vector<int64_t> s27_attn_layers;
 static int64_t s27_hidden, s27_inter, s27_ctx;
 static bool s27_init = false;
 static torch::Tensor s27_lg_out;
+static std::vector<float> s27_hnorm;   // per-layer probe
 
 void init27(
     torch::Tensor cb,
@@ -2515,6 +2516,7 @@ torch::Tensor gdn_decoder_step(
 
 int64_t step27(torch::Tensor h, int64_t pos, double theta) {
     if (!s27_init) throw std::runtime_error("init27 not called");
+    s27_hnorm.clear();
     auto st = at::cuda::getCurrentCUDAStream();
     int hidden = (int)s27_hidden;
     int inter = (int)s27_inter;
@@ -2581,6 +2583,8 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
             ig++;
         }
         h = hcur;
+        torch::Tensor hn = hcur.norm();
+        s27_hnorm.push_back(hn.item<float>());
     }
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h.data_ptr<float>(), s27_fnw.data_ptr<float>(),
@@ -2600,6 +2604,12 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
 }
 
 torch::Tensor s27_get_lg() { return s27_lg_out.cpu(); }
+
+torch::Tensor s27_get_hnorm() {
+    return torch::from_blob(s27_hnorm.data(),
+        {(long long)s27_hnorm.size()},
+        torch::TensorOptions().dtype(torch::kFloat32)).clone();
+}
 
 // q_proj fused gate split: src [nh, 512] -> q [nh,256], gate [nh,256]
 __global__ void chunk_qgate_kernel(const float* src, float* q,
