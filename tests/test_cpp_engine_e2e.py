@@ -33,7 +33,7 @@ t0 = time.perf_counter()
 nxt = eng.prefill(ids)
 t_pf = time.perf_counter() - t0
 t0 = time.perf_counter()
-graph_toks = eng.generate(nxt, len(ids), NGEN)
+graph_toks = eng._gen_block(nxt, len(ids), NGEN)
 t_g = time.perf_counter() - t0
 print(f'prefill {len(ids)} tok: {t_pf:.2f}s '
       f'({len(ids)/t_pf:.0f} tok/s)', flush=True)
