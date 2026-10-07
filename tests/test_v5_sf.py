@@ -70,7 +70,7 @@ void sf_step_graph();
 void sf_seed(int64_t token, int64_t pos);
 torch::Tensor sf_get_hist(int64_t from, int64_t n);
 '''
-ext = load_inline(name='ixrun_cpp_v5sf7', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v5sf8', cpp_sources=[proto],
                   cuda_sources=[src],
                   functions=['init_model', 'step', 'sf_step_graph',
                              'sf_seed', 'sf_get_hist'],

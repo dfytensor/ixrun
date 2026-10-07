@@ -255,6 +255,66 @@ __global__ void attn_kernel(
     out[h * head_dim + d] = sum / denom;
 }
 
+// ---------------- attention v2 (smem weights, bit-exact) ------------- //
+// v1 recomputed the full score scan in EVERY thread (128x) and again
+// in pass 2. v2: threads split the t-range for scores (each t computed
+// once, same j-order), block-max reduce (exact, order-free), then the
+// weighted-sum pass reads smem weights -> identical arithmetic, ~2x
+// faster and 128x less score work.
+__global__ void attn_kernel_v2(
+    const float* __restrict__ q,
+    const __nv_bfloat16* __restrict__ kv,
+    float* __restrict__ out,
+    int n_heads, int n_kv_heads,
+    int head_dim, int ctx)
+{
+    int pos = d_pos;
+    int h = blockIdx.x;
+    int d = threadIdx.x;
+    int kvh = h / (n_heads / n_kv_heads);
+    const __nv_bfloat16* ks = kv + kvh * ctx * head_dim;
+    const __nv_bfloat16* vs = kv + (long long)n_kv_heads*ctx*head_dim
+                              + kvh * ctx * head_dim;
+    float inv_hd = rsqrtf((float)head_dim);
+    extern __shared__ float w_sm[];          // ctx floats
+    __shared__ float red[32];
+    // 1. scores for t = d, d+blockDim, ... (same j-order as v1)
+    float maxs = -1e30f;
+    for (int t = d; t <= pos; t += blockDim.x) {
+        float sc = 0.f;
+        for (int j = 0; j < head_dim; ++j)
+            sc += q[h*head_dim + j]
+                * __bfloat162float(ks[t*head_dim + j]);
+        sc *= inv_hd;
+        w_sm[t] = sc;
+        if (sc > maxs) maxs = sc;
+    }
+    // 2. block max (exact — no rounding, order-free)
+    if (threadIdx.x < 32) red[threadIdx.x] = -1e30f;
+    __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        maxs = fmaxf(maxs, __shfl_down_sync(0xffffffff, maxs, off));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = maxs;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = -1e30f;
+        for (int k = 0; k < (int)(blockDim.x >> 5); ++k)
+            m = fmaxf(m, red[k]);
+        red[0] = m;
+    }
+    __syncthreads();
+    maxs = red[0];
+    // 3. weighted sum (same t-order, same exp arg as v1)
+    float denom = 0.f, sum = 0.f;
+    for (int t = 0; t <= pos; ++t) {
+        float sc = expf(w_sm[t] - maxs);
+        denom += sc;
+        sum += sc * __bfloat162float(vs[t*head_dim + d]);
+    }
+    out[h * head_dim + d] = sum / denom;
+}
+
 // ---------------- silu-mul (fp32) ---------------- //
 __global__ void silu_kernel(const float* a, const float* b,
                              float* out, int n) {
@@ -389,7 +449,8 @@ torch::Tensor layer_forward(
     }
 
     // 5. attention (reads d_pos)
-    attn_kernel<<<(unsigned)n_heads, (unsigned)hd, 0, st>>>(
+    attn_kernel_v2<<<(unsigned)n_heads, (unsigned)hd,
+                     (size_t)ctx * sizeof(float), st>>>(
         b_q.data_ptr<float>(),
         reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr()),
         b_attn.data_ptr<float>(),
