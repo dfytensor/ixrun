@@ -862,6 +862,60 @@ int64_t get_last_token() {
     return g_tok_gpu.item<int64_t>();
 }
 
+// ---------------- CUDA Graph with raw cudaMalloc input (WDDM-safe) ---- //
+static cudaGraphExec_t raw_exec = nullptr;
+static cudaGraph_t raw_graph = nullptr;
+static bool raw_captured = false;
+static float* raw_input = nullptr;
+static float* raw_output = nullptr;
+static int raw_n = 0;
+
+__global__ void copy_kernel(const float* src, float* dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i] * 2.0f;
+}
+
+void raw_graph_init(int64_t n) {
+    raw_n = (int)n;
+    if (raw_input) cudaFree(raw_input);
+    if (raw_output) cudaFree(raw_output);
+    cudaMalloc(&raw_input, raw_n * sizeof(float));
+    cudaMalloc(&raw_output, raw_n * sizeof(float));
+    cudaMemset(raw_input, 0, raw_n * sizeof(float));
+    cudaMemset(raw_output, 0, raw_n * sizeof(float));
+}
+
+void raw_graph_set_input(torch::Tensor data) {
+    cudaMemcpy(raw_input, data.data_ptr<float>(),
+               raw_n * sizeof(float),
+               cudaMemcpyDeviceToDevice);
+}
+
+torch::Tensor raw_graph_get_output() {
+    return torch::from_blob(raw_output, {raw_n},
+        torch::TensorOptions().dtype(torch::kFloat32)
+            .device(torch::kCUDA)).clone();
+}
+
+void raw_graph_capture() {
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    copy_kernel<<<1, 256, 0, stream>>>(
+        raw_input, raw_output, raw_n);
+    cudaStreamSynchronize(stream);
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+    copy_kernel<<<1, 256, 0, stream>>>(
+        raw_input, raw_output, raw_n);
+    cudaStreamEndCapture(stream, &raw_graph);
+    cudaGraphInstantiate(&raw_exec, raw_graph, NULL, NULL, 0);
+    raw_captured = true;
+}
+
+void raw_graph_replay() {
+    if (!raw_captured) throw std::runtime_error("not captured");
+    cudaGraphLaunch(raw_exec,
+                    at::cuda::getCurrentCUDAStream().stream());
+}
+
 static cudaGraphExec_t g_exec = nullptr;
 static cudaGraph_t g_graph = nullptr;
 static bool g_captured = false;
