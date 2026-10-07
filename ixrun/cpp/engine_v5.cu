@@ -805,6 +805,45 @@ torch::Tensor rope27_out(torch::Tensor q, torch::Tensor k,
     return q;
 }
 
+// fp32 rmsnorm with weight (Qwen3_5RMSNorm on fp32 q/k rows)
+__global__ void rmsnorm_fw_kernel(const float* __restrict__ x,
+                                  const float* __restrict__ w,
+                                  float* __restrict__ y,
+                                  int d, float eps) {
+    __shared__ float red[32];
+    const float* xr = x + (long long)blockIdx.x * d;
+    float* yr = y + (long long)blockIdx.x * d;
+    float sq = 0.f;
+    for (int i = threadIdx.x; i < d; i += blockDim.x)
+        sq += xr[i] * xr[i];
+    if (threadIdx.x < 32) red[threadIdx.x] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        sq += __shfl_down_sync(0xffffffff, sq, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sq;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int k = 0; k < (int)(blockDim.x >> 5); ++k) t += red[k];
+        red[0] = rsqrtf(t / (float)d + eps);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < d; i += blockDim.x)
+        yr[i] = w[i] * xr[i] * red[0];
+}
+
+torch::Tensor rmsnorm_fw_out(torch::Tensor x2d, torch::Tensor w,
+                             double eps) {
+    int R = (int)x2d.size(0), d = (int)x2d.size(1);
+    auto y = torch::empty_like(x2d);
+    rmsnorm_fw_kernel<<<R, 256, 0,
+                        at::cuda::getCurrentCUDAStream()>>>(
+        x2d.data_ptr<float>(), w.data_ptr<float>(),
+        y.data_ptr<float>(), d, (float)eps);
+    return y;
+}
+
 // ---------------- Stage 4 step 3a: GDN layer step --------------------- //
 __global__ void gdn_recurrent_kernel(
     const float* __restrict__ q, const float* __restrict__ k,
@@ -2316,4 +2355,152 @@ torch::Tensor graph_replay() {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     cudaGraphLaunch(g_exec, stream);
     return g_result;
+}
+
+// q_proj fused gate split: src [nh, 512] -> q [nh,256], gate [nh,256]
+__global__ void chunk_qgate_kernel(const float* src, float* q,
+                                   float* gate, int hd) {
+    int h = blockIdx.x;
+    int i = threadIdx.x;
+    if (i < hd) {
+        q[(long long)h * hd + i]
+            = src[(long long)h * hd * 2 + i];
+        gate[(long long)h * hd + i]
+            = src[(long long)h * hd * 2 + hd + i];
+    }
+}
+// y[i] *= sigmoid(g[i])
+__global__ void sigmoid_mul_kernel(float* y, const float* g,
+                                   int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] *= 1.f / (1.f + expf(-g[i]));
+}
+
+// ---------------- Stage 4 step 3b: full-attn layer step ---------------- //
+torch::Tensor attn_layer_step(
+    torch::Tensor h,                    // [5120] fp32 in/out value
+    torch::Tensor cb,
+    torch::Tensor q_i, torch::Tensor q_s, torch::Tensor q_sc,
+    torch::Tensor k_i, torch::Tensor k_s, torch::Tensor k_sc,
+    torch::Tensor v_i, torch::Tensor v_s, torch::Tensor v_sc,
+    torch::Tensor o_i, torch::Tensor o_s, torch::Tensor o_sc,
+    torch::Tensor g_i, torch::Tensor g_s, torch::Tensor g_sc,
+    torch::Tensor u_i, torch::Tensor u_s, torch::Tensor u_sc,
+    torch::Tensor d_i, torch::Tensor d_s, torch::Tensor d_sc,
+    torch::Tensor in_w, torch::Tensor post_w,
+    torch::Tensor q_norm_w, torch::Tensor k_norm_w,
+    torch::Tensor kv_cache,             // [8, ctx, 256] bf16
+    double theta, int64_t pos,
+    int64_t nh, int64_t nkv, int64_t hd,
+    int64_t hidden, int64_t inter, int64_t ctx)
+{
+    auto st = at::cuda::getCurrentCUDAStream();
+    int GROUP = 16;
+    auto f32 = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(h.device());
+    static torch::Tensor xn, q2, gt, k2, v2, qh, kh, o2, att, o,
+                        h1, xn2, mg, mu, act, md, out;
+    static bool init = false;
+    if (!init) {
+        xn  = torch::empty({1, hidden}, f32);
+        q2  = torch::empty({nh * hd * 2}, f32);
+        gt  = torch::empty({nh * hd}, f32);
+        k2  = torch::empty({1, nkv * hd}, f32);
+        v2  = torch::empty({1, nkv * hd}, f32);
+        qh  = torch::empty({nh, hd}, f32);
+        kh  = torch::empty({nkv, hd}, f32);
+        o2  = torch::empty({1, nh * hd}, f32);
+        att = torch::empty({1, nh * hd}, f32);
+        o   = torch::empty({hidden}, f32);
+        h1  = torch::empty({hidden}, f32);
+        xn2 = torch::empty({1, hidden}, f32);
+        mg  = torch::empty({inter}, f32);
+        mu  = torch::empty({inter}, f32);
+        act = torch::empty({inter}, f32);
+        md  = torch::empty({hidden}, f32);
+        out = torch::empty({hidden}, f32);
+        init = true;
+    }
+    int P = (int)pos;
+
+    rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
+        h.data_ptr<float>(), in_w.data_ptr<float>(),
+        xn.data_ptr<float>(), hidden, 1e-6f);
+    udcq_gemv_kernel<<<(unsigned)(nh * hd * 2), 256, 0, st>>>(
+        xn.data_ptr<float>(), q_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(q_s.data_ptr()),
+        q_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        q2.data_ptr<float>(), hidden, GROUP);
+    // fused per-head gate: q2 [nh,512] -> q [nh,256] + gate [nh,256]
+    chunk_qgate_kernel<<<(unsigned)nh, (unsigned)hd, 0, st>>>(
+        q2.data_ptr<float>(), qh.data_ptr<float>(),
+        gt.data_ptr<float>(), (int)hd);
+    udcq_gemv_kernel<<<(unsigned)(nkv * hd), 256, 0, st>>>(
+        xn.data_ptr<float>(), k_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(k_s.data_ptr()),
+        k_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        k2.data_ptr<float>(), hidden, GROUP);
+    udcq_gemv_kernel<<<(unsigned)(nkv * hd), 256, 0, st>>>(
+        xn.data_ptr<float>(), v_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(v_s.data_ptr()),
+        v_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        v2.data_ptr<float>(), hidden, GROUP);
+    rmsnorm_fw_kernel<<<nh, 256, 0, st>>>(
+        qh.data_ptr<float>(), q_norm_w.data_ptr<float>(),
+        qh.data_ptr<float>(), hd, 1e-6f);
+    k2 = k2.view({1, nkv * hd});
+    rmsnorm_fw_kernel<<<nkv, 256, 0, st>>>(
+        k2.data_ptr<float>(), k_norm_w.data_ptr<float>(),
+        kh.data_ptr<float>(), hd, 1e-6f);
+    rope27_kernel<<<(unsigned)nh, 32, 0, st>>>(
+        qh.data_ptr<float>(), kh.data_ptr<float>(),
+        (int)nh, (int)nkv, (int)hd, (float)theta, P);
+    cache_write_b_kernel<<<(unsigned)(2 * nkv), (unsigned)hd, 0,
+                           st>>>(
+        k2.data_ptr<float>(), v2.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(kv_cache.data_ptr()),
+        (int)hd, (int)ctx, (int)nkv, P);
+    attn_b_kernel<<<(unsigned)nh, (unsigned)hd,
+                    (size_t)ctx * sizeof(float), st>>>(
+        qh.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr()),
+        att.data_ptr<float>(), (int)nh, (int)nkv, (int)hd,
+        (int)ctx, P);
+    // per-head sigmoid gate before o_proj
+    sigmoid_mul_kernel<<<(unsigned)((nh * hd + 255) / 256), 256, 0,
+                         st>>>(
+        att.data_ptr<float>(), gt.data_ptr<float>(), nh * hd);
+    udcq_gemv_kernel<<<(unsigned)hidden, 256, 0, st>>>(
+        att.data_ptr<float>(), o_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(o_s.data_ptr()),
+        o_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        o.data_ptr<float>(), nh * hd, GROUP);
+    add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
+        h.data_ptr<float>(), o.data_ptr<float>(),
+        h1.data_ptr<float>(), hidden);
+    rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
+        h1.data_ptr<float>(), post_w.data_ptr<float>(),
+        xn2.data_ptr<float>(), hidden, 1e-6f);
+    udcq_gemv_kernel<<<(unsigned)inter, 256, 0, st>>>(
+        xn2.data_ptr<float>(), g_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(g_s.data_ptr()),
+        g_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        mg.data_ptr<float>(), hidden, GROUP);
+    udcq_gemv_kernel<<<(unsigned)inter, 256, 0, st>>>(
+        xn2.data_ptr<float>(), u_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(u_s.data_ptr()),
+        u_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        mu.data_ptr<float>(), hidden, GROUP);
+    silu_kernel<<<(unsigned)((inter + 255) / 256), 256, 0, st>>>(
+        mg.data_ptr<float>(), mu.data_ptr<float>(),
+        act.data_ptr<float>(), (int)inter);
+    udcq_gemv_kernel<<<(unsigned)hidden, 256, 0, st>>>(
+        act.data_ptr<float>(), d_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(d_s.data_ptr()),
+        d_sc.data_ptr<float>(), cb.data_ptr<float>(),
+        md.data_ptr<float>(), inter, GROUP);
+    add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
+        h1.data_ptr<float>(), md.data_ptr<float>(),
+        out.data_ptr<float>(), hidden);
+    return out;
 }
