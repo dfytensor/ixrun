@@ -224,10 +224,25 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
 - Multi-instance engines: instance=N -> suffixed module = separate
   statics, gate PASSED (test_cpp_multi_instance.py). Weights dup
   0.7GB/instance.
-- Stage 4 remaining: 27B engine assembly (64-layer hybrid scheduler,
-  safetensors per-layer loader, UDCQ packs) + MTP spec decode
-  (round4b queue semantics + prefill_batch verify chain). Full-attn
-  layers reuse attn_v2/rmsnorm/rope unchanged.
+- Stage 4 progress: step1 blob mmap loader + real-pack UDCQ GEMV
+  gate 1.10e-7 (test_blob_l0.py); step2 REAL layer-0 GDN assembly
+  gate (test_gdn_layer_real.py): vs bf16 5.09e-2 (format tier) BUT
+  vs torch-same-quant-weights 9.92e-6 = math clean. Gate pattern:
+  ALWAYS add the same-quant-weights torch chain to isolate math from
+  format. HF notes: conv1d bias=False; rope_scaling=None (theta from
+  text_config.rope_theta default); full-attn HAS q_norm/k_norm
+  (256-dim RMSNorm, fp32, needed in attn path). Blob EXCLUDES mtp
+  weights + all norms/conv/dt_bias/A_log (safetensors reads).
+- Step 3a NEXT (designed, not written): gdn_layer_step C++ fn
+  encapsulating the 5-GEMV+conv+l2norm+recurrent+gated-norm chain.
+  Pitfalls identified in a failed draft: (1) z must be copied into
+  [nv,dv] rows BEFORE gated_rmsnorm (zr), (2) gated_rmsnorm in/out
+  must NOT alias (allocate separate out), (3) needs new tiny kernels:
+  repeat_heads (nk->nv interleave, grid(nk,3)), sigmoid, g-gate
+  (=-exp(A_log)*softplus(a+dt_bias)), fp32 scale mul; (4) out buffer
+  must be allocated [hidden]; (5) init flag guards ALL statics.
+  Gate: fn vs step-2 inline chain bit-exact (same kernels same
+  order).
 - engine_v5.cu is 2100+ lines with ~350 dead/research lines; staged
   hygiene plan in docs/engine_v5_refactor_plan.md (execute Step 1
   first — zero-semantics dead code removal, no ext-name bump).
