@@ -591,6 +591,64 @@ torch::Tensor udcq_gemv_out(torch::Tensor x,
     return y;
 }
 
+// UDCQ batched GEMM: [T,in_f] @ W^T -> [T,out_f], same walk as
+// udcq_gemv_kernel per row (bit-exact by construction), grid.y = t.
+__global__ void udcq_gemm_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ idx,
+    const uint32_t* __restrict__ sign,
+    const float* __restrict__ scale,
+    const float* __restrict__ cb,
+    float* __restrict__ y,
+    int in_f, int out_f, int GROUP)
+{
+    __shared__ float red[32];
+    int r = blockIdx.x;
+    int t = blockIdx.y;
+    long long base = (long long)r * in_f;
+    const float* xt = x + (long long)t * in_f;
+    float acc = 0.f;
+    for (int j = threadIdx.x; j < in_f; j += blockDim.x) {
+        long long o = base + j;
+        uint8_t b = idx[o >> 1];
+        int nib = (o & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
+        float sc = scale[o / GROUP];
+        uint32_t sw = sign[o >> 5];
+        float sgn = ((sw >> (o & 31)) & 1u) ? 1.f : -1.f;
+        acc += cb[nib] * sc * sgn * xt[j];
+    }
+    if (threadIdx.x < 32) red[threadIdx.x] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.f;
+        for (int k = 0; k < (int)(blockDim.x >> 5); ++k) s += red[k];
+        y[(long long)t * out_f + r] = s;
+    }
+}
+
+torch::Tensor udcq_gemm_out(torch::Tensor x2d,
+                            torch::Tensor idx, torch::Tensor sign,
+                            torch::Tensor scale, torch::Tensor cb,
+                            int64_t out_f, int64_t in_f,
+                            int64_t group) {
+    int T = (int)x2d.size(0);
+    auto y = torch::zeros({T, out_f},
+        torch::dtype(torch::kFloat32).device(x2d.device()));
+    dim3 grid((unsigned)out_f, (unsigned)T);
+    udcq_gemm_kernel<<<grid, 256, 0,
+                       at::cuda::getCurrentCUDAStream()>>>(
+        x2d.data_ptr<float>(), idx.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(sign.data_ptr()),
+        scale.data_ptr<float>(), cb.data_ptr<float>(),
+        y.data_ptr<float>(), (int)in_f, (int)out_f, (int)group);
+    return y;
+}
+
 // l2norm (fla-aligned): y = x * rsqrt(sum(x^2) + 1e-6), one row/block
 __global__ void l2norm_kernel(const float* __restrict__ x,
                               float* __restrict__ y, int d) {
