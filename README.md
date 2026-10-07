@@ -97,6 +97,9 @@ python -m experiments.qwen38_udcq.pack_q38_blob
 python -m ixrun.cli chat --mode udcq-spec --cache experiments\qwen38_udcq\q38_blob.pt
 # ③ OpenAI 兼容服务
 python -m ixrun.cli serve --mode step-graph --codec gsq --port 8000
+# ④ C++ 引擎（最快）：纯 C++ kernel + 自喂 CUDA 图，decode ~296 tok/s
+python -m ixrun.cli generate "你好" --mode cpp-gsq --stream
+python -m ixrun.cli serve --mode cpp-gsq --port 8000
 ```
 
 无容器镜像（本仓库目标是单卡 Windows/WDDM 深度调优，容器化不在路线图）。
