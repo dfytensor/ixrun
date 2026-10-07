@@ -2425,6 +2425,176 @@ torch::Tensor gdn_decoder_step(
     return out;
 }
 
+// ---------------- Stage 4 step 4b: 27B model scheduler ---------------- //
+// Single-model statics (mirrors the 1B init_model pattern). Layer
+// packs normalized to 8 slots x 3 tensors per layer:
+//   GDN  slots: qkv,z,b,a,out,gate,up,down
+//   ATTN slots: q,k,v,o,gate,up,down,(unused)
+static std::vector<torch::Tensor> s27_packs;     // [64*8*3]
+static std::vector<torch::Tensor> s27_nw1, s27_nw2;
+static std::vector<torch::Tensor> s27_gex;       // [48*4]
+static std::vector<torch::Tensor> s27_gnorm;     // [48]
+static std::vector<torch::Tensor> s27_aex;       // [16*2]
+static std::vector<torch::Tensor> s27_convst, s27_S, s27_kv;
+static torch::Tensor s27_cb, s27_fnw, s27_lh_i, s27_lh_s,
+    s27_lh_sc;
+static std::vector<int64_t> s27_attn_layers;
+static int64_t s27_hidden, s27_inter, s27_ctx;
+static bool s27_init = false;
+
+void init27(
+    torch::Tensor cb,
+    std::vector<torch::Tensor> packs,
+    std::vector<torch::Tensor> nw1,
+    std::vector<torch::Tensor> nw2,
+    std::vector<torch::Tensor> gex,
+    std::vector<torch::Tensor> gnorm,
+    std::vector<torch::Tensor> aex,
+    torch::Tensor fnw,
+    torch::Tensor lh_i, torch::Tensor lh_s, torch::Tensor lh_sc,
+    std::vector<int64_t> attn_layers,
+    int64_t hidden, int64_t inter, int64_t ctx)
+{
+    s27_cb = cb;
+    s27_packs = packs;
+    s27_nw1 = nw1; s27_nw2 = nw2;
+    s27_gex = gex; s27_gnorm = gnorm; s27_aex = aex;
+    s27_fnw = fnw;
+    s27_lh_i = lh_i; s27_lh_s = lh_s; s27_lh_sc = lh_sc;
+    s27_attn_layers = attn_layers;
+    s27_hidden = hidden; s27_inter = inter; s27_ctx = ctx;
+    auto dev = cb.device();
+    auto f32 = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(dev);
+    auto bf = torch::TensorOptions()
+        .dtype(torch::kBFloat16).device(dev);
+    int nl = (int)nw1.size();
+    int ng = nl - (int)attn_layers.size();
+    for (int i = 0; i < ng; ++i) {
+        s27_convst.push_back(torch::zeros({10240, 3}, f32));
+        s27_S.push_back(torch::zeros({48, 128, 128}, f32));
+    }
+    for (int i = 0; i < (int)attn_layers.size(); ++i)
+        s27_kv.push_back(torch::zeros({8, ctx, 256}, bf));
+    s27_init = true;
+}
+
+// fwd decls (step27 sits before the layer fns in this file)
+torch::Tensor attn_layer_step(
+    torch::Tensor h, torch::Tensor cb,
+    torch::Tensor q_i, torch::Tensor q_s, torch::Tensor q_sc,
+    torch::Tensor k_i, torch::Tensor k_s, torch::Tensor k_sc,
+    torch::Tensor v_i, torch::Tensor v_s, torch::Tensor v_sc,
+    torch::Tensor o_i, torch::Tensor o_s, torch::Tensor o_sc,
+    torch::Tensor g_i, torch::Tensor g_s, torch::Tensor g_sc,
+    torch::Tensor u_i, torch::Tensor u_s, torch::Tensor u_sc,
+    torch::Tensor d_i, torch::Tensor d_s, torch::Tensor d_sc,
+    torch::Tensor in_w, torch::Tensor post_w,
+    torch::Tensor q_norm_w, torch::Tensor k_norm_w,
+    torch::Tensor kv_cache, double theta, int64_t pos,
+    int64_t nh, int64_t nkv, int64_t hd,
+    int64_t hidden, int64_t inter, int64_t ctx);
+torch::Tensor gdn_decoder_step(
+    torch::Tensor h, torch::Tensor cb,
+    torch::Tensor qkv_i, torch::Tensor qkv_s, torch::Tensor qkv_sc,
+    torch::Tensor z_i, torch::Tensor z_s, torch::Tensor z_sc,
+    torch::Tensor b_i, torch::Tensor b_s, torch::Tensor b_sc,
+    torch::Tensor a_i, torch::Tensor a_s, torch::Tensor a_sc,
+    torch::Tensor o_i, torch::Tensor o_s, torch::Tensor o_sc,
+    torch::Tensor gg_i, torch::Tensor gg_s, torch::Tensor gg_sc,
+    torch::Tensor uu_i, torch::Tensor uu_s, torch::Tensor uu_sc,
+    torch::Tensor dd_i, torch::Tensor dd_s, torch::Tensor dd_sc,
+    torch::Tensor in_w, torch::Tensor post_w,
+    torch::Tensor conv_w, torch::Tensor conv_b,
+    torch::Tensor A_log, torch::Tensor dt_bias,
+    torch::Tensor gnorm_w, torch::Tensor conv_state,
+    torch::Tensor S, int64_t nv, int64_t nk, int64_t dk,
+    int64_t dv, int64_t inter);
+
+int64_t step27(torch::Tensor h, int64_t pos, double theta) {
+    if (!s27_init) throw std::runtime_error("init27 not called");
+    auto st = at::cuda::getCurrentCUDAStream();
+    int hidden = (int)s27_hidden;
+    int inter = (int)s27_inter;
+    int nl = (int)s27_nw1.size();
+    int GROUP = 16;
+    auto f32 = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(h.device());
+    static torch::Tensor fn, lg, tok;
+    static bool init = false;
+    if (!init) {
+        fn  = torch::empty({hidden}, f32);
+        int64_t vocab = s27_lh_i.numel() * 2 / hidden;
+        lg  = torch::empty({vocab}, f32);
+        tok = torch::zeros({1}, torch::TensorOptions()
+            .dtype(torch::kInt64).device(h.device()));
+        init = true;
+    }
+    auto T3 = [&](int l, int s) -> std::vector<torch::Tensor> {
+        int k = (l * 8 + s) * 3;
+        return {s27_packs[k], s27_packs[k + 1], s27_packs[k + 2]};
+    };
+    int ig = 0, ia = 0;
+    for (int l = 0; l < nl; ++l) {
+        bool is_attn = false;
+        for (int64_t a : s27_attn_layers)
+            if (a == l) { is_attn = true; break; }
+        torch::Tensor hcur;
+        if (is_attn) {
+            auto q = T3(l, 0); auto k = T3(l, 1);
+            auto v = T3(l, 2); auto o = T3(l, 3);
+            auto gg = T3(l, 4); auto uu = T3(l, 5);
+            auto dd = T3(l, 6);
+            hcur = attn_layer_step(
+                h, s27_cb,
+                q[0], q[1], q[2], k[0], k[1], k[2],
+                v[0], v[1], v[2], o[0], o[1], o[2],
+                gg[0], gg[1], gg[2], uu[0], uu[1], uu[2],
+                dd[0], dd[1], dd[2],
+                s27_nw1[l], s27_nw2[l],
+                s27_aex[ia * 2], s27_aex[ia * 2 + 1],
+                s27_kv[ia], theta, pos,
+                24, 4, 256, hidden, inter, s27_ctx);
+            ia++;
+        } else {
+            auto qkv = T3(l, 0); auto z = T3(l, 1);
+            auto b = T3(l, 2); auto a = T3(l, 3);
+            auto o = T3(l, 4); auto gg = T3(l, 5);
+            auto uu = T3(l, 6); auto dd = T3(l, 7);
+            hcur = gdn_decoder_step(
+                h, s27_cb,
+                qkv[0], qkv[1], qkv[2],
+                z[0], z[1], z[2],
+                b[0], b[1], b[2],
+                a[0], a[1], a[2],
+                o[0], o[1], o[2],
+                gg[0], gg[1], gg[2],
+                uu[0], uu[1], uu[2],
+                dd[0], dd[1], dd[2],
+                s27_nw1[l], s27_nw2[l],
+                s27_gex[ig * 4], s27_gex[ig * 4 + 1],
+                s27_gex[ig * 4 + 2], s27_gex[ig * 4 + 3],
+                s27_gnorm[ig], s27_convst[ig], s27_S[ig],
+                48, 16, 128, 128, inter);
+            ig++;
+        }
+        h = hcur;
+    }
+    rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
+        h.data_ptr<float>(), s27_fnw.data_ptr<float>(),
+        fn.data_ptr<float>(), hidden, 1e-6f);
+    int64_t vocab = s27_lh_i.numel() * 2 / hidden;
+    udcq_gemv_kernel<<<(unsigned)vocab, 256, 0, st>>>(
+        fn.data_ptr<float>(), s27_lh_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(s27_lh_s.data_ptr()),
+        s27_lh_sc.data_ptr<float>(), s27_cb.data_ptr<float>(),
+        lg.data_ptr<float>(), hidden, GROUP);
+    argmax_f32<<<1, 256, 0, st>>>(
+        lg.data_ptr<float>(), (int)vocab,
+        tok.data_ptr<int64_t>());
+    return tok.item<int64_t>();
+}
+
 // q_proj fused gate split: src [nh, 512] -> q [nh,256], gate [nh,256]
 __global__ void chunk_qgate_kernel(const float* src, float* q,
                                    float* gate, int hd) {
