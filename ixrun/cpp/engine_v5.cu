@@ -591,6 +591,68 @@ torch::Tensor udcq_gemv_out(torch::Tensor x,
     return y;
 }
 
+// ---------------- GDN recurrent (27B stage 3a) ----------------------- //
+// torch_recurrent_gated_delta_rule for S=1 decode step, per head:
+//   S = S*exp(g); kv_mem[j] = sum_i S[i][j]*k[i];
+//   delta[j] = (v[j]-kv_mem[j])*beta; S[i][j] += k[i]*delta[j];
+//   out[j] = sum_i S[i][j]*q[i]
+// q,k must be L2-normalized and q pre-scaled by 1/sqrt(dk) on host
+// (matches use_qk_l2norm_in_kernel path). One block per head;
+// thread per dv column (requires dv <= blockDim), sequential dk walk.
+__global__ void gdn_recurrent_kernel(
+    const float* __restrict__ q,   // [nh, dk]
+    const float* __restrict__ k,   // [nh, dk]
+    const float* __restrict__ v,   // [nh, dv]
+    const float* __restrict__ g,   // [nh] (log decay)
+    const float* __restrict__ beta,// [nh]
+    float* __restrict__ S,         // [nh, dk, dv] in/out
+    float* __restrict__ out,       // [nh, dv]
+    int dk, int dv)
+{
+    int h = blockIdx.x;
+    int j = threadIdx.x;
+    if (j >= dv) return;
+    float gt = expf(g[h]);
+    float bt = beta[h];
+    const float* kh = k + (long long)h * dk;
+    const float* qh = q + (long long)h * dk;
+    float* Sh = S + (long long)h * dk * dv;
+    const float* vh = v + (long long)h * dv;
+    float* oh = out + (long long)h * dv;
+
+    float kv_mem = 0.f;
+    for (int i = 0; i < dk; ++i) {
+        float* s = Sh + (long long)i * dv + j;
+        *s *= gt;
+        kv_mem += *s * kh[i];
+    }
+    float delta = (vh[j] - kv_mem) * bt;
+    for (int i = 0; i < dk; ++i)
+        Sh[(long long)i * dv + j] += kh[i] * delta;
+    float o = 0.f;
+    for (int i = 0; i < dk; ++i)
+        o += Sh[(long long)i * dv + j] * qh[i];
+    oh[j] = o;
+}
+
+torch::Tensor gdn_recurrent_out(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor g, torch::Tensor beta,
+    torch::Tensor S) {
+    int nh = (int)q.size(0);
+    int dk = (int)q.size(1);
+    int dv = (int)v.size(1);
+    auto out = torch::zeros({nh, dv},
+        torch::dtype(torch::kFloat32).device(q.device()));
+    gdn_recurrent_kernel<<<nh, 256, 0,
+                           at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(), k.data_ptr<float>(),
+        v.data_ptr<float>(), g.data_ptr<float>(),
+        beta.data_ptr<float>(), S.data_ptr<float>(),
+        out.data_ptr<float>(), dk, dv);
+    return out;
+}
+
 // split-K GEMV: each row split across S warps (contiguous chunks),
 // partials summed in warp order (deterministic). NOTE: reduction
 // order differs from v2/v3 -> NOT bit-exact vs them; gate = rel-err
