@@ -770,6 +770,41 @@ torch::Tensor gated_rmsnorm_out(torch::Tensor o, torch::Tensor z,
     return out;
 }
 
+// 27B mRoPE (partial rotary 64/256, rotate_half over (i, i+32), theta 1e7)
+// in-place on q [nh*256] / k [nkv*256]; pos as kernel arg.
+__global__ void rope27_kernel(float* q, float* k,
+                              int n_heads, int n_kv_heads,
+                              int head_dim, float theta,
+                              int pos) {
+    int h = blockIdx.x;
+    int i = threadIdx.x;
+    if (i >= 32) return;   // rotary_dim/2 = 32 pairs
+    float th = pos * powf(theta, -2.0f * i / 64.0f);
+    float c = cosf(th), s = sinf(th);
+    int base = h * head_dim;
+    int lo = base + i;
+    int hi = base + i + 32;
+    float q0 = q[lo], q1 = q[hi];
+    q[lo] = q0 * c - q1 * s;  q[hi] = q0 * s + q1 * c;
+    if (h < n_kv_heads) {
+        float k0 = k[lo], k1 = k[hi];
+        k[lo] = k0 * c - k1 * s;  k[hi] = k0 * s + k1 * c;
+    }
+    // dims 64..255 pass through untouched
+}
+
+torch::Tensor rope27_out(torch::Tensor q, torch::Tensor k,
+                         int64_t n_heads, int64_t n_kv_heads,
+                         int64_t head_dim, double theta,
+                         int64_t pos) {
+    rope27_kernel<<<(unsigned)n_heads, 32, 0,
+                    at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(), k.data_ptr<float>(),
+        (int)n_heads, (int)n_kv_heads, (int)head_dim,
+        (float)theta, (int)pos);
+    return q;
+}
+
 // ---------------- Stage 4 step 3a: GDN layer step --------------------- //
 __global__ void gdn_recurrent_kernel(
     const float* __restrict__ q, const float* __restrict__ k,

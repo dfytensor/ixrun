@@ -13,6 +13,17 @@ rope_theta             None → 走 rope_scaling（默认 1e6? 执行时读
                        text_config.rope_scaling.rope_theta，1B 的坑复刻）
 ```
 
+## mRoPE（full-attn 层，从 modeling_qwen3_5.py:84-164,554-585 提取）
+```
+rotary_dim = 64 (partial_rotary_factor 0.25 × head_dim 256)
+inv_freq[j] = 1e7^(-2j/64), j = 0..31（theta=1e7）
+纯文本：三轴位置全等于 text pos → interleave 分节无影响
+emb = cat(freq, freq) → cos/sin [64]
+q_rot = q[..., :64]；q[..., 64:] 原样直通（partial！）
+q_rot = q_rot*cos + rotate_half_64(q_rot)*sin   # 对 (i, i+32) 对
+```
+与 1B rope 的三大差异：仅前 64 维旋转 / 配对跨 32 / theta 1e7
+
 ## per-layer 权重集
 GDN 层 (48): in_proj_qkv [2*key_dim+value_dim=4096+6144=10240, 5120]
   in_proj_z [6144,5120] in_proj_b/a [48,5120] conv1d [10240,1,4]
