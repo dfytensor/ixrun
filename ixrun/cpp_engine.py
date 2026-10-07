@@ -217,20 +217,38 @@ class CppGsqEngine:
         n = max(1, min(max_new_tokens, budget))
         return ids, n
 
-    def generate(self, prompt, max_new_tokens=128, **kw):
-        ids, n = self._prep(prompt, max_new_tokens)
-        nxt = self.prefill(ids)
-        toks = self._gen_block(nxt, len(ids), n)
-        eos = self.tok.eos_token_id
-        if eos is not None and eos in toks:
-            toks = toks[:toks.index(eos)]
-        return self.tok.decode(toks)
+    def _stop_ids(self):
+        ids = []
+        eos = getattr(self.tok, 'eos_token_id', None)
+        if eos is not None:
+            ids.append(eos)
+        try:
+            im = self.tok.convert_tokens_to_ids('<|im_end|>')
+            if im is not None and im != eos:
+                ids.append(im)
+        except Exception:
+            pass
+        return ids
 
-    def stream(self, prompt, max_new_tokens=128, chunk=16, **kw):
-        ids, n = self._prep(prompt, max_new_tokens)
+    def _cut_stops(self, toks):
+        cut = len(toks)
+        for s in self._stop_ids():
+            if s in toks:
+                cut = min(cut, toks.index(s))
+        return toks[:cut]
+
+    def generate(self, prompt, max_new_tokens=128, max_tokens=None,
+                 **kw):
+        ids, n = self._prep(prompt, max_tokens or max_new_tokens)
         nxt = self.prefill(ids)
-        eos = self.tok.eos_token_id
-        done = 0
+        return self.tok.decode(
+            self._cut_stops(self._gen_block(nxt, len(ids), n)))
+
+    def stream(self, prompt, max_new_tokens=128, chunk=16,
+               max_tokens=None, **kw):
+        ids, n = self._prep(prompt, max_tokens or max_new_tokens)
+        nxt = self.prefill(ids)
+        hist, prev, done = [], "", 0
         while done < n:
             k = min(chunk, n - done)
             if done == 0:
@@ -238,8 +256,11 @@ class CppGsqEngine:
             else:
                 toks = self._replay_block(len(ids) + done, k)
             done += k
-            if eos is not None and eos in toks:
-                toks = toks[:toks.index(eos)]
-                yield self.tok.decode(toks)
+            hist.extend(toks)
+            cut_toks = self._cut_stops(hist)
+            text = self.tok.decode(cut_toks)
+            if len(text) > len(prev):
+                yield text[len(prev):]
+                prev = text
+            if len(cut_toks) < len(hist):
                 return
-            yield self.tok.decode(toks)
