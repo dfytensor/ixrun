@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Self-feeding CUDA graph: argmax->embed->pos++ all in-graph.
 Python does ONE replay() per token, zero sync/copy per token."""
 import sys, time
@@ -70,7 +70,7 @@ void sf_step_graph();
 void sf_seed(int64_t token, int64_t pos);
 torch::Tensor sf_get_hist(int64_t from, int64_t n);
 '''
-ext = load_inline(name='ixrun_cpp_v5sf6', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v5sf7', cpp_sources=[proto],
                   cuda_sources=[src],
                   functions=['init_model', 'step', 'sf_step_graph',
                              'sf_seed', 'sf_get_hist'],

@@ -60,6 +60,79 @@ __global__ void gsq_gemv_kernel(
     if (lane == 0) yf[r] = acc;
 }
 
+// ---------------- GSQ GEMV v2 (llama.cpp-style: smem x + coop) ---- //
+// Same math order as v1 (bit-exact goal): warp-per-row, per-lane
+// group-stride, group dot in i=0..15 order. Adds: x staged in smem
+// once per block (all warps share), cb in smem (as v1).
+__global__ void gsq_gemv_v2_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ codes,
+    const float* __restrict__ cb,
+    const uint8_t* __restrict__ s_i8,
+    float s_base, float s_step,
+    float* __restrict__ yf,
+    int n_gr, int in_f)
+{
+    __shared__ float cb_sm[32];
+    extern __shared__ float x_sm[];   // in_f floats, dynamic smem
+    for (int i = threadIdx.x; i < 32; i += blockDim.x)
+        cb_sm[i] = cb[i];
+    for (int i = threadIdx.x; i < in_f; i += blockDim.x)
+        x_sm[i] = x[i];
+    __syncthreads();
+    int lane = threadIdx.x & 31;
+    int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    float acc = 0.f;
+    for (int jb = lane; jb < n_gr; jb += 32) {
+        long long gidx = (long long)r * n_gr + jb;
+        const uint8_t* p = codes + gidx * 10;
+        uint32_t d0 = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+            | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        uint32_t d1 = (uint32_t)p[4] | ((uint32_t)p[5] << 8)
+            | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+        uint16_t d2 = (uint16_t)(p[8] | (p[9] << 8));
+        unsigned long long lo = (unsigned long long)d0
+            | ((unsigned long long)d1 << 32);
+        float s = exp2f(s_base + (float)s_i8[gidx] * s_step);
+        const float* x16 = x_sm + jb * 16;
+        float inner = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 12; ++i)
+            inner += cb_sm[(int)((lo >> (5*i)) & 0x1F)] * x16[i];
+        inner += cb_sm[(int)(((lo >> 60)
+            | ((unsigned long long)d2 << 4)) & 0x1F)] * x16[12];
+        #pragma unroll
+        for (int i = 0; i < 3; ++i)
+            inner += cb_sm[(int)((d2 >> (5*i+1)) & 0x1F)] * x16[13+i];
+        acc += inner * s;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) yf[r] = acc;
+}
+
+// launcher: v2 with dynamic smem for x staging
+static torch::Tensor gsq_gemv_v2(torch::Tensor x_f32,
+                                 torch::Tensor codes,
+                                 torch::Tensor cb,
+                                 torch::Tensor s_i8,
+                                 double s_base, double s_step,
+                                 int64_t out_f, int64_t in_f) {
+    auto y = torch::zeros({out_f}, torch::dtype(torch::kFloat32)
+                                         .device(x_f32.device()));
+    int n_gr = (int)(in_f / 16);
+    int wpb = 8;
+    auto st = at::cuda::getCurrentCUDAStream();
+    gsq_gemv_v2_kernel<<<(unsigned)(out_f / wpb), wpb * 32,
+                         (size_t)in_f * sizeof(float), st>>>(
+        x_f32.data_ptr<float>(),
+        codes.data_ptr<uint8_t>(), cb.data_ptr<float>(),
+        s_i8.data_ptr<uint8_t>(), (float)s_base, (float)s_step,
+        y.data_ptr<float>(), n_gr, (int)in_f);
+    return y;
+}
+
 static torch::Tensor gsq_gemv(torch::Tensor x_f32,
                               torch::Tensor codes,
                               torch::Tensor cb,
@@ -385,6 +458,16 @@ torch::Tensor rmsnorm_out(torch::Tensor x, torch::Tensor w) {
     return rmsn(x, w);
 }
 
+// probe: raw gemv v2 (smem-x variant) for bit-exact + speed gate
+torch::Tensor gemv_v2_out(torch::Tensor x,
+                          torch::Tensor codes, torch::Tensor cb,
+                          torch::Tensor s_i8,
+                          double s_base, double s_step,
+                          int64_t out_f, int64_t in_f) {
+    return gsq_gemv_v2(x, codes, cb, s_i8, s_base, s_step,
+                       out_f, in_f);
+}
+
 // probe: raw gemv for lm_head
 torch::Tensor gemv_out(torch::Tensor x,
                        torch::Tensor codes, torch::Tensor cb,
@@ -671,13 +754,14 @@ int64_t step(int64_t token_id) {
         reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(g_fnw.data_ptr()),
         g_fn_buf.data_ptr<float>(), (int)g_hidden);
-    gsq_gemv_kernel<<<(unsigned)(g_lh_out_f / 8), 256, 0, st>>>(
+    gsq_gemv_v2_kernel<<<(unsigned)(g_lh_out_f / 8), 256, (size_t)g_lh_in_f * sizeof(float), st>>>(
         g_fn_buf.data_ptr<float>(),
         g_lh_codes.data_ptr<uint8_t>(),
         g_lh_cb.data_ptr<float>(),
         g_lh_s.data_ptr<uint8_t>(),
         (float)g_lh_base, (float)g_lh_step,
-        g_lg_buf.data_ptr<float>(), (int)(g_lh_in_f / 16));
+        g_lg_buf.data_ptr<float>(), (int)(g_lh_in_f / 16),
+        (int)g_lh_in_f);
     argmax_f32<<<1, 256, 0, st>>>(
         g_lg_buf.data_ptr<float>(), (int)g_lh_out_f,
         g_tok_gpu.data_ptr<int64_t>());
@@ -776,13 +860,14 @@ std::vector<int64_t> generate_batch_fast(int64_t start_token,
             reinterpret_cast<const __nv_bfloat16*>(
                 g_fnw.data_ptr()),
             fn_buf.data_ptr<float>(), (int)g_hidden);
-        gsq_gemv_kernel<<<(unsigned)(g_lh_out_f / 8), 256, 0, st>>>(
+        gsq_gemv_v2_kernel<<<(unsigned)(g_lh_out_f / 8), 256, (size_t)g_lh_in_f * sizeof(float), st>>>(
             fn_buf.data_ptr<float>(),
             g_lh_codes.data_ptr<uint8_t>(),
             g_lh_cb.data_ptr<float>(),
             g_lh_s.data_ptr<uint8_t>(),
             (float)g_lh_base, (float)g_lh_step,
-            lg_buf.data_ptr<float>(), (int)(g_lh_in_f / 16));
+            lg_buf.data_ptr<float>(), (int)(g_lh_in_f / 16),
+            (int)g_lh_in_f);
         argmax_f32<<<1, 256, 0, st>>>(
             lg_buf.data_ptr<float>(), (int)g_lh_out_f,
             tok_gpu.data_ptr<int64_t>());
@@ -843,13 +928,14 @@ void step_graph() {
         reinterpret_cast<const __nv_bfloat16*>(h.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(g_fnw.data_ptr()),
         g_fn_buf.data_ptr<float>(), (int)g_hidden);
-    gsq_gemv_kernel<<<(unsigned)(g_lh_out_f / 8), 256, 0, st>>>(
+    gsq_gemv_v2_kernel<<<(unsigned)(g_lh_out_f / 8), 256, (size_t)g_lh_in_f * sizeof(float), st>>>(
         g_fn_buf.data_ptr<float>(),
         g_lh_codes.data_ptr<uint8_t>(),
         g_lh_cb.data_ptr<float>(),
         g_lh_s.data_ptr<uint8_t>(),
         (float)g_lh_base, (float)g_lh_step,
-        g_lg_buf.data_ptr<float>(), (int)(g_lh_in_f / 16));
+        g_lg_buf.data_ptr<float>(), (int)(g_lh_in_f / 16),
+        (int)g_lh_in_f);
     argmax_f32<<<1, 256, 0, st>>>(
         g_lg_buf.data_ptr<float>(), (int)g_lh_out_f,
         g_tok_gpu.data_ptr<int64_t>());
@@ -924,13 +1010,14 @@ void sf_step_graph() {
         g_fn_buf.data_ptr<float>(), (int)g_hidden);
 
     // 5. lm_head GEMV
-    gsq_gemv_kernel<<<(unsigned)(g_lh_out_f / 8), 256, 0, st>>>(
+    gsq_gemv_v2_kernel<<<(unsigned)(g_lh_out_f / 8), 256, (size_t)g_lh_in_f * sizeof(float), st>>>(
         g_fn_buf.data_ptr<float>(),
         g_lh_codes.data_ptr<uint8_t>(),
         g_lh_cb.data_ptr<float>(),
         g_lh_s.data_ptr<uint8_t>(),
         (float)g_lh_base, (float)g_lh_step,
-        g_lg_buf.data_ptr<float>(), (int)(g_lh_in_f / 16));
+        g_lg_buf.data_ptr<float>(), (int)(g_lh_in_f / 16),
+        (int)g_lh_in_f);
 
     // 6. argmax -> g_tok_gpu (feeds NEXT replay's embed_lookup)
     argmax_f32<<<1, 256, 0, st>>>(
