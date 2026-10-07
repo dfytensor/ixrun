@@ -535,7 +535,79 @@ torch::Tensor gemv_v2_out(torch::Tensor x,
                        out_f, in_f);
 }
 
-// probe: raw gemv for lm_head
+// probe: batched GSQ GEMM (stage 1 of batched prefill).
+// Same warp-walk as v2 (bit-exact goal per token); blockIdx.y = token.
+__global__ void gsq_gemm_kernel(
+    const float* __restrict__ x,      // [T, in_f]
+    const uint8_t* __restrict__ codes,
+    const float* __restrict__ cb,
+    const uint8_t* __restrict__ s_i8,
+    float s_base, float s_step,
+    float* __restrict__ y,            // [T, out_f]
+    int n_gr, int in_f, int out_f)
+{
+    __shared__ float cb_sm[32];
+    extern __shared__ float x_sm[];
+    for (int i = threadIdx.x; i < 32; i += blockDim.x)
+        cb_sm[i] = cb[i];
+    int t = blockIdx.y;
+    for (int i = threadIdx.x; i < in_f; i += blockDim.x)
+        x_sm[i] = x[(long long)t * in_f + i];
+    __syncthreads();
+    int lane = threadIdx.x & 31;
+    int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    float acc = 0.f;
+    for (int jb = lane; jb < n_gr; jb += 32) {
+        long long gidx = (long long)r * n_gr + jb;
+        const uint8_t* p = codes + gidx * 10;
+        uint32_t d0 = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+            | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        uint32_t d1 = (uint32_t)p[4] | ((uint32_t)p[5] << 8)
+            | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+        uint16_t d2 = (uint16_t)(p[8] | (p[9] << 8));
+        unsigned long long lo = (unsigned long long)d0
+            | ((unsigned long long)d1 << 32);
+        float s = exp2f(s_base + (float)s_i8[gidx] * s_step);
+        const float* x16 = x_sm + jb * 16;
+        float inner = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 12; ++i)
+            inner += cb_sm[(int)((lo >> (5*i)) & 0x1F)] * x16[i];
+        inner += cb_sm[(int)(((lo >> 60)
+            | ((unsigned long long)d2 << 4)) & 0x1F)] * x16[12];
+        #pragma unroll
+        for (int i = 0; i < 3; ++i)
+            inner += cb_sm[(int)((d2 >> (5*i+1)) & 0x1F)] * x16[13+i];
+        acc += inner * s;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0)
+        y[(long long)t * out_f + r] = acc;
+}
+
+torch::Tensor gemm_out(torch::Tensor x2d,   // [T, in_f] fp32
+                       torch::Tensor codes, torch::Tensor cb,
+                       torch::Tensor s_i8,
+                       double s_base, double s_step,
+                       int64_t out_f, int64_t in_f) {
+    int T = (int)x2d.size(0);
+    auto y = torch::zeros({T, out_f},
+        torch::dtype(torch::kFloat32).device(x2d.device()));
+    int n_gr = (int)(in_f / 16);
+    int wpb = 8;
+    dim3 grid((unsigned)(out_f / wpb), (unsigned)T);
+    gsq_gemm_kernel<<<grid, wpb * 32,
+                      (size_t)in_f * sizeof(float),
+                      at::cuda::getCurrentCUDAStream()>>>(
+        x2d.data_ptr<float>(),
+        codes.data_ptr<uint8_t>(), cb.data_ptr<float>(),
+        s_i8.data_ptr<uint8_t>(), (float)s_base, (float)s_step,
+        y.data_ptr<float>(), n_gr, (int)in_f, (int)out_f);
+    return y;
+}
+
 torch::Tensor gemv_out(torch::Tensor x,
                        torch::Tensor codes, torch::Tensor cb,
                        torch::Tensor s_i8,
