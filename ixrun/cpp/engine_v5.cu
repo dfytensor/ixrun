@@ -535,6 +535,95 @@ torch::Tensor gemv_v2_out(torch::Tensor x,
                        out_f, in_f);
 }
 
+// split-K GEMV: each row split across S warps (contiguous chunks),
+// partials summed in warp order (deterministic). NOTE: reduction
+// order differs from v2/v3 -> NOT bit-exact vs them; gate = rel-err
+// vs fp64 reference accumulation + engine E2E coherence.
+__global__ void gsq_gemv_sk_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ codes,
+    const float* __restrict__ cb,
+    const uint8_t* __restrict__ s_i8,
+    float s_base, float s_step,
+    float* __restrict__ yf,
+    int n_gr, int in_f, int S)
+{
+    __shared__ float cb_sm[32];
+    __shared__ float part_sm[8];
+    extern __shared__ float x_sm[];
+    for (int i = threadIdx.x; i < 32; i += blockDim.x)
+        cb_sm[i] = cb[i];
+    for (int i = threadIdx.x; i < in_f; i += blockDim.x)
+        x_sm[i] = x[i];
+    __syncthreads();
+    int lane = threadIdx.x & 31;
+    int w = threadIdx.x >> 5;          // warp in block
+    int nw = blockDim.x >> 5;          // warps per block (8)
+    int rows_pb = nw / S;              // rows per block
+    int r = blockIdx.x * rows_pb + (w / S);
+    int c = w % S;                     // chunk id
+    int csize = (n_gr + S - 1) / S;
+    int jb0 = c * csize;
+    int jb1 = min(n_gr, jb0 + csize);
+    float acc = 0.f;
+    for (int jb = jb0 + lane; jb < jb1; jb += 32) {
+        long long gidx = (long long)r * n_gr + jb;
+        const uint8_t* p = codes + gidx * 10;
+        uint32_t d0 = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+            | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        uint32_t d1 = (uint32_t)p[4] | ((uint32_t)p[5] << 8)
+            | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+        uint16_t d2 = (uint16_t)(p[8] | (p[9] << 8));
+        unsigned long long lo = (unsigned long long)d0
+            | ((unsigned long long)d1 << 32);
+        float s = exp2f(s_base + (float)s_i8[gidx] * s_step);
+        const float* x16 = x_sm + jb * 16;
+        float inner = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 12; ++i)
+            inner += cb_sm[(int)((lo >> (5*i)) & 0x1F)] * x16[i];
+        inner += cb_sm[(int)(((lo >> 60)
+            | ((unsigned long long)d2 << 4)) & 0x1F)] * x16[12];
+        #pragma unroll
+        for (int i = 0; i < 3; ++i)
+            inner += cb_sm[(int)((d2 >> (5*i+1)) & 0x1F)]
+                   * x16[13+i];
+        acc += inner * s;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) part_sm[w] = acc;
+    __syncthreads();
+    if (w < rows_pb && lane == 0) {
+        float t = 0.f;
+        for (int k = 0; k < S; ++k)
+            t += part_sm[w * S + k];
+        yf[r] = t;
+    }
+}
+
+torch::Tensor gemv_sk_out(torch::Tensor x,
+                          torch::Tensor codes, torch::Tensor cb,
+                          torch::Tensor s_i8,
+                          double s_base, double s_step,
+                          int64_t out_f, int64_t in_f,
+                          int64_t S) {
+    auto y = torch::zeros({out_f}, torch::dtype(torch::kFloat32)
+                                         .device(x.device()));
+    int n_gr = (int)(in_f / 16);
+    int S_ = (int)S;
+    int rows_pb = 8 / S_;
+    unsigned grid = (unsigned)(out_f / rows_pb);
+    gsq_gemv_sk_kernel<<<grid, 256, (size_t)in_f * sizeof(float),
+                         at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(),
+        codes.data_ptr<uint8_t>(), cb.data_ptr<float>(),
+        s_i8.data_ptr<uint8_t>(), (float)s_base, (float)s_step,
+        y.data_ptr<float>(), n_gr, (int)in_f, S_);
+    return y;
+}
+
 // v3: software-pipelined v2. Order-preserving (bit-exact by
 // construction): each lane still sums its groups jb, jb+32,... in
 // sequence; only the NEXT group's codes are prefetched during the
