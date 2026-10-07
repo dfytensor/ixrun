@@ -779,7 +779,7 @@ int64_t generate_step(
     return tok_buf.item<int64_t>();
 }
 
-// ---------------- static-init generation (llama.cpp architecture) ------ //
+// shared model/buffer statics (used by batch + step paths)
 static bool g_init = false;
 static torch::Tensor g_embed, g_pos, g_fnw,
                      g_lh_codes, g_lh_cb, g_lh_s;
@@ -818,6 +818,286 @@ static void ensure_g_bufs() {
     g_bufs_init = true;
 }
 
+// ---------------- batched prefill (stage 2) --------------------------- //
+// Whole [T,H] chain with batched kernels. Every kernel keeps the
+// per-token arithmetic ORDER (bit-exact goal vs prefill_tokens).
+// Positions passed as kernel args (start_pos + t), never d_pos.
+__global__ void rmsnorm_b_kernel(const __nv_bfloat16* x,
+                                 const __nv_bfloat16* w,
+                                 float* out, int n, int H) {
+    int t = blockIdx.x;
+    const __nv_bfloat16* xr = x + (long long)t * H;
+    float* orow = out + (long long)t * H;
+    __shared__ float red[32];
+    float sq = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        sq += __bfloat162float(xr[i]) * __bfloat162float(xr[i]);
+    if (threadIdx.x < 32) red[threadIdx.x] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        sq += __shfl_down_sync(0xffffffff, sq, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sq;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.f;
+        for (int k = 0; k < (int)(blockDim.x >> 5); ++k) s += red[k];
+        red[0] = rsqrtf(s / (float)n + 1e-5f);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        orow[i] = __bfloat162float(xr[i]) * red[0]
+                * __bfloat162float(w[i]);
+}
+
+__global__ void rope_b_kernel(float* q, float* k,
+                              int n_heads, int n_kv_heads,
+                              int head_dim, float theta_base,
+                              int start_pos) {
+    int th = blockIdx.x;
+    int t = th / n_heads;
+    int h = th % n_heads;
+    int i = threadIdx.x;
+    if (i >= head_dim / 2) return;
+    int pos = start_pos + t;
+    float th_ = pos / powf(theta_base, 2.0f*i / (float)head_dim);
+    float c = cosf(th_), s = sinf(th_);
+    long long qbase = (long long)t * n_heads * head_dim + h * head_dim;
+    long long kbase = (long long)t * n_kv_heads * head_dim
+                    + h * head_dim;
+    int lo = (int)(qbase + i);
+    int hi = (int)(qbase + i + head_dim / 2);
+    float q0=q[lo], q1=q[hi];
+    q[lo] = q0*c - q1*s;  q[hi] = q0*s + q1*c;
+    if (h < n_kv_heads) {
+        int klo = (int)(kbase + i);
+        int khi = (int)(kbase + i + head_dim / 2);
+        float k0=k[klo], k1=k[khi];
+        k[klo] = k0*c - k1*s;  k[khi] = k0*s + k1*c;
+    }
+}
+
+__global__ void cache_write_b_kernel(
+    const float* k2d, const float* v2d,
+    __nv_bfloat16* kv_base, int hd, int ctx,
+    int n_kv_heads, int start_pos) {
+    int tv = blockIdx.x;
+    int t = tv / (2 * n_kv_heads);
+    int kvi = tv % (2 * n_kv_heads);
+    int i = threadIdx.x;
+    if (i >= hd) return;
+    const float* src = (kvi < n_kv_heads) ? k2d : v2d;
+    int row = t * n_kv_heads + (kvi % n_kv_heads);
+    kv_base[((long long)kvi * ctx + start_pos + t) * hd + i]
+        = __float2bfloat16(src[(long long)row * hd + i]);
+}
+
+__global__ void attn_b_kernel(const float* q,
+                              const __nv_bfloat16* kv,
+                              float* out,
+                              int n_heads, int n_kv_heads,
+                              int head_dim, int ctx,
+                              int start_pos) {
+    int th = blockIdx.x;
+    int t = th / n_heads;
+    int h = th % n_heads;
+    int pos = start_pos + t;
+    int d = threadIdx.x;
+    if (d >= head_dim) return;
+    int kvh = h / (n_heads / n_kv_heads);
+    const __nv_bfloat16* ks = kv + kvh * ctx * head_dim;
+    const __nv_bfloat16* vs = kv + (long long)n_kv_heads*ctx*head_dim
+                              + kvh * ctx * head_dim;
+    float inv_hd = rsqrtf((float)head_dim);
+    extern __shared__ float w_sm[];
+    __shared__ float red[32];
+    const float* qt = q + (long long)t * n_heads * head_dim
+                    + h * head_dim;
+    float maxs = -1e30f;
+    for (int tt = d; tt <= pos; tt += blockDim.x) {
+        float sc = 0.f;
+        for (int j = 0; j < head_dim; ++j)
+            sc += qt[j] * __bfloat162float(ks[tt*head_dim + j]);
+        sc *= inv_hd;
+        w_sm[tt] = sc;
+        if (sc > maxs) maxs = sc;
+    }
+    if (threadIdx.x < 32) red[threadIdx.x] = -1e30f;
+    __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        maxs = fmaxf(maxs, __shfl_down_sync(0xffffffff, maxs, off));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = maxs;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = -1e30f;
+        for (int k2 = 0; k2 < (int)(blockDim.x >> 5); ++k2)
+            m = fmaxf(m, red[k2]);
+        red[0] = m;
+    }
+    __syncthreads();
+    maxs = red[0];
+    float denom = 0.f, sum = 0.f;
+    for (int tt = 0; tt <= pos; ++tt) {
+        float sc = expf(w_sm[tt] - maxs);
+        denom += sc;
+        sum += sc * __bfloat162float(vs[tt*head_dim + d]);
+    }
+    out[(long long)t * n_heads * head_dim + h * head_dim + d]
+        = sum / denom;
+}
+
+__global__ void embed_rows_kernel(const __nv_bfloat16* table,
+                                  const int64_t* toks,
+                                  __nv_bfloat16* out,
+                                  int T, int H) {
+    int r = blockIdx.x;
+    int i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (r < T && i < H)
+        out[(long long)r * H + i]
+            = table[toks[r] * H + i];
+}
+
+torch::Tensor prefill_batch(torch::Tensor ids_gpu,   // int64 [T] cuda
+                            int64_t start_pos) {
+    if (!g_init) throw std::runtime_error("init_model not called");
+    auto st = at::cuda::getCurrentCUDAStream();
+    ensure_g_bufs();
+    int T = (int)ids_gpu.size(0);
+    int H = (int)g_hidden;
+    // layer-0 dims (identical across layers)
+    int qo = (int)g_outfs[0], ko = (int)g_outfs[1],
+        vo = (int)g_outfs[2], oo = (int)g_outfs[3],
+        go = (int)g_outfs[4], uo = (int)g_outfs[5],
+        dof = (int)g_outfs[6];
+    auto opts_f = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(ids_gpu.device());
+    auto opts_b = torch::TensorOptions()
+        .dtype(torch::kBFloat16).device(ids_gpu.device());
+
+    static torch::Tensor hb, h1f, h1bf, xn, q2, k2, v2, at,
+                          o2, xn2, mg, mu, act, md, outb;
+    static int cap = 0;
+    if (cap < T) {
+        cap = g_ctx;
+        hb   = torch::empty({cap, H}, opts_b);
+        h1f  = torch::empty({cap, H}, opts_f);
+        h1bf = torch::empty({cap, H}, opts_b);
+        xn   = torch::empty({cap, H}, opts_f);
+        q2   = torch::empty({cap, qo}, opts_f);
+        k2   = torch::empty({cap, ko}, opts_f);
+        v2   = torch::empty({cap, vo}, opts_f);
+        at   = torch::empty({cap, qo}, opts_f);
+        o2   = torch::empty({cap, oo}, opts_f);
+        xn2  = torch::empty({cap, H}, opts_f);
+        mg   = torch::empty({cap, go}, opts_f);
+        mu   = torch::empty({cap, uo}, opts_f);
+        act  = torch::empty({cap, go}, opts_f);
+        md   = torch::empty({cap, dof}, opts_f);
+        outb = torch::empty({cap, H}, opts_b);
+    }
+    long long TH = (long long)T * H;
+    int nblkH = (int)((TH + 255) / 256);
+
+    embed_rows_kernel<<<dim3(T, (H + 255) / 256), 256, 0, st>>>(
+        reinterpret_cast<const __nv_bfloat16*>(g_embed.data_ptr()),
+        ids_gpu.data_ptr<int64_t>(),
+        reinterpret_cast<__nv_bfloat16*>(hb.data_ptr()),
+        T, H);
+
+    auto hcur = hb;
+    for (int l = 0; l < (int)g_kcs.size(); ++l) {
+        int b = l * 7;
+        rmsnorm_b_kernel<<<T, 256, 0, st>>>(
+            reinterpret_cast<const __nv_bfloat16*>(hcur.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(g_inws[l].data_ptr()),
+            xn.data_ptr<float>(), H, H);
+        dim3 gq((unsigned)(qo / 8), T), gk((unsigned)(ko / 8), T),
+             gv((unsigned)(vo / 8), T);
+        gsq_gemm_kernel<<<gq, 256, (size_t)H*4, st>>>(
+            xn.data_ptr<float>(), g_codes[b].data_ptr<uint8_t>(),
+            g_cbs[b].data_ptr<float>(), g_s[b].data_ptr<uint8_t>(),
+            (float)g_bases[b], (float)g_steps[b],
+            q2.data_ptr<float>(), H/16, H, qo);
+        gsq_gemm_kernel<<<gk, 256, (size_t)H*4, st>>>(
+            xn.data_ptr<float>(), g_codes[b+1].data_ptr<uint8_t>(),
+            g_cbs[b+1].data_ptr<float>(), g_s[b+1].data_ptr<uint8_t>(),
+            (float)g_bases[b+1], (float)g_steps[b+1],
+            k2.data_ptr<float>(), H/16, H, ko);
+        gsq_gemm_kernel<<<gv, 256, (size_t)H*4, st>>>(
+            xn.data_ptr<float>(), g_codes[b+2].data_ptr<uint8_t>(),
+            g_cbs[b+2].data_ptr<float>(), g_s[b+2].data_ptr<uint8_t>(),
+            (float)g_bases[b+2], (float)g_steps[b+2],
+            v2.data_ptr<float>(), H/16, H, vo);
+        rope_b_kernel<<<T * (unsigned)g_nheads, (unsigned)(g_hd/2),
+                        0, st>>>(
+            q2.data_ptr<float>(), k2.data_ptr<float>(),
+            (int)g_nheads, (int)g_nkv, (int)g_hd, (float)g_theta,
+            (int)start_pos);
+        cache_write_b_kernel<<<T * 2 * (unsigned)g_nkv, (unsigned)g_hd,
+                               0, st>>>(
+            k2.data_ptr<float>(), v2.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(g_kcs[l].data_ptr()),
+            (int)g_hd, (int)g_ctx, (int)g_nkv, (int)start_pos);
+        attn_b_kernel<<<T * (unsigned)g_nheads, (unsigned)g_hd,
+                        (size_t)g_ctx * 4, st>>>(
+            q2.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(g_kcs[l].data_ptr()),
+            at.data_ptr<float>(),
+            (int)g_nheads, (int)g_nkv, (int)g_hd, (int)g_ctx,
+            (int)start_pos);
+        dim3 go_((unsigned)(oo / 8), T);
+        gsq_gemm_kernel<<<go_, 256, (size_t)qo*4, st>>>(
+            at.data_ptr<float>(), g_codes[b+3].data_ptr<uint8_t>(),
+            g_cbs[b+3].data_ptr<float>(), g_s[b+3].data_ptr<uint8_t>(),
+            (float)g_bases[b+3], (float)g_steps[b+3],
+            o2.data_ptr<float>(), qo/16, qo, oo);
+        cast_bf16_f32<<<nblkH, 256, 0, st>>>(
+            reinterpret_cast<const __nv_bfloat16*>(hcur.data_ptr()),
+            h1f.data_ptr<float>(), (int)TH);
+        add_f32<<<nblkH, 256, 0, st>>>(
+            h1f.data_ptr<float>(), o2.data_ptr<float>(),
+            h1f.data_ptr<float>(), (int)TH);
+        cast_f32_bf16<<<nblkH, 256, 0, st>>>(
+            h1f.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(h1bf.data_ptr()),
+            (int)TH);
+        rmsnorm_b_kernel<<<T, 256, 0, st>>>(
+            reinterpret_cast<const __nv_bfloat16*>(h1bf.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(g_postws[l].data_ptr()),
+            xn2.data_ptr<float>(), H, H);
+        dim3 gg((unsigned)(go / 8), T), gu((unsigned)(uo / 8), T);
+        gsq_gemm_kernel<<<gg, 256, (size_t)H*4, st>>>(
+            xn2.data_ptr<float>(), g_codes[b+4].data_ptr<uint8_t>(),
+            g_cbs[b+4].data_ptr<float>(), g_s[b+4].data_ptr<uint8_t>(),
+            (float)g_bases[b+4], (float)g_steps[b+4],
+            mg.data_ptr<float>(), H/16, H, go);
+        gsq_gemm_kernel<<<gu, 256, (size_t)H*4, st>>>(
+            xn2.data_ptr<float>(), g_codes[b+5].data_ptr<uint8_t>(),
+            g_cbs[b+5].data_ptr<float>(), g_s[b+5].data_ptr<uint8_t>(),
+            (float)g_bases[b+5], (float)g_steps[b+5],
+            mu.data_ptr<float>(), H/16, H, uo);
+        silu_kernel<<<(int)((go * (long long)T + 255) / 256), 256,
+                      0, st>>>(
+            mg.data_ptr<float>(), mu.data_ptr<float>(),
+            act.data_ptr<float>(), (int)((long long)go * T));
+        dim3 gd((unsigned)(dof / 8), T);
+        gsq_gemm_kernel<<<gd, 256, (size_t)go*4, st>>>(
+            act.data_ptr<float>(), g_codes[b+6].data_ptr<uint8_t>(),
+            g_cbs[b+6].data_ptr<float>(), g_s[b+6].data_ptr<uint8_t>(),
+            (float)g_bases[b+6], (float)g_steps[b+6],
+            md.data_ptr<float>(), go/16, go, dof);
+        add_f32<<<nblkH, 256, 0, st>>>(
+            h1f.data_ptr<float>(), md.data_ptr<float>(),
+            h1f.data_ptr<float>(), (int)TH);
+        cast_f32_bf16<<<nblkH, 256, 0, st>>>(
+            h1f.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(outb.data_ptr()),
+            (int)TH);
+        hcur = outb;
+    }
+    return hcur;
+}
 void init_model(
     torch::Tensor embed_table, torch::Tensor pos_gpu,
     std::vector<torch::Tensor> kv_caches,
