@@ -349,6 +349,11 @@ def serve(
         from .step_graph import StepGraphEngine
 
         eng = StepGraphEngine.from_pretrained(model_path, codec=codec)
+    elif mode == "cpp-gsq":
+        from .cpp_engine import CppGsqEngine
+
+        eng = CppGsqEngine.from_pretrained(model_path,
+                                           ctx=max(max_ctx, 512))
     elif codec == "peakq":
         from .peakq_engine import PeakQEngine
 

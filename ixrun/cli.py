@@ -265,7 +265,7 @@ def main():
     pv = sub.add_parser("serve", help="OpenAI-compatible API server")
     pv.add_argument("--model", default=MODEL_PATH)
     pv.add_argument("--mode", default="streaming",
-                    choices=["cached", "streaming", "udcq-graph", "udcq-spec", "step-graph"])
+                    choices=["cached", "streaming", "udcq-graph", "udcq-spec", "step-graph", "cpp-gsq"])
     pv.add_argument("--codec", default="int8x", choices=["int8x", "peakq", "bf16", "udcq", "udcq-stream", "gmm-stream", "hpqs-mixed", "gsq", "bf16xl"])
     pv.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pv.add_argument("--cache", default=None, help="packed-weight cache file / UDCQ blob")
