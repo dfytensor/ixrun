@@ -2357,6 +2357,74 @@ torch::Tensor graph_replay() {
     return g_result;
 }
 
+// ---------------- Stage 4 step 4: full GDN decoder layer -------------- //
+// Wraps the gated gdn_layer_step CORE with decoder semantics:
+// h1 = h + core(rmsnorm(h, in_w)); out = h1 + mlp(rmsnorm(h1, post_w))
+// All pieces already gated individually. conv_state/S updated in place.
+torch::Tensor gdn_decoder_step(
+    torch::Tensor h, torch::Tensor cb,
+    torch::Tensor qkv_i, torch::Tensor qkv_s, torch::Tensor qkv_sc,
+    torch::Tensor z_i,   torch::Tensor z_s,   torch::Tensor z_sc,
+    torch::Tensor b_i,   torch::Tensor b_s,   torch::Tensor b_sc,
+    torch::Tensor a_i,   torch::Tensor a_s,   torch::Tensor a_sc,
+    torch::Tensor o_i,   torch::Tensor o_s,   torch::Tensor o_sc,
+    torch::Tensor gg_i,  torch::Tensor gg_s,  torch::Tensor gg_sc,
+    torch::Tensor uu_i,  torch::Tensor uu_s,  torch::Tensor uu_sc,
+    torch::Tensor dd_i,  torch::Tensor dd_s,  torch::Tensor dd_sc,
+    torch::Tensor in_w, torch::Tensor post_w,
+    torch::Tensor conv_w, torch::Tensor conv_b,
+    torch::Tensor A_log, torch::Tensor dt_bias,
+    torch::Tensor gnorm_w,
+    torch::Tensor conv_state, torch::Tensor S,
+    int64_t nv, int64_t nk, int64_t dk, int64_t dv,
+    int64_t inter)
+{
+    auto st = at::cuda::getCurrentCUDAStream();
+    int hidden = (int)h.numel();
+    auto f32 = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(h.device());
+    static torch::Tensor xn, h1, xn2, out;
+    static bool init = false;
+    if (!init) {
+        xn  = torch::empty({hidden}, f32);
+        h1  = torch::empty({hidden}, f32);
+        xn2 = torch::empty({hidden}, f32);
+        out = torch::empty({hidden}, f32);
+        init = true;
+    }
+    rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
+        h.data_ptr<float>(), in_w.data_ptr<float>(),
+        xn.data_ptr<float>(), hidden, 1e-6f);
+    torch::Tensor core = gdn_layer_step(
+        xn.view({-1}), cb,
+        qkv_i, qkv_s, qkv_sc, z_i, z_s, z_sc,
+        b_i, b_s, b_sc, a_i, a_s, a_sc,
+        o_i, o_s, o_sc,
+        conv_w, conv_b, A_log, dt_bias, gnorm_w,
+        conv_state, S, nv, nk, dk, dv);
+    add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
+        h.data_ptr<float>(), core.data_ptr<float>(),
+        h1.data_ptr<float>(), hidden);
+    rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
+        h1.data_ptr<float>(), post_w.data_ptr<float>(),
+        xn2.data_ptr<float>(), hidden, 1e-6f);
+    // mlp (inter passed explicitly; shapes from checkpoint)
+    torch::Tensor mg = udcq_gemv_out(
+        xn2.view({-1}), gg_i, gg_s, gg_sc, cb, inter, hidden, 16);
+    torch::Tensor mu = udcq_gemv_out(
+        xn2.view({-1}), uu_i, uu_s, uu_sc, cb, inter, hidden, 16);
+    torch::Tensor act = torch::empty_like(mg);
+    silu_kernel<<<(unsigned)((inter + 255) / 256), 256, 0, st>>>(
+        mg.data_ptr<float>(), mu.data_ptr<float>(),
+        act.data_ptr<float>(), (int)inter);
+    torch::Tensor md = udcq_gemv_out(
+        act, dd_i, dd_s, dd_sc, cb, hidden, 17408, 16);
+    add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
+        h1.data_ptr<float>(), md.data_ptr<float>(),
+        out.data_ptr<float>(), hidden);
+    return out;
+}
+
 // q_proj fused gate split: src [nh, 512] -> q [nh,256], gate [nh,256]
 __global__ void chunk_qgate_kernel(const float* src, float* q,
                                    float* gate, int hd) {
