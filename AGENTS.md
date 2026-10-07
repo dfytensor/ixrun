@@ -233,16 +233,20 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   text_config.rope_theta default); full-attn HAS q_norm/k_norm
   (256-dim RMSNorm, fp32, needed in attn path). Blob EXCLUDES mtp
   weights + all norms/conv/dt_bias/A_log (safetensors reads).
-- Step 3a NEXT (designed, not written): gdn_layer_step C++ fn
-  encapsulating the 5-GEMV+conv+l2norm+recurrent+gated-norm chain.
-  Pitfalls identified in a failed draft: (1) z must be copied into
-  [nv,dv] rows BEFORE gated_rmsnorm (zr), (2) gated_rmsnorm in/out
-  must NOT alias (allocate separate out), (3) needs new tiny kernels:
-  repeat_heads (nk->nv interleave, grid(nk,3)), sigmoid, g-gate
-  (=-exp(A_log)*softplus(a+dt_bias)), fp32 scale mul; (4) out buffer
-  must be allocated [hidden]; (5) init flag guards ALL statics.
-  Gate: fn vs step-2 inline chain bit-exact (same kernels same
-  order).
+- Step 4 (decode_64 scheduler) DESIGN CORRECTION before coding:
+  the two layer fns have ASYMMETRIC contracts — attn_layer_step
+  includes norms/residuals/mlp, gdn_layer_step is bare-core (norms/
+  residual/mlp live OUTSIDE it). Draft attempt mixing them failed
+  (reverted, never committed). REQUIRED: extend gdn_layer_step to
+  full decoder semantics (add in_w/post_w norms + residual adds +
+  gate/up/down GEMVs + silu — all pieces already gated) so both fns
+  take (h, pos, weights) -> new h symmetrically. Then step27 = clean
+  dispatch over layer_types {3,7,...,63} + final norm + lm_head
+  GEMV (248320 out) + argmax. init27 static-init pattern (vectors
+  of packs [64][7], norms, states) as designed. Gate ladder:
+  (a) 4-layer schedule (3 GDN + 1 attn) bit-compare vs direct fn
+  calls; (b) full-64 greedy tokens vs Python q38 pipeline (same
+  blob -> expect >=90% match + coherent text).
 - engine_v5.cu is 2100+ lines with ~350 dead/research lines; staged
   hygiene plan in docs/engine_v5_refactor_plan.md (execute Step 1
   first — zero-semantics dead code removal, no ext-name bump).
