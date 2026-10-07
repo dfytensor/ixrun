@@ -74,6 +74,11 @@ def _build_engine(args):
 
         return StepGraphEngine.from_pretrained(
             args.model, codec=args.codec, verbose=True)
+    if getattr(args, "mode", None) == "cpp-gsq":
+        from .cpp_engine import CppGsqEngine
+
+        return CppGsqEngine.from_pretrained(args.model,
+                                            ctx=max(mctx, 512))
     if getattr(args, "codec", "int8x") == "peakq":
         from .peakq_engine import PeakQEngine
 
@@ -214,7 +219,7 @@ def main():
     pg.add_argument("prompt")
     pg.add_argument("--model", default=MODEL_PATH)
     pg.add_argument("--mode", default="cached",
-                    choices=["cached", "streaming", "graph", "udcq-graph", "udcq-spec", "step-graph"])
+                    choices=["cached", "streaming", "graph", "udcq-graph", "udcq-spec", "step-graph", "cpp-gsq"])
     pg.add_argument("--codec", default="int8x", choices=["int8x", "peakq", "bf16", "udcq", "udcq-stream", "gmm-stream", "hpqs-mixed", "gsq", "bf16xl"])
     pg.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pg.add_argument("--max-new-tokens", type=int, default=128)
@@ -238,7 +243,7 @@ def main():
     pc = sub.add_parser("chat", help="interactive chat REPL")
     pc.add_argument("--model", default=MODEL_PATH)
     pc.add_argument("--mode", default="streaming",
-                    choices=["cached", "streaming", "udcq-graph", "udcq-spec", "step-graph"])
+                    choices=["cached", "streaming", "udcq-graph", "udcq-spec", "step-graph", "cpp-gsq"])
     pc.add_argument("--codec", default="int8x", choices=["int8x", "peakq", "bf16", "udcq", "udcq-stream", "gmm-stream", "hpqs-mixed", "gsq", "bf16xl"])
     pc.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pc.add_argument("--max-new-tokens", type=int, default=256)

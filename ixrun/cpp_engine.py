@@ -169,3 +169,77 @@ class CppGsqEngine:
         if out is not None:
             out.extend(toks)
         return toks
+
+    # ------------- CLI engine facade (greedy, llama.cpp-style) ------ //
+    @classmethod
+    def from_pretrained(cls, model_path, ctx=512, verbose=True):
+        import gc
+        import time
+        from transformers import (AutoModelForCausalLM,
+                                  AutoTokenizer)
+        t0 = time.perf_counter()
+        tok = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True)
+        m = AutoModelForCausalLM.from_pretrained(
+            model_path, dtype=torch.bfloat16, trust_remote_code=True
+        ).eval().cuda()
+        eng = cls(m, ctx=ctx)
+        eng.tok = tok
+        eng.model = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        if verbose:
+            print(f'[cpp-gsq] packed+init '
+                  f'{time.perf_counter()-t0:.1f}s', flush=True)
+        return eng
+
+    def _gen_block(self, seed, pos, n):
+        self._ensure_graph()
+        self.ext.sf_seed(seed, pos)
+        torch.cuda.synchronize()
+        for _ in range(n):
+            self._graph.replay()
+        torch.cuda.synchronize()
+        return self.ext.sf_get_hist(pos, n).tolist()
+
+    def _replay_block(self, pos, n):
+        # continuation: tok/pos state already advanced in-graph
+        for _ in range(n):
+            self._graph.replay()
+        torch.cuda.synchronize()
+        return self.ext.sf_get_hist(pos, n).tolist()
+
+    def _prep(self, prompt, max_new_tokens):
+        self.reset()
+        ids = self.tok(prompt, return_tensors='pt')\
+            .input_ids[0].tolist()
+        budget = self.ctx - len(ids) - 2
+        n = max(1, min(max_new_tokens, budget))
+        return ids, n
+
+    def generate(self, prompt, max_new_tokens=128, **kw):
+        ids, n = self._prep(prompt, max_new_tokens)
+        nxt = self.prefill(ids)
+        toks = self._gen_block(nxt, len(ids), n)
+        eos = self.tok.eos_token_id
+        if eos is not None and eos in toks:
+            toks = toks[:toks.index(eos)]
+        return self.tok.decode(toks)
+
+    def stream(self, prompt, max_new_tokens=128, chunk=16, **kw):
+        ids, n = self._prep(prompt, max_new_tokens)
+        nxt = self.prefill(ids)
+        eos = self.tok.eos_token_id
+        done = 0
+        while done < n:
+            k = min(chunk, n - done)
+            if done == 0:
+                toks = self._gen_block(nxt, len(ids), k)
+            else:
+                toks = self._replay_block(len(ids) + done, k)
+            done += k
+            if eos is not None and eos in toks:
+                toks = toks[:toks.index(eos)]
+                yield self.tok.decode(toks)
+                return
+            yield self.tok.decode(toks)
