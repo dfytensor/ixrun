@@ -208,18 +208,42 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
 
 - **NEW kernel variants MUST pass a bit-exact unit test before deployment** (per-group GMM: G=8 variant was never bit-exact-verified — it produced 27B text degeneration while G=16 was fine; severe VRAM paging did NOT corrupt text, so degeneration = numerical bug in the new variant). Rule: any new tl.constexpr configuration (GROUP/BK/R/T) gets a decode-vs-reference bit-exact check on real shapes before touching a model.
 
-## C++ engine (ixrun/cpp) - 2026/9 session
-- engine.cu: GSQ GEMV (bit-exact port) + rmsnorm_f32 + rope + GQA S=1 attn
+## C++ engine (ixrun/cpp) - 2026/10 session
+- engine_v5.cu: GSQ GEMV (bit-exact port) + rmsnorm_f32 + rope + GQA S=1 attn
   + mlp_forward + layer_forward, all fp32-internal with bf16 boundaries.
   VALIDATED: 3-position chain memcheck-CLEAN, pos rel 0.062/0.079/0.091
   vs fp32 ref = GSQ inherent tier (bf16-activation + 5.5bpw), ACCEPTED.
+- **SELF-FEEDING CUDA graph (2999a90) — the only correct + fastest decode**:
+  in-graph loop argmax→g_tok_gpu→embed_lookup→24 layers→lm_head→argmax
+  + tok_record(hist[d_pos]) + pos_incr(g_pos). Python = 1 replay()/token,
+  zero sync/copy. 64/64 TOKEN-IDENTICAL vs eager per-token ref, 25.6 tok/s
+  (pure GPU kernel time, WDDM PyTorch CUDAGraph). In-graph kernel writes
+  PERSIST across replays; Python-written input buffers also visible.
+- **BUG 1**: step_graph() had NO set_pos_kernel — replays ran at the stale
+  d_pos from the last eager step() (pos 127) forever. The old "25 tok/s
+  FULL graph coherent text" was position-corrupted (model robustness made
+  it LOOK fine). LESSON: token-level comparison vs eager ref is MANDATORY;
+  "coherent text" checks are worthless (positions wrong, cache clobbered,
+  everything still looks fluent).
+- **BUG 2**: lazy-init inside seed functions ran a full step at STALE g_pos,
+  clobbering the last real cache slot (3/64 vs 24/24 mystery). LESSON:
+  init helpers must be PURE (allocate only, launch zero kernels).
+- **argmax_f32 was scanning only the first 256 logits** (single-element-
+  per-thread, no grid-stride) for the full vocab — silently wrong since
+  introduction; embed_lookup same. LESSON: single-block kernels over large
+  arrays MUST grid-stride (or be bit-tested at real vocab size).
+- **WDDM CUDA graphs (definitive)**: raw cudaStreamBeginCapture graphs read
+  STALE data on replay (even with raw cudaMalloc + cudaMemcpy, zero PyTorch)
+  — driver-level snapshot, UNFIXABLE on Windows. PyTorch torch.cuda.CUDAGraph
+  (dedicated mempool) is the ONLY working graph path on WDDM. cudaGraphExec-
+  KernelNodeSetParams untested (explicit-API construction would be needed).
 - Iron rules: load_inline cpp_sources MUST declare every bound fn (empty
   = C2065); NO PYBIND11_MODULE in the .cu (load_inline generates it =
   LNK2005 PyInit); extension kernels launch on getCurrentCUDAStream
   (legacy stream silently escapes graph capture); after ANY kernel-sign
   or layout change bump the extension name (stale cache poisons);
-  pack/ref roundtrip test BEFORE blaming the kernel (the "halved codes"
-  was a decode-side weight typo arange(5) vs (1<<ar5)); gs_pack lm_head
+  pack/ref roundtrip test BEFORE blaming the kernel; gs_pack lm_head
   reuses pks[-1] (weights are zeroed after pack - never re-pack).
-- Open: token-level gen harness (test_cpp_gen.py, pos indexing + ref
-  window alignment), then C3 host-loop perf (target 250 tg128).
+- Open: GEMV kernel optimization (no vectorized uint4 loads, fp32 x
+  re-reads; 25.6 tok/s is kernel-bound not launch-bound) → target 50+;
+  prefill still per-token eager (~5s/128tok); C4 dual-format bf16xl.
