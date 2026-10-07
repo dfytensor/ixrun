@@ -2442,6 +2442,7 @@ static torch::Tensor s27_cb, s27_fnw, s27_lh_i, s27_lh_s,
 static std::vector<int64_t> s27_attn_layers;
 static int64_t s27_hidden, s27_inter, s27_ctx;
 static bool s27_init = false;
+static torch::Tensor s27_lg_out;
 
 void init27(
     torch::Tensor cb,
@@ -2594,8 +2595,11 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
     argmax_f32<<<1, 256, 0, st>>>(
         lg.data_ptr<float>(), (int)vocab,
         tok.data_ptr<int64_t>());
+    s27_lg_out = lg;   // probe (diagnostics)
     return tok.item<int64_t>();
 }
+
+torch::Tensor s27_get_lg() { return s27_lg_out.cpu(); }
 
 // q_proj fused gate split: src [nh, 512] -> q [nh,256], gate [nh,256]
 __global__ void chunk_qgate_kernel(const float* src, float* q,
