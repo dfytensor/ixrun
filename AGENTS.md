@@ -233,6 +233,15 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   text_config.rope_theta default); full-attn HAS q_norm/k_norm
   (256-dim RMSNorm, fp32, needed in attn path). Blob EXCLUDES mtp
   weights + all norms/conv/dt_bias/A_log (safetensors reads).
+- BISECT BLOCKED by toolchain: nvcc cudafe++ dies 0xC0000005
+  PERSISTENTLY on current engine_v5.cu (2620 lines) — not RAM
+  (54GB free), not zombie processes (killed, retried twice).
+  Appeared with the per-layer probe additions (s27_layer_h/
+  getters) and/or the 36/40-param fwd-decl block. Unblock via:
+  reboot, comment out probe block, or split source (refactor
+  plan). Bisect logic + ground truth (HF top1 ' Paris') all
+  committed. PUSH PENDING: GitHub 500 outage — push first thing
+  next session.
 - Step 4 (decode_64 scheduler) DESIGN CORRECTION before coding:
   the two layer fns have ASYMMETRIC contracts — attn_layer_step
   includes norms/residuals/mlp, gdn_layer_step is bare-core (norms/
