@@ -591,6 +591,81 @@ torch::Tensor udcq_gemv_out(torch::Tensor x,
     return y;
 }
 
+// l2norm (fla-aligned): y = x * rsqrt(sum(x^2) + 1e-6), one row/block
+__global__ void l2norm_kernel(const float* __restrict__ x,
+                              float* __restrict__ y, int d) {
+    __shared__ float red[32];
+    const float* xr = x + (long long)blockIdx.x * d;
+    float* yr = y + (long long)blockIdx.x * d;
+    float sq = 0.f;
+    for (int i = threadIdx.x; i < d; i += blockDim.x)
+        sq += xr[i] * xr[i];
+    if (threadIdx.x < 32) red[threadIdx.x] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        sq += __shfl_down_sync(0xffffffff, sq, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sq;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int k = 0; k < (int)(blockDim.x >> 5); ++k) t += red[k];
+        red[0] = rsqrtf(t + 1e-6f);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < d; i += blockDim.x)
+        yr[i] = xr[i] * red[0];
+}
+
+// causal_conv1d_update (S=1): depthwise K-tap over [state, x],
+// state shifts left (drop oldest, append x), optional silu.
+__global__ void conv1d_update_kernel(
+    const float* __restrict__ x,       // [C]
+    float* __restrict__ conv_state,    // [C, state_len] in/out
+    const float* __restrict__ w,       // [C, K]
+    const float* __restrict__ bias,    // [C]
+    float* __restrict__ out,           // [C]
+    int state_len, int K, int use_act)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const float* st_in = conv_state + (long long)c * state_len;
+    float* st = conv_state + (long long)c * state_len;
+    float acc = 0.f;
+    for (int k = 0; k < state_len; ++k)
+        acc += w[c * K + k] * st_in[k];
+    acc += w[c * K + state_len] * x[c];   // last tap = new token
+    acc += bias[c];
+    for (int j = 0; j < state_len - 1; ++j)
+        st[j] = st[j + 1];
+    st[state_len - 1] = x[c];
+    out[c] = use_act ? (acc / (1.f + expf(-acc))) : acc;
+}
+
+torch::Tensor l2norm_out(torch::Tensor x2d) {
+    int R = (int)x2d.size(0), d = (int)x2d.size(1);
+    auto y = torch::empty_like(x2d);
+    l2norm_kernel<<<R, 256, 0,
+                    at::cuda::getCurrentCUDAStream()>>>(
+        x2d.data_ptr<float>(), y.data_ptr<float>(), d);
+    return y;
+}
+
+torch::Tensor conv1d_update_out(torch::Tensor x,
+                                torch::Tensor conv_state,
+                                torch::Tensor w, torch::Tensor bias,
+                                int64_t use_act) {
+    int C = (int)x.size(0);
+    int state_len = (int)conv_state.size(1);
+    int K = (int)w.size(1);
+    auto out = torch::empty_like(x);
+    conv1d_update_kernel<<<(C + 255) / 256, 256, 0,
+                           at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(), conv_state.data_ptr<float>(),
+        w.data_ptr<float>(), bias.data_ptr<float>(),
+        out.data_ptr<float>(), state_len, K, (int)use_act);
+    return out;
+}
+
 // ---------------- GDN recurrent (27B stage 3a) ----------------------- //
 // torch_recurrent_gated_delta_rule for S=1 decode step, per head:
 //   S = S*exp(g); kv_mem[j] = sum_i S[i][j]*k[i];
