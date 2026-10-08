@@ -17,6 +17,8 @@ static bool s27_init = false;
 static torch::Tensor s27_lg_out;
 static std::vector<float> s27_hnorm;   // per-layer probe
 static std::vector<torch::Tensor> s27_layer_h;
+static int s27_probe_l = -1;
+static torch::Tensor s27_h_out;
 
 void init27(
     torch::Tensor cb,
@@ -119,7 +121,7 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
         h = hcur;
         torch::Tensor hn = hcur.norm();
         s27_hnorm.push_back(hn.item<float>());
-        // s27_layer_h.push_back(hcur.clone());  // AV probe off
+        if ((int)l == s27_probe_l) s27_h_out = hcur.clone();
     }
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h.data_ptr<float>(), s27_fnw.data_ptr<float>(),
@@ -150,5 +152,8 @@ torch::Tensor s27_get_layer_h() {
     return torch::zeros({1});  // AV probe off
     return torch::stack(s27_layer_h).cpu();
 }
+
+void s27_set_probe(int64_t l) { s27_probe_l = (int)l; }
+torch::Tensor s27_get_probe_h() { return s27_h_out.cpu(); }
 
 

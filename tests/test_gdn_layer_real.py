@@ -71,7 +71,9 @@ Wb_bf = attn.in_proj_b.weight.data
 Wa_bf = attn.in_proj_a.weight.data
 
 g = torch.Generator(device='cuda').manual_seed(37)
-h = torch.randn(5120, generator=g, device='cuda').float()
+blob = blob if 'blob' in dir() else blob
+# REAL-SCALE input: actual embedding row (norm ~1.1), not randn
+h = blob['embed'][760].cuda().float()
 conv_state = torch.randn(conv_dim, 3, generator=g,
                          device='cuda').float() * 0.1
 S0 = torch.randn(nv, dk, dv, generator=g,
