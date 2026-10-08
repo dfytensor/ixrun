@@ -33,12 +33,13 @@ torch::Tensor s27_get_probe_h();
 torch::Tensor s27_get_lg();
     torch::Tensor s27d_get_xn();
     torch::Tensor s27d_get_core();
+torch::Tensor s27d_get_xn2();
 '''
 ext = load_inline(name='ixrun_cpp_v5s4k', cpp_sources=[proto],
                   cuda_sources=[src, src27],
                   functions=['init27', 'step27', 's27_set_probe',
                              's27_get_probe_h', 's27_get_lg',
-                             's27d_get_xn', 's27d_get_core'],
+                             's27d_get_xn', 's27d_get_core', 's27d_get_xn2'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
@@ -120,11 +121,18 @@ def mkhook(i):
 hooks = [layer.register_forward_pre_hook(mkhook(i), with_kwargs=True)
          for i, layer in enumerate(m.model.layers)]
 py_core_caps = []
+py_mlp_caps = []
 def mkcore(i):
     def hk2(mod, inp, out):
-        py_core_caps.append(out.detach())
+        if i == 0:
+            py_core_caps.append(out.detach())
     return hk2
-hooks2 = [m.model.layers[0].linear_attn.register_forward_hook(mkcore(0))]
+def mkpre(i):
+    def hk3(mod, args):
+        py_mlp_caps.append(args[0].detach())
+    return hk3
+hooks2 = [m.model.layers[0].linear_attn.register_forward_hook(mkcore(0)),
+          m.model.layers[0].mlp.register_forward_pre_hook(mkpre(1))]
 with torch.no_grad():
     out = m(input_ids=torch.tensor([ids]))
 for hk in hooks + hooks2:
@@ -152,6 +160,10 @@ he62 = captured[0][0, -1].float().cuda()   # HF input to layer 0 = embed
 w62 = nw1[0]
 ln_ref = w62 * he62 * torch.rsqrt(he62.pow(2).mean() + 1e-6)
 py_core = py_core_caps[0][0, -1].float().cuda()
+xn2 = ext.s27d_get_xn2().cuda().float()
+print(f'py caps: core {len(py_core_caps)} mlp {len(py_mlp_caps)}', flush=True)
+py_mlp_in = py_mlp_caps[-1][0, -1].float().cuda()
+print(f'xn2(L0) vs PY mlp-input: norm {xn2.norm():.3f} vs {py_mlp_in.norm():.3f} | cos {torch.nn.functional.cosine_similarity(xn2, py_mlp_in, dim=0).item():.4f}', flush=True)
 print(f'core(L0): cpp norm {core0.norm():.3f} vs PY linear_attn out norm {py_core.norm():.3f} | cos {torch.nn.functional.cosine_similarity(core0, py_core, dim=0).item():.4f}', flush=True)
 print(f'xn(L0) vs torch-LN: norm {xn.norm():.3f} vs {ln_ref.norm():.3f} | cos {torch.nn.functional.cosine_similarity(xn, ln_ref, dim=0).item():.4f}', flush=True)
 lg = ext.s27_get_lg()

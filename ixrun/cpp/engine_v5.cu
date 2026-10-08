@@ -2255,6 +2255,7 @@ static torch::Tensor g_input;   // static input buffer (address baked in graph)
 // All pieces already gated individually. conv_state/S updated in place.
 // packs: 24 tensors = qkv(3),z(3),b(3),a(3),o(3),g(3),u(3),d(3)
 static torch::Tensor s27d_xn;   // diagnostics probe (file scope)
+static torch::Tensor s27d_xn2;  // probe: MLP input (post-norm)
 static torch::Tensor s27d_core; // probe: gdn core output
 int s27_probe_l = -1;           // probe (defined here)
 torch::Tensor s27_h_out;
@@ -2308,6 +2309,7 @@ torch::Tensor gdn_decoder_step(
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h1.data_ptr<float>(), post_w.data_ptr<float>(),
         xn2.data_ptr<float>(), hidden, 1e-6f);
+    if ((int)l == s27_probe_l) s27d_xn2 = xn2.clone(); // probe
     // mlp (inter passed explicitly; shapes from checkpoint)
     torch::Tensor mg = udcq_gemv_out(
         xn2.view({-1}), gg_i, gg_s, gg_sc, cb, inter, hidden, 16);
@@ -2326,6 +2328,7 @@ torch::Tensor gdn_decoder_step(
 }
 
 torch::Tensor s27d_get_xn() { return s27d_xn.cpu(); }
+torch::Tensor s27d_get_xn2() { return s27d_xn2.cpu(); }
 torch::Tensor s27d_get_core() { return s27d_core.cpu(); }
 
 // q_proj fused gate split: src [nh, 512] -> q [nh,256], gate [nh,256]
