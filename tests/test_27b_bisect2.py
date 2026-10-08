@@ -138,7 +138,9 @@ print(f'{"L":>3} {"hf_norm":>8} {"cpp_norm":>8} {"cos":>8}',
       flush=True)
 first_bad = None
 for i in range(64):
-    hf = captured[i][0, -1].float()
+    if i >= 63:
+        continue
+    hf = captured[i + 1][0, -1].float()   # input to L+1 = output of L
     cpp = cpp_layers[i]
     cos = torch.nn.functional.cosine_similarity(
         hf, cpp, dim=0).item()

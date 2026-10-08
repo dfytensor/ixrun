@@ -74,6 +74,10 @@ g = torch.Generator(device='cuda').manual_seed(37)
 blob = blob if 'blob' in dir() else blob
 # REAL-SCALE input: actual embedding row (norm ~1.1), not randn
 h = blob['embed'][760].cuda().float()
+from torch.utils.cpp_extension import load_inline as _li
+# replicate scheduler entry: rmsnorm with the layer's in_w FIRST
+in_w = m.model.layers[0].input_layernorm.weight.data.float().cuda()
+h = in_w * h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-6)
 conv_state = torch.randn(conv_dim, 3, generator=g,
                          device='cuda').float() * 0.1
 S0 = torch.randn(nv, dk, dv, generator=g,
