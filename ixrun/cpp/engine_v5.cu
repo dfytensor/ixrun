@@ -2253,16 +2253,10 @@ static torch::Tensor g_input;   // static input buffer (address baked in graph)
 // Wraps the gated gdn_layer_step CORE with decoder semantics:
 // h1 = h + core(rmsnorm(h, in_w)); out = h1 + mlp(rmsnorm(h1, post_w))
 // All pieces already gated individually. conv_state/S updated in place.
+// packs: 24 tensors = qkv(3),z(3),b(3),a(3),o(3),g(3),u(3),d(3)
 torch::Tensor gdn_decoder_step(
     torch::Tensor h, torch::Tensor cb,
-    torch::Tensor qkv_i, torch::Tensor qkv_s, torch::Tensor qkv_sc,
-    torch::Tensor z_i,   torch::Tensor z_s,   torch::Tensor z_sc,
-    torch::Tensor b_i,   torch::Tensor b_s,   torch::Tensor b_sc,
-    torch::Tensor a_i,   torch::Tensor a_s,   torch::Tensor a_sc,
-    torch::Tensor o_i,   torch::Tensor o_s,   torch::Tensor o_sc,
-    torch::Tensor gg_i,  torch::Tensor gg_s,  torch::Tensor gg_sc,
-    torch::Tensor uu_i,  torch::Tensor uu_s,  torch::Tensor uu_sc,
-    torch::Tensor dd_i,  torch::Tensor dd_s,  torch::Tensor dd_sc,
+    std::vector<torch::Tensor> PK,
     torch::Tensor in_w, torch::Tensor post_w,
     torch::Tensor conv_w, torch::Tensor conv_b,
     torch::Tensor A_log, torch::Tensor dt_bias,
@@ -2272,6 +2266,14 @@ torch::Tensor gdn_decoder_step(
     int64_t inter)
 {
     auto st = at::cuda::getCurrentCUDAStream();
+    torch::Tensor qkv_i = PK[0], qkv_s = PK[1], qkv_sc = PK[2];
+    torch::Tensor z_i = PK[3], z_s = PK[4], z_sc = PK[5];
+    torch::Tensor b_i = PK[6], b_s = PK[7], b_sc = PK[8];
+    torch::Tensor a_i = PK[9], a_s = PK[10], a_sc = PK[11];
+    torch::Tensor o_i = PK[12], o_s = PK[13], o_sc = PK[14];
+    torch::Tensor gg_i = PK[15], gg_s = PK[16], gg_sc = PK[17];
+    torch::Tensor uu_i = PK[18], uu_s = PK[19], uu_sc = PK[20];
+    torch::Tensor dd_i = PK[21], dd_s = PK[22], dd_sc = PK[23];
     int hidden = (int)h.numel();
     auto f32 = torch::TensorOptions()
         .dtype(torch::kFloat32).device(h.device());
@@ -2337,16 +2339,12 @@ __global__ void sigmoid_mul_kernel(float* y, const float* g,
 }
 
 // ---------------- Stage 4 step 3b: full-attn layer step ---------------- //
+// packs: 21 tensors = q(3),k(3),v(3),o(3),g(3),u(3),d(3) idx/sign/scale
+// (long explicit arg lists trigger a cudafe++ frontend AV at call sites)
 torch::Tensor attn_layer_step(
     torch::Tensor h,                    // [5120] fp32 in/out value
     torch::Tensor cb,
-    torch::Tensor q_i, torch::Tensor q_s, torch::Tensor q_sc,
-    torch::Tensor k_i, torch::Tensor k_s, torch::Tensor k_sc,
-    torch::Tensor v_i, torch::Tensor v_s, torch::Tensor v_sc,
-    torch::Tensor o_i, torch::Tensor o_s, torch::Tensor o_sc,
-    torch::Tensor g_i, torch::Tensor g_s, torch::Tensor g_sc,
-    torch::Tensor u_i, torch::Tensor u_s, torch::Tensor u_sc,
-    torch::Tensor d_i, torch::Tensor d_s, torch::Tensor d_sc,
+    std::vector<torch::Tensor> PK,
     torch::Tensor in_w, torch::Tensor post_w,
     torch::Tensor q_norm_w, torch::Tensor k_norm_w,
     torch::Tensor kv_cache,             // [8, ctx, 256] bf16
@@ -2355,6 +2353,13 @@ torch::Tensor attn_layer_step(
     int64_t hidden, int64_t inter, int64_t ctx)
 {
     auto st = at::cuda::getCurrentCUDAStream();
+    torch::Tensor q_i = PK[0], q_s = PK[1], q_sc = PK[2];
+    torch::Tensor k_i = PK[3], k_s = PK[4], k_sc = PK[5];
+    torch::Tensor v_i = PK[6], v_s = PK[7], v_sc = PK[8];
+    torch::Tensor o_i = PK[9], o_s = PK[10], o_sc = PK[11];
+    torch::Tensor g_i = PK[12], g_s = PK[13], g_sc = PK[14];
+    torch::Tensor u_i = PK[15], u_s = PK[16], u_sc = PK[17];
+    torch::Tensor d_i = PK[18], d_s = PK[19], d_sc = PK[20];
     int GROUP = 16;
     auto f32 = torch::TensorOptions()
         .dtype(torch::kFloat32).device(h.device());

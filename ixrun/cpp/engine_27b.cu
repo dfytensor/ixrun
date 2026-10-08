@@ -87,36 +87,28 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
             if (a == l) { is_attn = true; break; }
         torch::Tensor hcur;
         if (is_attn) {
-            auto q = T3(l, 0); auto k = T3(l, 1);
-            auto v = T3(l, 2); auto o = T3(l, 3);
-            auto gg = T3(l, 4); auto uu = T3(l, 5);
-            auto dd = T3(l, 6);
+            std::vector<torch::Tensor> P;
+            for (int s = 0; s < 7; ++s) {
+                auto t3 = T3(l, s);
+                P.push_back(t3[0]); P.push_back(t3[1]);
+                P.push_back(t3[2]);
+            }
             hcur = attn_layer_step(
-                h, s27_cb,
-                q[0], q[1], q[2], k[0], k[1], k[2],
-                v[0], v[1], v[2], o[0], o[1], o[2],
-                gg[0], gg[1], gg[2], uu[0], uu[1], uu[2],
-                dd[0], dd[1], dd[2],
+                h, s27_cb, P,
                 s27_nw1[l], s27_nw2[l],
                 s27_aex[ia * 2], s27_aex[ia * 2 + 1],
                 s27_kv[ia], theta, pos,
                 24, 4, 256, hidden, inter, s27_ctx);
             ia++;
         } else {
-            auto qkv = T3(l, 0); auto z = T3(l, 1);
-            auto b = T3(l, 2); auto a = T3(l, 3);
-            auto o = T3(l, 4); auto gg = T3(l, 5);
-            auto uu = T3(l, 6); auto dd = T3(l, 7);
+            std::vector<torch::Tensor> P;
+            for (int s = 0; s < 8; ++s) {
+                auto t3 = T3(l, s);
+                P.push_back(t3[0]); P.push_back(t3[1]);
+                P.push_back(t3[2]);
+            }
             hcur = gdn_decoder_step(
-                h, s27_cb,
-                qkv[0], qkv[1], qkv[2],
-                z[0], z[1], z[2],
-                b[0], b[1], b[2],
-                a[0], a[1], a[2],
-                o[0], o[1], o[2],
-                gg[0], gg[1], gg[2],
-                uu[0], uu[1], uu[2],
-                dd[0], dd[1], dd[2],
+                h, s27_cb, P,
                 s27_nw1[l], s27_nw2[l],
                 s27_gex[ig * 4], s27_gex[ig * 4 + 1],
                 s27_gex[ig * 4 + 2], s27_gex[ig * 4 + 3],
