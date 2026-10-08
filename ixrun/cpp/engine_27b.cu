@@ -17,8 +17,8 @@ static bool s27_init = false;
 static torch::Tensor s27_lg_out;
 static std::vector<float> s27_hnorm;   // per-layer probe
 static std::vector<torch::Tensor> s27_layer_h;
-int s27_probe_l = -1;
-torch::Tensor s27_h_out;
+extern int s27_probe_l;
+extern torch::Tensor s27_h_out;
 
 void init27(
     torch::Tensor cb,

@@ -2255,8 +2255,8 @@ static torch::Tensor g_input;   // static input buffer (address baked in graph)
 // All pieces already gated individually. conv_state/S updated in place.
 // packs: 24 tensors = qkv(3),z(3),b(3),a(3),o(3),g(3),u(3),d(3)
 static torch::Tensor s27d_xn;   // diagnostics probe (file scope)
-extern int s27_probe_l;         // defined in engine_27b.cu
-extern torch::Tensor s27_h_out; // defined in engine_27b.cu
+int s27_probe_l = -1;           // probe (defined here)
+torch::Tensor s27_h_out;
 torch::Tensor gdn_decoder_step(
     torch::Tensor h, torch::Tensor cb,
     std::vector<torch::Tensor> PK,
