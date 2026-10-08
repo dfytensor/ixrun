@@ -17,8 +17,8 @@ static bool s27_init = false;
 static torch::Tensor s27_lg_out;
 static std::vector<float> s27_hnorm;   // per-layer probe
 static std::vector<torch::Tensor> s27_layer_h;
-static int s27_probe_l = -1;
-static torch::Tensor s27_h_out;
+int s27_probe_l = -1;
+torch::Tensor s27_h_out;
 
 void init27(
     torch::Tensor cb,
@@ -115,7 +115,7 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
                 s27_gex[ig * 4], s27_gex[ig * 4 + 1],
                 s27_gex[ig * 4 + 2], s27_gex[ig * 4 + 3],
                 s27_gnorm[ig], s27_convst[ig], s27_S[ig],
-                48, 16, 128, 128, inter);
+                48, 16, 128, 128, inter, l);
             ig++;
         }
         h = hcur;

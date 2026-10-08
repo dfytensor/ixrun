@@ -31,11 +31,13 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta);
 void s27_set_probe(int64_t l);
 torch::Tensor s27_get_probe_h();
 torch::Tensor s27_get_lg();
+    torch::Tensor s27d_get_xn();
 '''
 ext = load_inline(name='ixrun_cpp_v5s4k', cpp_sources=[proto],
                   cuda_sources=[src, src27],
                   functions=['init27', 'step27', 's27_set_probe',
-                             's27_get_probe_h', 's27_get_lg'],
+                             's27_get_probe_h', 's27_get_lg',
+                             's27d_get_xn'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
@@ -102,6 +104,7 @@ for l in range(64):
 fnw = m.model.norm.weight.data.float().cuda()
 emb = blob['embed']
 
+print(f'STAGING CHECK: nw1[0] norm {nw1[0].float().norm():.3f} | hf input_layernorm norm ' + str(m.model.layers[0].input_layernorm.weight.float().norm().item()) + ' | hf post norm ' + str(m.model.layers[0].post_attention_layernorm.weight.float().norm().item()) + f' | nw2[0] {nw2[0].float().norm():.3f} | fnw {fnw.float().norm():.3f}', flush=True)
 ext.init27(cb_g, packs, nw1, nw2, gex, gnorm, aex, fnw,
            *lh_t, ATTN, 5120, 17408, 512)
 
@@ -129,6 +132,18 @@ for L in range(64):
         ext.step27(h, pos, 1e7)
     torch.cuda.synchronize()
     cpp_layers.append(ext.s27_get_probe_h().clone())
+# xn probe: last sweep L=63 (attn layer — xn not captured there, so
+# rerun one more sweep at the last GDN layer for the xn check)
+ext.s27_set_probe(0)
+for pos, t in enumerate(ids):
+    h = emb[t].cuda().float()
+    ext.step27(h, pos, 1e7)
+torch.cuda.synchronize()
+xn = ext.s27d_get_xn().cuda().float()
+he62 = captured[0][0, -1].float().cuda()   # HF input to layer 0 = embed
+w62 = nw1[0]
+ln_ref = w62 * he62 * torch.rsqrt(he62.pow(2).mean() + 1e-6)
+print(f'xn(L0) vs torch-LN: norm {xn.norm():.3f} vs {ln_ref.norm():.3f} | cos {torch.nn.functional.cosine_similarity(xn, ln_ref, dim=0).item():.4f}', flush=True)
 lg = ext.s27_get_lg()
 top = torch.topk(lg, 3)
 print(f'cpp top3: {top.indices.tolist()} '
