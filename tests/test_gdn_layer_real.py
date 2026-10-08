@@ -46,7 +46,7 @@ L = 'model.layers.0.linear_attn.'
 def pack(nm):
     p = blob['layers'][L + nm]
     return (p['idx'].cuda(), p['sign'].cuda(),
-            p['scale'].float().cuda())
+            p['scale'].cuda())
 
 from transformers import AutoModelForCausalLM
 t0 = time.perf_counter()
