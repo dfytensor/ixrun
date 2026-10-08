@@ -33,7 +33,9 @@ torch::Tensor s27_get_probe_h();
 torch::Tensor s27_get_lg();
     torch::Tensor s27d_get_xn();
     torch::Tensor s27d_get_core();
-torch::Tensor s27d_get_xn2();
+    torch::Tensor s27d_get_xn2();
+    torch::Tensor s27d_get_gated();
+    torch::Tensor s27d_get_o();
 torch::Tensor udcq_gemv_out(torch::Tensor x, torch::Tensor idx,
     torch::Tensor sign, torch::Tensor scale, torch::Tensor cb,
     int64_t out_f, int64_t in_f, int64_t group);
@@ -52,6 +54,7 @@ ext = load_inline(name='ixrun_cpp_v5s4k', cpp_sources=[proto],
                   functions=['init27', 'step27', 's27_set_probe',
                              's27_get_probe_h', 's27_get_lg',
                              's27d_get_xn', 's27d_get_core', 's27d_get_xn2',
+                             's27d_get_gated', 's27d_get_o',
                              'udcq_gemv_out', 'conv1d_update_out',
                              'l2norm_out', 'gdn_recurrent_out',
                              'gated_rmsnorm_out'],
@@ -185,6 +188,12 @@ py_core = py_core_caps[0][0, -1].float().cuda()
 xn2 = ext.s27d_get_xn2().cuda().float()
 print(f'py caps: core {len(py_core_caps)} mlp {len(py_mlp_caps)}', flush=True)
 py_mlp_in = py_mlp_caps[-1][0, -1].float().cuda()
+gated_s = ext.s27d_get_gated().cuda().float()
+o_s = ext.s27d_get_o().cuda().float()
+print(f'sched gated norm {gated_s.norm():.3f} | sched o norm {o_s.norm():.3f}', flush=True)
+gated_s = ext.s27d_get_gated().cuda().float()
+o_s = ext.s27d_get_o().cuda().float()
+print(f'sched gated norm {gated_s.float().norm().item():.3f} | sched o norm {o_s.float().norm().item():.3f}', flush=True)
 print(f'xn2(L0) vs PY mlp-input: norm {xn2.norm():.3f} vs {py_mlp_in.norm():.3f} | cos {torch.nn.functional.cosine_similarity(xn2, py_mlp_in, dim=0).item():.4f}', flush=True)
 print(f'core(L0): cpp norm {core0.norm():.3f} vs PY linear_attn out norm {py_core.norm():.3f} | cos {torch.nn.functional.cosine_similarity(core0, py_core, dim=0).item():.4f}', flush=True)
 print(f'xn(L0) vs torch-LN: norm {xn.norm():.3f} vs {ln_ref.norm():.3f} | cos {torch.nn.functional.cosine_similarity(xn, ln_ref, dim=0).item():.4f}', flush=True)

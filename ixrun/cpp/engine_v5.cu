@@ -11,6 +11,10 @@
 
 // ---------------- device-side position (CUDA-graph parameterizable) --- //
 __device__ int d_pos = 0;
+extern int s27_probe_l;         // defined in engine_27b.cu
+extern torch::Tensor s27_h_out; // defined in engine_27b.cu
+static torch::Tensor s27d_gated; // probe: gated norm out
+static torch::Tensor s27d_o;     // probe: pre-gated o
 
 __global__ void set_pos_kernel(const int* pos_gpu) {
     d_pos = *pos_gpu;
@@ -890,7 +894,7 @@ torch::Tensor gdn_layer_step(
     torch::Tensor A_log, torch::Tensor dt_bias,
     torch::Tensor norm_w,
     torch::Tensor conv_state, torch::Tensor S,
-    int64_t nv, int64_t nk, int64_t dk, int64_t dv)
+    int64_t nv, int64_t nk, int64_t dk, int64_t dv, int64_t l)
 {
     auto st = at::cuda::getCurrentCUDAStream();
     int hidden = (int)h.numel();
@@ -986,6 +990,10 @@ torch::Tensor gdn_layer_step(
     gated_rmsnorm_kernel<<<nv, 256, 0, st>>>(
         o.data_ptr<float>(), zr.data_ptr<float>(),
         norm_w.data_ptr<float>(), on.data_ptr<float>(), dv, 1e-6f);
+    if ((int)l == s27_probe_l) {
+        s27d_o = o.clone();
+        s27d_gated = on.clone();
+    }
     udcq_gemv_kernel<<<(unsigned)hidden, 256, 0, st>>>(
         on.view(-1).data_ptr<float>(), o_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(o_s.data_ptr()),
@@ -2301,7 +2309,7 @@ torch::Tensor gdn_decoder_step(
         b_i, b_s, b_sc, a_i, a_s, a_sc,
         o_i, o_s, o_sc,
         conv_w, conv_b, A_log, dt_bias, gnorm_w,
-        conv_state, S, nv, nk, dk, dv);
+        conv_state, S, nv, nk, dk, dv, l);
     if ((int)l == s27_probe_l) s27d_core = core.clone();   // probe
     add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
         h.data_ptr<float>(), core.data_ptr<float>(),
@@ -2330,6 +2338,8 @@ torch::Tensor gdn_decoder_step(
 torch::Tensor s27d_get_xn() { return s27d_xn.cpu(); }
 torch::Tensor s27d_get_xn2() { return s27d_xn2.cpu(); }
 torch::Tensor s27d_get_core() { return s27d_core.cpu(); }
+torch::Tensor s27d_get_gated() { return s27d_gated.cpu(); }
+torch::Tensor s27d_get_o() { return s27d_o.cpu(); }
 
 // q_proj fused gate split: src [nh, 512] -> q [nh,256], gate [nh,256]
 __global__ void chunk_qgate_kernel(const float* src, float* q,
