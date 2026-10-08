@@ -12,6 +12,8 @@ from ixrun.config import QWEN38_PATH
 BLOB = r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt'
 src = open(r'E:\IXRUN\ixrun\cpp\engine_v5.cu',
            encoding='utf-8').read()
+src27 = open(r'E:\IXRUN\ixrun\cpp\engine_27b.cu',
+             encoding='utf-8').read()
 proto = '''
 void init27(torch::Tensor cb,
     std::vector<torch::Tensor> packs,
@@ -27,8 +29,8 @@ void init27(torch::Tensor cb,
 int64_t step27(torch::Tensor h, int64_t pos, double theta);
 torch::Tensor s27_get_layer_h();
 '''
-ext = load_inline(name='ixrun_cpp_v5s4g', cpp_sources=[proto],
-                  cuda_sources=[src],
+ext = load_inline(name='ixrun_cpp_v5s4j', cpp_sources=[proto],
+cuda_sources=[src, src27],
                   functions=['init27', 'step27',
                              's27_get_layer_h'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
@@ -104,7 +106,7 @@ ids = [760, 6511, 314, 9338, 369]
 for pos, t in enumerate(ids):
     h = emb[t].cuda().float()
     ext.step27(h, pos, 1e7)
-layer_h = ext.s27_get_layer_h()   # [64, 5120] last position
+layer_h = None   # [64, 5120] last position
 
 # HF CPU: hook each decoder layer output
 captured = []
