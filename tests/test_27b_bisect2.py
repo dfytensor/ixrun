@@ -61,7 +61,7 @@ ext = load_inline(name='ixrun_cpp_v5s4k3', cpp_sources=[proto],
                              'udcq_gemv_out', 'conv1d_update_out',
                              'l2norm_out', 'gdn_recurrent_out',
                              'gated_rmsnorm_out', 'rmsnorm_fw_out'],
-                  extra_cuda_cflags=['-O3', '--use_fast_math',
+                  extra_cuda_cflags=['-O3', '--use_fast_math', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
 

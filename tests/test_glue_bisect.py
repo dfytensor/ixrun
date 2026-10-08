@@ -12,14 +12,17 @@ src = open(r'E:\IXRUN\ixrun\cpp\engine_v5.cu',
            encoding='utf-8').read()
 proto = '''
 torch::Tensor gdn_layer_step(torch::Tensor h, torch::Tensor cb,
-    std::vector<torch::Tensor> PK,
-    torch::Tensor in_w, torch::Tensor post_w,
+    torch::Tensor qkv_i, torch::Tensor qkv_s, torch::Tensor qkv_sc,
+    torch::Tensor z_i,   torch::Tensor z_s,   torch::Tensor z_sc,
+    torch::Tensor b_i,   torch::Tensor b_s,   torch::Tensor b_sc,
+    torch::Tensor a_i,   torch::Tensor a_s,   torch::Tensor a_sc,
+    torch::Tensor o_i,   torch::Tensor o_s,   torch::Tensor o_sc,
     torch::Tensor conv_w, torch::Tensor conv_b,
     torch::Tensor A_log, torch::Tensor dt_bias,
     torch::Tensor gnorm_w,
     torch::Tensor conv_state, torch::Tensor S,
     int64_t nv, int64_t nk, int64_t dk, int64_t dv,
-    int64_t inter, int64_t l);
+    int64_t l);
 torch::Tensor udcq_gemv_out(torch::Tensor x, torch::Tensor idx,
     torch::Tensor sign, torch::Tensor scale, torch::Tensor cb,
     int64_t out_f, int64_t in_f, int64_t group);
@@ -32,14 +35,14 @@ torch::Tensor gdn_recurrent_out(torch::Tensor q, torch::Tensor k,
     torch::Tensor S);
 torch::Tensor gated_rmsnorm_out(torch::Tensor o, torch::Tensor z,
     torch::Tensor w, double eps);
-torch::Tensor bf16_round_out(torch::Tensor x);
+
 '''
-ext = load_inline(name='ixrun_cpp_v5gl1', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v5gl126b', cpp_sources=[proto],
                   cuda_sources=[src],
                   functions=['gdn_layer_step', 'udcq_gemv_out',
                              'conv1d_update_out', 'l2norm_out',
                              'gdn_recurrent_out',
-                             'gated_rmsnorm_out', 'bf16_round_out'],
+                             'gated_rmsnorm_out'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
@@ -103,7 +106,7 @@ core_a = ext.gdn_layer_step(
     xn, cb_g, P[0], P[1], P[2], P[3], P[4], P[5], P[6], P[7], P[8],
     P[9], P[10], P[11], P[12], P[13], P[14],
     conv_w, conv_b, A_log, dt_bias, gnorm_w, st_a, S_a,
-    nv, nk, dk, dv, 17408, 0)
+    nv, nk, dk, dv, 0)
 
 # direct sequence on same tensors
 st_b = torch.zeros(conv_dim, 3, device='cuda')
