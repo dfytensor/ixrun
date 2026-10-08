@@ -13,7 +13,10 @@
 __device__ int d_pos = 0;
 extern int s27_probe_l;         // defined in engine_27b.cu
 extern torch::Tensor s27_h_out; // defined in engine_27b.cu
-static torch::Tensor s27d_gated; // probe: gated norm out
+__global__ void bf16_round_kernel(float* x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = __bfloat162float(__float2bfloat16(x[i]));
+}static torch::Tensor s27d_gated; // probe: gated norm out
 static torch::Tensor s27d_o;     // probe: pre-gated o
 
 __global__ void set_pos_kernel(const int* pos_gpu) {
@@ -932,11 +935,15 @@ torch::Tensor gdn_layer_step(
         reinterpret_cast<const uint32_t*>(qkv_s.data_ptr()),
         reinterpret_cast<const __half*>(qkv_sc.data_ptr()), cb.data_ptr<float>(),
         qkv.data_ptr<float>(), hidden, GROUP);
+    bf16_round_kernel<<<(conv_dim + 255) / 256, 256, 0, st>>>(
+        qkv.data_ptr<float>(), conv_dim);
     udcq_gemv_kernel<<<(unsigned)value_dim, 256, 0, st>>>(
         h.data_ptr<float>(), z_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(z_s.data_ptr()),
         reinterpret_cast<const __half*>(z_sc.data_ptr()), cb.data_ptr<float>(),
         z.data_ptr<float>(), hidden, GROUP);
+    bf16_round_kernel<<<(value_dim + 255) / 256, 256, 0, st>>>(
+        z.data_ptr<float>(), value_dim);
     udcq_gemv_kernel<<<(unsigned)nv, 256, 0, st>>>(
         h.data_ptr<float>(), b_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(b_s.data_ptr()),
@@ -952,6 +959,8 @@ torch::Tensor gdn_layer_step(
         qkv.data_ptr<float>(), conv_state.data_ptr<float>(),
         conv_w.data_ptr<float>(), conv_b.data_ptr<float>(),
         mq.data_ptr<float>(), 3, 4, 1);
+    bf16_round_kernel<<<(conv_dim + 255) / 256, 256, 0, st>>>(
+        mq.data_ptr<float>(), conv_dim);
 
     // z -> [nv,dv] rows BEFORE gated norm (pitfall 1)
     cudaMemcpyAsync(zr.data_ptr<float>(), z.data_ptr<float>(),
@@ -994,11 +1003,15 @@ torch::Tensor gdn_layer_step(
         s27d_o = o.clone();
         s27d_gated = on.clone();
     }
+    bf16_round_kernel<<<(value_dim + 255) / 256, 256, 0, st>>>(
+        on.data_ptr<float>(), value_dim);
     udcq_gemv_kernel<<<(unsigned)hidden, 256, 0, st>>>(
         on.view(-1).data_ptr<float>(), o_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(o_s.data_ptr()),
         reinterpret_cast<const __half*>(o_sc.data_ptr()), cb.data_ptr<float>(),
         out.data_ptr<float>(), value_dim, GROUP);
+    bf16_round_kernel<<<(hidden + 255) / 256, 256, 0, st>>>(
+        out.data_ptr<float>(), hidden);
     return out;
 }
 
@@ -2303,6 +2316,8 @@ torch::Tensor gdn_decoder_step(
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h.data_ptr<float>(), in_w.data_ptr<float>(),
         xn.data_ptr<float>(), hidden, 1e-6f);
+    int nr = (hidden + 255) / 256;
+    bf16_round_kernel<<<nr, 256, 0, st>>>(xn.data_ptr<float>(), hidden);
     if ((int)l == s27_probe_l) s27d_xn = xn.clone();   // probe
     torch::Tensor core = gdn_layer_step(
         xn.view({-1}), cb,
@@ -2311,14 +2326,17 @@ torch::Tensor gdn_decoder_step(
         o_i, o_s, o_sc,
         conv_w, conv_b, A_log, dt_bias, gnorm_w,
         conv_state, S, nv, nk, dk, dv, l);
+    bf16_round_kernel<<<nr, 256, 0, st>>>(core.data_ptr<float>(), hidden);
     if ((int)l == s27_probe_l) s27d_core = core.clone();   // probe
-    add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
+    add_f32<<<nr, 256, 0, st>>>(
         h.data_ptr<float>(), core.data_ptr<float>(),
         h1.data_ptr<float>(), hidden);
+    bf16_round_kernel<<<nr, 256, 0, st>>>(h1.data_ptr<float>(), hidden);
     if ((int)l == s27_probe_l) s27d_h1 = h1.clone();       // probe
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h1.data_ptr<float>(), post_w.data_ptr<float>(),
         xn2.data_ptr<float>(), hidden, 1e-6f);
+    bf16_round_kernel<<<nr, 256, 0, st>>>(xn2.data_ptr<float>(), hidden);
     if ((int)l == s27_probe_l) s27d_xn2 = xn2.clone(); // probe
     // mlp (inter passed explicitly; shapes from checkpoint)
     torch::Tensor mg = udcq_gemv_out(
@@ -2331,9 +2349,11 @@ torch::Tensor gdn_decoder_step(
         act.data_ptr<float>(), (int)inter);
     torch::Tensor md = udcq_gemv_out(
         act, dd_i, dd_s, dd_sc, cb, hidden, 17408, 16);
-    add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
+    bf16_round_kernel<<<nr, 256, 0, st>>>(md.data_ptr<float>(), hidden);
+    add_f32<<<nr, 256, 0, st>>>(
         h1.data_ptr<float>(), md.data_ptr<float>(),
         out.data_ptr<float>(), hidden);
+    bf16_round_kernel<<<nr, 256, 0, st>>>(out.data_ptr<float>(), hidden);
     return out;
 }
 
@@ -2344,7 +2364,14 @@ torch::Tensor s27d_get_h1() { return s27d_h1.cpu(); }
 torch::Tensor s27d_get_gated() { return s27d_gated.cpu(); }
 torch::Tensor s27d_get_o() { return s27d_o.cpu(); }
 
+// bf16 rounding damping: x[i] = bf16(x[i]) — mirrors HF's bf16
+// activation boundaries; WITHOUT this the fp32 chain compounds
+// quantization noise across 48 GDN layers (norm 2x, cos 0.87->0.22)
+
+
 // q_proj fused gate split: src [nh, 512] -> q [nh,256], gate [nh,256]
+
+
 __global__ void chunk_qgate_kernel(const float* src, float* q,
                                    float* gate, int hd) {
     int h = blockIdx.x;

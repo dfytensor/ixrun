@@ -52,7 +52,7 @@ torch::Tensor rmsnorm_fw_out(torch::Tensor x2d, torch::Tensor w,
 torch::Tensor gated_rmsnorm_out(torch::Tensor o, torch::Tensor z,
     torch::Tensor w, double eps);
 '''
-ext = load_inline(name='ixrun_cpp_v5s4k2', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v5s4k3', cpp_sources=[proto],
                   cuda_sources=[src, src27],
                   functions=['init27', 'step27', 's27_set_probe',
                              's27_get_probe_h', 's27_get_lg',
@@ -61,7 +61,7 @@ ext = load_inline(name='ixrun_cpp_v5s4k2', cpp_sources=[proto],
                              'udcq_gemv_out', 'conv1d_update_out',
                              'l2norm_out', 'gdn_recurrent_out',
                              'gated_rmsnorm_out', 'rmsnorm_fw_out'],
-                  extra_cuda_cflags=['-O3',
+                  extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
 
