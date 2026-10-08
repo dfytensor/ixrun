@@ -52,7 +52,7 @@ torch::Tensor rmsnorm_fw_out(torch::Tensor x2d, torch::Tensor w,
 torch::Tensor gated_rmsnorm_out(torch::Tensor o, torch::Tensor z,
     torch::Tensor w, double eps);
 '''
-ext = load_inline(name='ixrun_cpp_v5s4k3', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v5s4k5', cpp_sources=[proto],
                   cuda_sources=[src, src27],
                   functions=['init27', 'step27', 's27_set_probe',
                              's27_get_probe_h', 's27_get_lg',
@@ -202,6 +202,8 @@ gated_s = ext.s27d_get_gated().cuda().float()
 o_s = ext.s27d_get_o().cuda().float()
 print(f'sched gated norm {gated_s.float().norm().item():.3f} | sched o norm {o_s.float().norm().item():.3f}', flush=True)
 xn2_direct = ext.rmsnorm_fw_out(h1_c.view(1, -1), nw2[0], 1e-6).view(-1)
+xn2_torch_ref = nw2[0] * (h1_c / torch.rsqrt(h1_c.pow(2).mean() + 1e-6))
+print(f'xn2 refs: DIRECT-kernel {xn2_direct.float().norm().item():.3f} | torch-formula {xn2_torch_ref.float().norm().item():.3f} | PY {py_mlp_in.norm().item():.3f} | cos(direct,torch) {torch.nn.functional.cosine_similarity(xn2_direct.float(), xn2_torch_ref, dim=0).item():.4f}', flush=True)
 print(f'DIRECT rmsnorm_fw_out(h1_c, nw2[0]): norm {xn2_direct.float().norm().item():.3f} | cos vs cpp-xn2 ' + str(torch.nn.functional.cosine_similarity(xn2_direct.float(), xn2, dim=0).item())[:6] + ' | cos vs PY ' + str(torch.nn.functional.cosine_similarity(xn2_direct.float(), py_mlp_in, dim=0).item())[:6], flush=True)
 print(f'xn2(L0) vs PY mlp-input: norm {xn2.norm():.3f} vs {py_mlp_in.norm():.3f} | cos {torch.nn.functional.cosine_similarity(xn2, py_mlp_in, dim=0).item():.4f}', flush=True)
 print(f'core(L0): cpp norm {core0.norm():.3f} vs PY linear_attn out norm {py_core.norm():.3f} | cos {torch.nn.functional.cosine_similarity(core0, py_core, dim=0).item():.4f}', flush=True)
