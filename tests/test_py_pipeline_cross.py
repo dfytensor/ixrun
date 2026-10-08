@@ -16,6 +16,17 @@ tok = AutoTokenizer.from_pretrained(Q.MD)
 
 ids = tok("The capital of France is",
           return_tensors='pt')["input_ids"][0].tolist()
+caps = []
+def mkhook(i):
+    def hk(mod, args):
+        caps.append(args[0].detach())
+    return hk
+hooks = [lay.register_forward_pre_hook(mkhook(i)) for i, lay in enumerate(m.model.layers)]
+with torch.no_grad():
+    out = m(torch.tensor([ids]).cuda(), use_cache=True)
+for hk in hooks:
+    hk.remove()
+print('PY h-norms:', [round(caps[i][0, -1].float().norm().item(), 1) for i in range(min(8, len(caps)))], flush=True)
 with torch.no_grad():
     out = m(torch.tensor([ids]).cuda(), use_cache=True)
 top = torch.topk(out.logits[0, -1].float(), 5)
