@@ -34,12 +34,27 @@ torch::Tensor s27_get_lg();
     torch::Tensor s27d_get_xn();
     torch::Tensor s27d_get_core();
 torch::Tensor s27d_get_xn2();
+torch::Tensor udcq_gemv_out(torch::Tensor x, torch::Tensor idx,
+    torch::Tensor sign, torch::Tensor scale, torch::Tensor cb,
+    int64_t out_f, int64_t in_f, int64_t group);
+torch::Tensor conv1d_update_out(torch::Tensor x,
+    torch::Tensor conv_state, torch::Tensor w, torch::Tensor bias,
+    int64_t use_act);
+torch::Tensor l2norm_out(torch::Tensor x2d);
+torch::Tensor gdn_recurrent_out(torch::Tensor q, torch::Tensor k,
+    torch::Tensor v, torch::Tensor g, torch::Tensor beta,
+    torch::Tensor S);
+torch::Tensor gated_rmsnorm_out(torch::Tensor o, torch::Tensor z,
+    torch::Tensor w, double eps);
 '''
 ext = load_inline(name='ixrun_cpp_v5s4k', cpp_sources=[proto],
                   cuda_sources=[src, src27],
                   functions=['init27', 'step27', 's27_set_probe',
                              's27_get_probe_h', 's27_get_lg',
-                             's27d_get_xn', 's27d_get_core', 's27d_get_xn2'],
+                             's27d_get_xn', 's27d_get_core', 's27d_get_xn2',
+                             'udcq_gemv_out', 'conv1d_update_out',
+                             'l2norm_out', 'gdn_recurrent_out',
+                             'gated_rmsnorm_out'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
@@ -109,7 +124,7 @@ emb = blob['embed']
 slots = ['in_proj_qkv','in_proj_z','in_proj_b','in_proj_a','out_proj','mlp.gate_proj','mlp.up_proj','mlp.down_proj']
 for s, nm in enumerate(slots):
     pi = packs[(0*8+s)*3]; ps = packs[(0*8+s)*3+1]; psc = packs[(0*8+s)*3+2]
-    bp = blob['layers']['model.layers.0.' + ('linear_attn.' if s < 5 else 'mlp.') + nm if s >= 5 else 'model.layers.0.' + ('linear_attn.' + nm if s < 5 else 'self_attn.' + nm)]
+    bp = blob['layers']['model.layers.0.' + ('linear_attn.' + nm if s < 5 else nm)]
     ok = (torch.equal(pi, bp['idx'].cuda()) and torch.equal(ps, bp['sign'].cuda()) and torch.equal(psc, bp['scale'].cuda()))
     print(f'slot {s} {nm}: staging match {ok}', flush=True)
 print(f'STAGING CHECK: nw1[0] norm {nw1[0].float().norm():.3f} | hf input_layernorm norm ' + str(m.model.layers[0].input_layernorm.weight.float().norm().item()) + ' | hf post norm ' + str(m.model.layers[0].post_attention_layernorm.weight.float().norm().item()) + f' | nw2[0] {nw2[0].float().norm():.3f} | fnw {fnw.float().norm():.3f}', flush=True)
@@ -162,6 +177,7 @@ for pos, t in enumerate(ids):
 torch.cuda.synchronize()
 xn = ext.s27d_get_xn().cuda().float()
 core0 = ext.s27d_get_core().cuda().float()
+s27d_core_ref = core0.clone()
 he62 = captured[0][0, -1].float().cuda()   # HF input to layer 0 = embed
 w62 = nw1[0]
 ln_ref = w62 * he62 * torch.rsqrt(he62.pow(2).mean() + 1e-6)
@@ -193,3 +209,38 @@ for i in range(64):
     if cos < 0.9 and first_bad is None:
         first_bad = i
 print(f'first layer with cos<0.9: {first_bad}', flush=True)
+
+# ---- FINAL EXPERIMENT: isolated chain on the scheduler's own xn ----
+import torch.nn.functional as F
+def pack0(nm):
+    p = blob['layers']['model.layers.0.linear_attn.' + nm]
+    return (p['idx'].cuda(), p['sign'].cuda(), p['scale'].cuda())
+st_x = torch.zeros(10240, 3, device='cuda')
+S_x = torch.zeros(48, 128, 128, device='cuda')
+qkv_x = ext.udcq_gemv_out(xn, *pack0('in_proj_qkv'), cb_g, 10240, 5120, 16)
+z_x = ext.udcq_gemv_out(xn, *pack0('in_proj_z'), cb_g, 6144, 5120, 16)
+b_x = ext.udcq_gemv_out(xn, *pack0('in_proj_b'), cb_g, 48, 5120, 16)
+a_x = ext.udcq_gemv_out(xn, *pack0('in_proj_a'), cb_g, 48, 5120, 16)
+mq_x = ext.conv1d_update_out(qkv_x, st_x, gex[0].view(10240, 4),
+                             torch.zeros(10240, device='cuda'), 1)
+q_c, k_c, v_c = mq_x.split([2048, 2048, 6144])
+q_c = q_c.reshape(16, 128).repeat_interleave(3, 0).contiguous()
+k_c = k_c.reshape(16, 128).repeat_interleave(3, 0).contiguous()
+v_c = v_c.reshape(48, 128).contiguous()
+q_c = ext.l2norm_out(q_c)
+k_c = ext.l2norm_out(k_c)
+q_c = q_c / (128 ** 0.5)
+beta = torch.sigmoid(b_x)
+gv = -torch.exp(gex[2]) * F.softplus(a_x + gex[3])
+S_x2 = S_x.clone()
+o_c = ext.gdn_recurrent_out(q_c, k_c, v_c, gv.contiguous(),
+                            beta.contiguous(), S_x2)
+o_x = ext.gated_rmsnorm_out(o_c, z_x.reshape(48, 128).contiguous(),
+                            gnorm[0], 1e-6)
+core_x = ext.udcq_gemv_out(o_x.reshape(-1).contiguous(),
+                           *pack0('out_proj'), cb_g, 5120, 6144, 16)
+torch.cuda.synchronize()
+print(f'FINAL: isolated-core(xn_sched) norm {core_x.float().norm().item():.3f} '
+      f'vs scheduler-captured norm {s27d_core_ref.float().norm().item():.3f} | cos '
+      + str(torch.nn.functional.cosine_similarity(
+          core_x, s27d_core_ref, dim=0).item()), flush=True)
