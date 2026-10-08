@@ -2265,6 +2265,7 @@ static torch::Tensor g_input;   // static input buffer (address baked in graph)
 static torch::Tensor s27d_xn;   // diagnostics probe (file scope)
 static torch::Tensor s27d_xn2;  // probe: MLP input (post-norm)
 static torch::Tensor s27d_core; // probe: gdn core output
+static torch::Tensor s27d_h1;   // probe: residual h + core
 int s27_probe_l = -1;           // probe (defined here)
 torch::Tensor s27_h_out;
 torch::Tensor gdn_decoder_step(
@@ -2314,6 +2315,7 @@ torch::Tensor gdn_decoder_step(
     add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
         h.data_ptr<float>(), core.data_ptr<float>(),
         h1.data_ptr<float>(), hidden);
+    if ((int)l == s27_probe_l) s27d_h1 = h1.clone();       // probe
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h1.data_ptr<float>(), post_w.data_ptr<float>(),
         xn2.data_ptr<float>(), hidden, 1e-6f);
@@ -2338,6 +2340,7 @@ torch::Tensor gdn_decoder_step(
 torch::Tensor s27d_get_xn() { return s27d_xn.cpu(); }
 torch::Tensor s27d_get_xn2() { return s27d_xn2.cpu(); }
 torch::Tensor s27d_get_core() { return s27d_core.cpu(); }
+torch::Tensor s27d_get_h1() { return s27d_h1.cpu(); }
 torch::Tensor s27d_get_gated() { return s27d_gated.cpu(); }
 torch::Tensor s27d_get_o() { return s27d_o.cpu(); }
 

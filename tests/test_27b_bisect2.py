@@ -33,6 +33,7 @@ torch::Tensor s27_get_probe_h();
 torch::Tensor s27_get_lg();
     torch::Tensor s27d_get_xn();
     torch::Tensor s27d_get_core();
+    torch::Tensor s27d_get_h1();
     torch::Tensor s27d_get_xn2();
     torch::Tensor s27d_get_gated();
     torch::Tensor s27d_get_o();
@@ -46,19 +47,21 @@ torch::Tensor l2norm_out(torch::Tensor x2d);
 torch::Tensor gdn_recurrent_out(torch::Tensor q, torch::Tensor k,
     torch::Tensor v, torch::Tensor g, torch::Tensor beta,
     torch::Tensor S);
+torch::Tensor rmsnorm_fw_out(torch::Tensor x2d, torch::Tensor w,
+    double eps);
 torch::Tensor gated_rmsnorm_out(torch::Tensor o, torch::Tensor z,
     torch::Tensor w, double eps);
 '''
-ext = load_inline(name='ixrun_cpp_v5s4k', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v5s4k2', cpp_sources=[proto],
                   cuda_sources=[src, src27],
                   functions=['init27', 'step27', 's27_set_probe',
                              's27_get_probe_h', 's27_get_lg',
-                             's27d_get_xn', 's27d_get_core', 's27d_get_xn2',
+                             's27d_get_xn', 's27d_get_core', 's27d_get_h1', 's27d_get_h1', 's27d_get_xn2',
                              's27d_get_gated', 's27d_get_o',
                              'udcq_gemv_out', 'conv1d_update_out',
                              'l2norm_out', 'gdn_recurrent_out',
-                             'gated_rmsnorm_out'],
-                  extra_cuda_cflags=['-O3', '--use_fast_math',
+                             'gated_rmsnorm_out', 'rmsnorm_fw_out'],
+                  extra_cuda_cflags=['-O3',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
 
@@ -180,8 +183,12 @@ for pos, t in enumerate(ids):
 torch.cuda.synchronize()
 xn = ext.s27d_get_xn().cuda().float()
 core0 = ext.s27d_get_core().cuda().float()
+h1_c = ext.s27d_get_h1().cuda().float()
+he0 = captured[0][0, -1].float().cuda()
+h1_ref = he0 + core0
+print(f'h1(L0): cpp norm {h1_c.float().norm().item():.3f} vs embed+core {h1_ref.float().norm().item():.3f} | cos {torch.nn.functional.cosine_similarity(h1_c.float(), h1_ref, dim=0).item():.4f}', flush=True)
 s27d_core_ref = core0.clone()
-he62 = captured[0][0, -1].float().cuda()   # HF input to layer 0 = embed
+he62 = he0   # HF input to layer 0 = embed
 w62 = nw1[0]
 ln_ref = w62 * he62 * torch.rsqrt(he62.pow(2).mean() + 1e-6)
 py_core = py_core_caps[0][0, -1].float().cuda()
@@ -194,6 +201,8 @@ print(f'sched gated norm {gated_s.norm():.3f} | sched o norm {o_s.norm():.3f}', 
 gated_s = ext.s27d_get_gated().cuda().float()
 o_s = ext.s27d_get_o().cuda().float()
 print(f'sched gated norm {gated_s.float().norm().item():.3f} | sched o norm {o_s.float().norm().item():.3f}', flush=True)
+xn2_direct = ext.rmsnorm_fw_out(h1_c.view(1, -1), nw2[0], 1e-6).view(-1)
+print(f'DIRECT rmsnorm_fw_out(h1_c, nw2[0]): norm {xn2_direct.float().norm().item():.3f} | cos vs cpp-xn2 ' + str(torch.nn.functional.cosine_similarity(xn2_direct.float(), xn2, dim=0).item())[:6] + ' | cos vs PY ' + str(torch.nn.functional.cosine_similarity(xn2_direct.float(), py_mlp_in, dim=0).item())[:6], flush=True)
 print(f'xn2(L0) vs PY mlp-input: norm {xn2.norm():.3f} vs {py_mlp_in.norm():.3f} | cos {torch.nn.functional.cosine_similarity(xn2, py_mlp_in, dim=0).item():.4f}', flush=True)
 print(f'core(L0): cpp norm {core0.norm():.3f} vs PY linear_attn out norm {py_core.norm():.3f} | cos {torch.nn.functional.cosine_similarity(core0, py_core, dim=0).item():.4f}', flush=True)
 print(f'xn(L0) vs torch-LN: norm {xn.norm():.3f} vs {ln_ref.norm():.3f} | cos {torch.nn.functional.cosine_similarity(xn, ln_ref, dim=0).item():.4f}', flush=True)

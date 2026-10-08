@@ -46,6 +46,27 @@ y = ext.rmsnorm_fw_out(h_big.view(1, -1), w, 1e-6).view(-1)
 y_ref = w * h_big * torch.rsqrt(h_big.pow(2).mean() + 1e-6)
 e = ((y - y_ref).norm() / y_ref.norm()).item()
 print(f'[x0.3, norm 21.4] rmsnorm_fw rel-err: {e:.2e}', flush=True)
+from ixrun.config import QWEN38_PATH as QP
+from transformers import AutoModelForCausalLM as _AM
+_m = _AM.from_pretrained(QP, dtype=torch.bfloat16,
+                         low_cpu_mem_usage=True, device_map='cpu')
+post_w_real = _m.model.layers[0].post_attention_layernorm \
+    .weight.data.float().cuda()
+del _m
+y_pw = ext.rmsnorm_fw_out(h.view(1, -1), post_w_real, 1e-6).view(-1)
+y_pw_ref = post_w_real * h * torch.rsqrt(h.pow(2).mean() + 1e-6)
+e_pw = ((y_pw - y_pw_ref).norm() / y_pw_ref.norm()).item()
+print(f'[real post_w + randn h] rel-err: {e_pw:.2e} '
+      f'(out {y_pw.norm().item():.2f} vs {y_pw_ref.norm().item():.2f})',
+      flush=True)
+y_bg = ext.rmsnorm_fw_out(h_big.view(1, -1), post_w_real, 1e-6) \
+    .view(-1)
+y_bg_ref = post_w_real * h_big * torch.rsqrt(
+    h_big.pow(2).mean() + 1e-6)
+e_bg = ((y_bg - y_bg_ref).norm() / y_bg_ref.norm()).item()
+print(f'[real post_w + big h] rel-err: {e_bg:.2e} '
+      f'(out {y_bg.norm().item():.2f} vs {y_bg_ref.norm().item():.2f})',
+      flush=True)
 
 # real embed row
 blob = torch.load(r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt',
