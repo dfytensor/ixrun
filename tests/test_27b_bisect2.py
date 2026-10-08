@@ -106,6 +106,12 @@ for l in range(64):
 fnw = m.model.norm.weight.data.float().cuda()
 emb = blob['embed']
 
+slots = ['in_proj_qkv','in_proj_z','in_proj_b','in_proj_a','out_proj','mlp.gate_proj','mlp.up_proj','mlp.down_proj']
+for s, nm in enumerate(slots):
+    pi = packs[(0*8+s)*3]; ps = packs[(0*8+s)*3+1]; psc = packs[(0*8+s)*3+2]
+    bp = blob['layers']['model.layers.0.' + ('linear_attn.' if s < 5 else 'mlp.') + nm if s >= 5 else 'model.layers.0.' + ('linear_attn.' + nm if s < 5 else 'self_attn.' + nm)]
+    ok = (torch.equal(pi, bp['idx'].cuda()) and torch.equal(ps, bp['sign'].cuda()) and torch.equal(psc, bp['scale'].cuda()))
+    print(f'slot {s} {nm}: staging match {ok}', flush=True)
 print(f'STAGING CHECK: nw1[0] norm {nw1[0].float().norm():.3f} | hf input_layernorm norm ' + str(m.model.layers[0].input_layernorm.weight.float().norm().item()) + ' | hf post norm ' + str(m.model.layers[0].post_attention_layernorm.weight.float().norm().item()) + f' | nw2[0] {nw2[0].float().norm():.3f} | fnw {fnw.float().norm():.3f}', flush=True)
 ext.init27(cb_g, packs, nw1, nw2, gex, gnorm, aex, fnw,
            *lh_t, ATTN, 5120, 17408, 512)
