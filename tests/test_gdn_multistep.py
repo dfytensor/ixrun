@@ -22,11 +22,38 @@ torch::Tensor l2norm_out(torch::Tensor x2d);
 torch::Tensor gdn_recurrent_out(torch::Tensor q, torch::Tensor k,
     torch::Tensor v, torch::Tensor g, torch::Tensor beta,
     torch::Tensor S);
+torch::Tensor gdn_decoder_step(torch::Tensor h, torch::Tensor cb,
+    std::vector<torch::Tensor> PK,
+    torch::Tensor in_w, torch::Tensor post_w,
+    torch::Tensor conv_w, torch::Tensor conv_b,
+    torch::Tensor A_log, torch::Tensor dt_bias,
+    torch::Tensor gnorm_w,
+    torch::Tensor conv_state, torch::Tensor S,
+    int64_t nv, int64_t nk, int64_t dk, int64_t dv,
+    int64_t inter, int64_t l);
+void init27(torch::Tensor cb,
+    std::vector<torch::Tensor> packs,
+    std::vector<torch::Tensor> nw1,
+    std::vector<torch::Tensor> nw2,
+    std::vector<torch::Tensor> gex,
+    std::vector<torch::Tensor> gnorm,
+    std::vector<torch::Tensor> aex,
+    torch::Tensor fnw,
+    torch::Tensor lh_i, torch::Tensor lh_s, torch::Tensor lh_sc,
+    std::vector<int64_t> attn_layers,
+    int64_t hidden, int64_t inter, int64_t ctx);
+int64_t step27(torch::Tensor h, int64_t pos, double theta);
+void s27_set_probe(int64_t l);
+torch::Tensor s27d_get_xn2();
 '''
-ext = load_inline(name='ixrun_cpp_v5ms1', cpp_sources=[proto],
-                  cuda_sources=[src],
+src27 = open(r'E:\IXRUN\ixrun\cpp\engine_27b.cu',
+             encoding='utf-8').read()
+ext = load_inline(name='ixrun_cpp_v5ms2', cpp_sources=[proto],
+                  cuda_sources=[src, src27],
                   functions=['udcq_gemv_out', 'conv1d_update_out',
-                             'l2norm_out', 'gdn_recurrent_out'],
+                             'l2norm_out', 'gdn_recurrent_out',
+                             'gdn_decoder_step', 'init27', 'step27',
+                             's27_set_probe', 's27d_get_xn2'],
                   extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
@@ -99,6 +126,8 @@ st_c = torch.zeros(conv_dim, 3, device='cuda')
 S_c = torch.zeros(nv, dk, dv, device='cuda')
 st_r = st_c.clone()
 S_r = torch.zeros(nv, dk, dv, device='cuda')
+S_r_snap = []
+st_r_snap = []
 h_c = None
 h_r = None
 
@@ -136,6 +165,8 @@ for pos, t in enumerate(ids):
     kv_mem = (S_r * k_r.unsqueeze(-1)).sum(1)
     delta = (v_r - kv_mem) * beta.unsqueeze(-1)
     S_r = S_r + k_r.unsqueeze(-1) * delta.unsqueeze(1)
+    S_r_snap.append(S_r.clone())
+    st_r_snap.append(st_r.clone())
     o_r = (S_r * q_r.unsqueeze(-1)).sum(1).reshape(-1)
     core_r = out_w @ o_r
     h1_r = h_r + core_r
@@ -192,3 +223,62 @@ for pos, t in enumerate(ids):
     dh1 = (h1_c.double() - h1_r.double()).norm().item()
     print(f'{pos:>4} {dS:>10.3e} {dst:>10.3e} {dmq:>10.3e} '
           f'{dh1:>10.3e} {dmlp:>10.3e}', flush=True)
+
+# ---- DECISIVE: same 5 tokens through gdn_decoder_step (scheduler
+# entry) vs the torch loop above — compare conv_state/S per step ----
+L0P = 'model.layers.0.'
+def pack0(nm):
+    pre = '' if 'mlp' in nm else 'linear_attn.'
+    p = blob['layers'][L0P + pre + nm]
+    return (p['idx'].cuda(), p['sign'].cuda(), p['scale'].cuda())
+P = []
+for nm in ('in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a',
+           'out_proj', 'mlp.gate_proj', 'mlp.up_proj',
+           'mlp.down_proj'):
+    P += list(pack0(nm))
+nw1_0 = in_w.clone()
+nw2_0 = post_w.clone()
+gnorm_0 = gnorm_w.clone()
+fnw_d = torch.randn(5120, device='cuda')
+lh_d = (torch.zeros(8, dtype=torch.uint8, device='cuda'),
+        torch.zeros(1, dtype=torch.int32, device='cuda'),
+        torch.zeros(1, dtype=torch.float16, device='cuda'))
+ext.init27(cb_g, packs if 'packs' in dir() else [], [nw1_0],
+           [nw2_0], gex if 'gex' in dir() else
+           [conv_w.flatten(), conv_b, A_log, dt_bias],
+           [gnorm_0], [], fnw_d, *lh_d, [], 5120, 17408, 512)
+st_g = torch.zeros(conv_dim, 3, device='cuda')
+S_g = torch.zeros(nv, dk, dv, device='cuda')
+h_g = None
+print('gdn_decoder_step vs torch:', flush=True)
+for pos, t in enumerate(ids):
+    he = emb[t].cuda().float()
+    if h_g is None:
+        h_g = he.clone()
+    torch.manual_seed(1234 + pos)  # no rand use; placeholder
+    ext.s27_set_probe(0)
+    h_new = ext.gdn_decoder_step(
+        h_g, cb_g, P, in_w, post_w, conv_w, conv_b, A_log,
+        dt_bias, gnorm_w, st_g, S_g, 48, 16, 128, 128, 17408, pos)
+    if pos == 0:
+        xn2_c = ext.s27d_get_xn2().cuda().float()
+        he0 = emb[t].cuda().float()
+        xnv = in_w * he0 * torch.rsqrt(
+            he0.pow(2).mean() + 1e-6) + core_c
+        xn2_t = post_w * xnv * torch.rsqrt(
+            xnv.pow(2).mean() + 1e-6)
+        cosx = torch.nn.functional.cosine_similarity(
+            xn2_c.float(), xn2_t, dim=0).item()
+        print(f'xn2(pos0): cpp {xn2_c.float().norm().item():.3f} '
+              f'vs torch-sq {xn2_t.float().norm().item():.3f} '
+              f'cos {cosx:.4f}', flush=True)
+    torch.cuda.synchronize()
+    dS_g = (S_g.double() - S_r_snap[pos].double()).norm().item()
+    dst_g = (st_g - st_r_snap[pos]).abs().max().item()
+    dh_g = (h_new.double() - h_r.double()).norm().item()
+    print(f'  step {pos}: dS {dS_g:.3e} dst {dst_g:.3e} '
+          f'dh {dh_g:.3e}', flush=True)
+    # advance torch ref already done above per iteration? NO — the
+    # torch loop above consumed its own tokens; here we just compare
+    # the C++ step against the torch states from the SAME step index.
+    h_g = h_new
