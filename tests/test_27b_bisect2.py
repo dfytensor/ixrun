@@ -136,6 +136,11 @@ for s, nm in enumerate(slots):
 print(f'STAGING CHECK: nw1[0] norm {nw1[0].float().norm():.3f} | hf input_layernorm norm ' + str(m.model.layers[0].input_layernorm.weight.float().norm().item()) + ' | hf post norm ' + str(m.model.layers[0].post_attention_layernorm.weight.float().norm().item()) + f' | nw2[0] {nw2[0].float().norm():.3f} | fnw {fnw.float().norm():.3f}', flush=True)
 ext.init27(cb_g, packs, nw1, nw2, gex, gnorm, aex, fnw,
            *lh_t, ATTN, 5120, 17408, 512)
+ext.s27_set_probe(0)
+he0 = emb[760].cuda().float()
+ext.step27(he0, 0, 1e7)
+h1_pos0 = ext.s27d_get_h1().cuda().float().norm().item()
+print(f'SINGLE-TOKEN h(L0) norm: {h1_pos0:.3f}', flush=True)
 
 ids = [760, 6511, 314, 9338, 369]
 
@@ -164,6 +169,8 @@ with torch.no_grad():
     out = m(input_ids=torch.tensor([ids]))
 for hk in hooks + hooks2:
     hk.remove()
+hf_h_l0_pos0 = captured[1][0, 0].float().norm().item()
+print(f'HF single-token h(L0): {hf_h_l0_pos0:.3f}', flush=True)
 
 # C++ per-layer h via probe-layer sweep
 cpp_layers = []
