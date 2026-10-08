@@ -179,7 +179,7 @@ __global__ void rmsnorm_kernel(
     if (threadIdx.x == 0) {
         float t = 0.f;
         for (int k = 0; k < (int)(blockDim.x >> 5); ++k) t += red[k];
-        red[0] = rsqrtf(t / (float)n + 1e-5f);
+        red[0] = __frsqrt_rn(t / (float)n + 1e-5f);
     }
     __syncthreads();
     for (int i = threadIdx.x; i < n; i += blockDim.x)
@@ -669,7 +669,7 @@ __global__ void l2norm_kernel(const float* __restrict__ x,
     if (threadIdx.x == 0) {
         float t = 0.f;
         for (int k = 0; k < (int)(blockDim.x >> 5); ++k) t += red[k];
-        red[0] = rsqrtf(t + 1e-6f);
+        red[0] = __frsqrt_rn(t + 1e-6f);
     }
     __syncthreads();
     for (int i = threadIdx.x; i < d; i += blockDim.x)
@@ -749,7 +749,7 @@ __global__ void gated_rmsnorm_kernel(const float* __restrict__ o,
     if (threadIdx.x == 0) {
         float t = 0.f;
         for (int k = 0; k < (int)(blockDim.x >> 5); ++k) t += red[k];
-        red[0] = rsqrtf(t / (float)d + eps);
+        red[0] = __frsqrt_rn(t / (float)d + eps);
     }
     __syncthreads();
     for (int i = threadIdx.x; i < d; i += blockDim.x) {
@@ -827,7 +827,7 @@ __global__ void rmsnorm_fw_kernel(const float* __restrict__ x,
     if (threadIdx.x == 0) {
         float t = 0.f;
         for (int k = 0; k < (int)(blockDim.x >> 5); ++k) t += red[k];
-        red[0] = rsqrtf(t / (float)d + eps);
+        red[0] = __frsqrt_rn(t / (float)d + eps);
     }
     __syncthreads();
     for (int i = threadIdx.x; i < d; i += blockDim.x)
@@ -870,7 +870,7 @@ __global__ void ggate_kernel(const float* a, const float* A_log,
     int i = threadIdx.x;
     if (i < n) {
         float x = a[i] + dt_bias[i];
-        float sp = (x > 20.f) ? x : log1pf(expf(x));
+        float sp = (x > 20.f) ? x : (float)log1p(exp((double)x));
         g[i] = -expf(A_log[i]) * sp;
     }
 }
@@ -1015,7 +1015,7 @@ __global__ void gdn_recurrent_kernel(
     int h = blockIdx.x;
     int j = threadIdx.x;
     if (j >= dv) return;
-    float gt = expf(g[h]);
+    float gt = (float)exp((double)g[h]);
     float bt = beta[h];
     const float* kh = k + (long long)h * dk;
     const float* qh = q + (long long)h * dk;
@@ -1557,7 +1557,7 @@ __global__ void rmsnorm_b_kernel(const __nv_bfloat16* x,
     if (threadIdx.x == 0) {
         float s = 0.f;
         for (int k = 0; k < (int)(blockDim.x >> 5); ++k) s += red[k];
-        red[0] = rsqrtf(s / (float)n + 1e-5f);
+        red[0] = __frsqrt_rn(s / (float)n + 1e-5f);
     }
     __syncthreads();
     for (int i = threadIdx.x; i < n; i += blockDim.x)
