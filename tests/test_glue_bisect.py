@@ -75,6 +75,7 @@ def decode0(nm):
     return W.reshape(of, inf).float().cuda()
 
 from transformers import AutoModelForCausalLM
+py_core_caps = []
 m = AutoModelForCausalLM.from_pretrained(
     r'E:\models\Qwen3.8-27B', dtype=torch.bfloat16,
     low_cpu_mem_usage=True, device_map='cpu')
@@ -131,7 +132,28 @@ zg = z.reshape(nv, dv).contiguous()
 gated = ext.gated_rmsnorm_out(o, zg, gnorm_w, 1e-6)
 core_b = ext.udcq_gemv_out(gated.reshape(-1).contiguous(),
                            *P[12:15], cb_g, 5120, 6144, GROUP)
+hook_caps = []
+def mkhook():
+    def hk(mod, inp, out):
+        hook_caps.append(out.detach())
+    return hk
+hk = at.norm.register_forward_hook(mkhook())
+at.to('cuda')
 torch.cuda.synchronize()
+with torch.no_grad():
+    _ = at(xn.view(1, 1, -1).to(torch.bfloat16), None)
+hk.remove()
+py_core = hook_caps[0][0, -1].float().cuda()
+topv, topi = torch.topk(core_a.abs().flatten(), 5)
+print(f'core_a top5 abs: {[round(v, 2) for v in topv.tolist()]} at {topi.tolist()}', flush=True)
+print(f'py_core norm: {py_core.norm().item():.3f}', flush=True)
+gated_out = gated.reshape(-1)
+topg, topgi = torch.topk(gated_out.abs(), 5)
+print(f'gated(top) top5 abs: {[round(v, 2) for v in topg.tolist()]} at {topgi.tolist()}', flush=True)
+if topgi[0].item() < 6144:
+    h_gi = 3994
+    print(f'gated[3994//3]: gated value at h1-3994-related pos: '
+          f'{gated_out[3994 % 6144].item():.4f}', flush=True)
 
 d = (core_a - core_b).abs().max().item()
 na, nb = core_a.norm().item(), core_b.norm().item()
