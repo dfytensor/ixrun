@@ -24,7 +24,7 @@ torch::Tensor conv1d_update_out(torch::Tensor x,
     int64_t use_act);
 torch::Tensor l2norm_out(torch::Tensor x2d);
 '''
-ext = load_inline(name='ixrun_rnfw2', cpp_sources=[proto],
+ext = load_inline(name='ixrun_rnfw3', cpp_sources=[proto],
                   cuda_sources=[src, src27],
                   functions=['rmsnorm_fw_out', 'gdn_recurrent_out',
                              'gated_rmsnorm_out',
@@ -36,11 +36,16 @@ ext = load_inline(name='ixrun_rnfw2', cpp_sources=[proto],
 g = torch.Generator(device='cuda').manual_seed(59)
 d = 5120
 h = torch.randn(d, generator=g, device='cuda').float() * 0.015
+h_big = torch.randn(d, generator=g, device='cuda').float() * 0.3
 w = torch.randn(d, generator=g, device='cuda').float()
 y = ext.rmsnorm_fw_out(h.view(1, -1), w, 1e-6).view(-1)
 y_ref = w * h * torch.rsqrt(h.pow(2).mean() + 1e-6)
 e = ((y - y_ref).norm() / y_ref.norm()).item()
-print(f'[randn-scale] rmsnorm_fw rel-err: {e:.2e}', flush=True)
+print(f'[x0.015, norm 1.07] rmsnorm_fw rel-err: {e:.2e}', flush=True)
+y = ext.rmsnorm_fw_out(h_big.view(1, -1), w, 1e-6).view(-1)
+y_ref = w * h_big * torch.rsqrt(h_big.pow(2).mean() + 1e-6)
+e = ((y - y_ref).norm() / y_ref.norm()).item()
+print(f'[x0.3, norm 21.4] rmsnorm_fw rel-err: {e:.2e}', flush=True)
 
 # real embed row
 blob = torch.load(r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt',
