@@ -336,3 +336,5 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   chat-template stop tokens (<|im_end|> leaks; eos_token_id mismatch),
   streaming chunk-boundary token dedup; batched-GEMM prefill is the
   next big perf play (format-level, 10B-group packing blocks uint4).
+
+- 27B INVESTIGATION POSITION MISMATCH: C++ h(L0)=5.915 was pos 0 (zero states, first token — tiny core CORRECT: only w[3] tap fires); HF 20.606 was pos 4 (states accumulated — larger core normal). The A/B comparison was INVALID. The e2e degeneration investigation needs complete restart with position-matched comparisons. All kernels/staging/decode verified clean. The real remaining question: does the blob-based C++ engine produce the same TEXT as the PY engine on the same prompt? If yes, both are correct (quantization tier). If no, bisect at MATCHED positions.
