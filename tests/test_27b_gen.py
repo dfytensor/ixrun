@@ -4,6 +4,8 @@ import sys
 sys.path.insert(0, r'E:\IXRUN')
 from ixrun.cpp_engine_27b import CppQwen27bEngine
 
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 eng = CppQwen27bEngine.from_blob(
     r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt',
     r'E:\models\Qwen3.8-27B', ctx=256, verbose=True)
