@@ -6,7 +6,7 @@ from ixrun.cpp_engine_27b import CppQwen27bEngine
 
 eng = CppQwen27bEngine.from_blob(
     r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt',
-    r'E:\models\Qwen3.8-27B', verbose=True)
+    r'E:\models\Qwen3.8-27B', ctx=256, verbose=True)
 
 text = eng.generate("The capital of France is", max_new_tokens=8)
 print(f'TEXT: {text!r}', flush=True)
