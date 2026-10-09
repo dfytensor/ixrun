@@ -2357,6 +2357,7 @@ torch::Tensor gdn_decoder_step(
     add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
         h1.data_ptr<float>(), md.data_ptr<float>(),
         out.data_ptr<float>(), hidden);
+    bf16_round_inplace(out);
     return out;
 }
 

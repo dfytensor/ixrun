@@ -61,7 +61,7 @@ ext = load_inline(name='ixrun_cpp_v5s4k5', cpp_sources=[proto],
                              'udcq_gemv_out', 'conv1d_update_out',
                              'l2norm_out', 'gdn_recurrent_out',
                              'gated_rmsnorm_out', 'rmsnorm_fw_out'],
-                  extra_cuda_cflags=['-O3', '--use_fast_math', '--use_fast_math',
+                  extra_cuda_cflags=['-O3', '--use_fast_math',
                                      '-allow-unsupported-compiler'],
                   verbose=False)
 
@@ -216,6 +216,8 @@ print(f'A) kernel(xn): {xn_c2.float().norm().item():.3f} vs torch {xn_c2_ref.flo
 print(f'B) kernel(h1): {xn2_direct.float().norm().item():.3f} vs torch {xn2_torch_ref.float().norm().item():.3f}', flush=True)
 topv, topi = torch.topk(h1_c.abs().flatten(), 5)
 print(f'C) h1 top5 abs: {[round(v, 2) for v in topv.tolist()]} at {topi.tolist()}', flush=True)
+torch.save({'h1': h1_c.cpu(), 'w': nw2[0].cpu()},
+           r'C:\Users\Administrator\AppData\Local\Temp\opencode\h1_dump.pt')
 print(f'xn2 refs: DIRECT-kernel {xn2_direct.float().norm().item():.3f} | torch-formula {xn2_torch_ref.float().norm().item():.3f} | PY {py_mlp_in.norm().item():.3f} | cos(direct,torch) {torch.nn.functional.cosine_similarity(xn2_direct.float(), xn2_torch_ref, dim=0).item():.4f}', flush=True)
 print(f'DIRECT rmsnorm_fw_out(h1_c, nw2[0]): norm {xn2_direct.float().norm().item():.3f} | cos vs cpp-xn2 ' + str(torch.nn.functional.cosine_similarity(xn2_direct.float(), xn2, dim=0).item())[:6] + ' | cos vs PY ' + str(torch.nn.functional.cosine_similarity(xn2_direct.float(), py_mlp_in, dim=0).item())[:6], flush=True)
 print(f'xn2(L0) vs PY mlp-input: norm {xn2.norm():.3f} vs {py_mlp_in.norm():.3f} | cos {torch.nn.functional.cosine_similarity(xn2, py_mlp_in, dim=0).item():.4f}', flush=True)
