@@ -71,9 +71,12 @@ class CppQwen27bEngine:
                                     ('mlp.down_proj', hidden, inter)]:
                     p = blob['layers'][pre + nm]
                     packs += [p['idx'].cuda(), p['sign'].cuda(), p['scale'].cuda()]
+                packs += [torch.zeros(8, dtype=torch.uint8, device='cuda'),
+                          torch.zeros(1, dtype=torch.int32, device='cuda'),
+                          torch.zeros(1, dtype=torch.float16, device='cuda')]
                 a = m.model.layers[l].self_attn
-                aex += [a.q_norm.weight.data.float().cuda(),
-                        a.k_norm.weight.data.float().cuda()]
+                aex += [(a.q_norm.weight.data.float() + 1.0).cuda(),
+                        (a.k_norm.weight.data.float() + 1.0).cuda()]
                 sa = ia; ia += 1
             else:
                 for nm in ('linear_attn.in_proj_qkv', 'linear_attn.in_proj_z',
@@ -89,13 +92,13 @@ class CppQwen27bEngine:
                         la.dt_bias.data.float().cuda()]
                 gnorm.append(la.norm.weight.data.float().cuda())
                 ig += 1
-            nw1.append(m.model.layers[l].input_layernorm.weight.data.float().cuda())
-            nw2.append(m.model.layers[l].post_attention_layernorm.weight.data.float().cuda())
+            nw1.append((m.model.layers[l].input_layernorm.weight.data.float() + 1.0).cuda())
+            nw2.append((m.model.layers[l].post_attention_layernorm.weight.data.float() + 1.0).cuda())
             if verbose and (l+1) % 16 == 0:
                 free, _ = torch.cuda.mem_get_info()
                 print(f'  layer {l+1}/64 staged, free {free/1e9:.1f}GB ({time.perf_counter()-t0:.0f}s)', flush=True)
 
-        fnw = m.model.norm.weight.data.float().cuda()
+        fnw = (m.model.norm.weight.data.float() + 1.0).cuda()
         lh = blob['layers']['lm_head']
         lh_t = (lh['idx'].cuda(), lh['sign'].cuda(), lh['scale'].cuda())
         emb = blob['embed']

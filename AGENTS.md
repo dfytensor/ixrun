@@ -209,6 +209,34 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
 - **NEW kernel variants MUST pass a bit-exact unit test before deployment** (per-group GMM: G=8 variant was never bit-exact-verified — it produced 27B text degeneration while G=16 was fine; severe VRAM paging did NOT corrupt text, so degeneration = numerical bug in the new variant). Rule: any new tl.constexpr configuration (GROUP/BK/R/T) gets a decode-vs-reference bit-exact check on real shapes before touching a model.
 
 ## 27B C++ port (2026/10 session) — pieces all gated, Stage 4 = assembly
+- **E2E INFERENCE WORKS (2026/10/09)**: coherent text both prompts
+  ("The capital of France is" -> " Paris.\nThe capital of Germany is
+  Berlin"; "北京最值得游览的三个景点是" -> "：\n1. 故宫（紫禁城...).
+  TWO root-cause bugs, both in Python staging (zero kernel changes):
+  (1) **Qwen3.5 RMSNorm is ZERO-CENTERED**: weight = Parameter(zeros),
+  forward multiplies by (1.0 + weight) — NOT by weight. Affects
+  input_layernorm / post_attention_layernorm / model.norm / q_norm /
+  k_norm. Qwen3_5RMSNormGated (linear_attn.norm) is ones-init and
+  multiplies DIRECTLY (direct w). Staging must feed (1+w) for the
+  former. This one bug explained the entire 3.5x layer-0 norm mystery,
+  the 60.4 xn2-norm "smoking gun" (post_w[3994]=-0.996 -> correct
+  multiplier 0.0039 SUPPRESSES the channel-3994 spike; the wrong w
+  amplified it), and every failed torch-ref gate (the refs copied the
+  misread formula). LESSON: for every norm/math primitive, run the
+  REAL module and compare element-wise BEFORE writing any gate.
+  (2) **step27 slot stride**: T3(l,s) indexes (l*8+s)*3 — EVERY layer
+  must stage exactly 8 slots x 3 tensors. Attn layers stage 7 packs +
+  3 DUMMY tensors (zeros(8,uint8)+zeros(1,int32)+zeros(1,fp16));
+  missing dummy shifts all later layers and OOB-crashes at layer 62
+  (pack vector size 1488, first OOB index exactly 1488).
+- **Verification tool: tests/test_27b_stage0.py** — zero-state
+  single-token pos-0, hooks the REAL HF module (embed/in-ln/raw o/
+  gated/core/h1/post-ln/mlp/layer-out), compares to C++ probes.
+  After fix: all stages cos >= 0.998, norms within 0.5%.
+  Build/run recipe: vcvars64 + CUDA_HOME/PATH=v12.6 + INCLUDE/LIB=v13.1
+  (v12.6 install lacks headers; v13.1 nvcc has the cudafe++ AV;
+  v13.4 (installed) nvcc is incompatible with torch cu126).
+- Known polish: generate() does not reset states between calls.
 - All in engine_v5.cu, each with its own gate test, zero exceptions:
   UDCQ gemv/gemm (fp64 1e-7 tier; BUG: pack scale is f16 — kernel
   must take f32, convert at init, else rel-err 1.0); GDN recurrent
