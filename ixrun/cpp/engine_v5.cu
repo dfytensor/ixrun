@@ -808,6 +808,93 @@ torch::Tensor udcq_gemv_mt4_out(torch::Tensor x, torch::Tensor idx,
     return y;
 }
 
+// dual small-shape GEMV: two packs sharing one x, one launch.
+// grid = 2 * ceil(out_f/8); first half -> pack0/y0, second -> pack1/y1.
+// Same warp-per-row walk as v2 (x staged in smem).
+__global__ void udcq_gemv_dual_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ i0,
+    const uint32_t* __restrict__ s0,
+    const __half* __restrict__ sc0,
+    const uint8_t* __restrict__ i1,
+    const uint32_t* __restrict__ s1,
+    const __half* __restrict__ sc1,
+    const float* __restrict__ cb,
+    float* __restrict__ y0, float* __restrict__ y1,
+    int in_f, int out_f, int GROUP)
+{
+    extern __shared__ float smem[];
+    float* x_sm = smem;
+    float* cb_sm = smem + in_f;
+    for (int i = threadIdx.x; i < 16; i += blockDim.x) {
+        cb_sm[i] = -cb[i];
+        cb_sm[i + 16] = cb[i];
+    }
+    for (int i = threadIdx.x; i < in_f; i += blockDim.x) x_sm[i] = x[i];
+    __syncthreads();
+    int half = gridDim.x >> 1;
+    bool second = (int)blockIdx.x >= half;
+    int blk = second ? (int)blockIdx.x - half : (int)blockIdx.x;
+    const uint8_t* idx = second ? i1 : i0;
+    const uint32_t* sign = second ? s1 : s0;
+    const __half* scale = second ? sc1 : sc0;
+    float* y = second ? y1 : y0;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blk * (blockDim.x >> 5) + warp;
+    if (r >= out_f) return;
+    int n_gr = in_f / GROUP;
+    const uint8_t* irow = idx + (size_t)r * (in_f / 2);
+    const __half* srow = scale + (size_t)r * n_gr;
+    const uint32_t* wrow = sign + (size_t)r * (in_f / 32);
+    float acc = 0.f;
+    for (int g = lane; g < n_gr; g += 32) {
+        uint2 b2 = *reinterpret_cast<const uint2*>(irow + (size_t)g * 8);
+        uint32_t sw = wrow[g >> 1] >> (16 * (g & 1));
+        float sc = __half2float(srow[g]);
+        const float* xs = x_sm + (size_t)g * GROUP;
+        float xr[16];
+        #pragma unroll
+        for (int q = 0; q < 4; ++q)
+            *reinterpret_cast<float4*>(&xr[q * 4]) =
+                *reinterpret_cast<const float4*>(xs + q * 4);
+        float inner = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int b = (int)((b2.x >> (8 * i)) & 0xFF);
+            int s0_ = (int)((sw >> (2 * i)) & 1u) << 4;
+            int s1_ = (int)((sw >> (2 * i + 1)) & 1u) << 4;
+            inner = fmaf(cb_sm[(b & 0xF) | s0_], xr[2 * i], inner);
+            inner = fmaf(cb_sm[(b >> 4) | s1_], xr[2 * i + 1], inner);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int b = (int)((b2.y >> (8 * i)) & 0xFF);
+            int s0_ = (int)((sw >> (8 + 2 * i)) & 1u) << 4;
+            int s1_ = (int)((sw >> (8 + 2 * i + 1)) & 1u) << 4;
+            inner = fmaf(cb_sm[(b & 0xF) | s0_], xr[8 + 2 * i], inner);
+            inner = fmaf(cb_sm[(b >> 4) | s1_], xr[8 + 2 * i + 1], inner);
+        }
+        acc += inner * sc;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) y[r] = acc;
+}
+
+static void udcq_gemv_dual_launch(
+    const float* x, const uint8_t* i0, const uint32_t* s0,
+    const __half* sc0, const uint8_t* i1, const uint32_t* s1,
+    const __half* sc1, const float* cb, float* y0, float* y1,
+    int out_f, int in_f, int group, cudaStream_t st)
+{
+    size_t sm = (size_t)in_f * sizeof(float) + 32 * sizeof(float);
+    unsigned nb = (unsigned)((out_f + 7) / 8);
+    udcq_gemv_dual_kernel<<<2 * nb, 256, sm, st>>>(
+        x, i0, s0, sc0, i1, s1, sc1, cb, y0, y1, in_f, out_f, group);
+}
+
 // UDCQ batched GEMM: [T,in_f] @ W^T -> [T,out_f], same walk as
 // udcq_gemv_kernel per row (bit-exact by construction), grid.y = t.
 __global__ void udcq_gemm_kernel(
@@ -1071,6 +1158,12 @@ __global__ void gdn_recurrent_kernel(
     const float* __restrict__ beta, float* __restrict__ S,
     float* __restrict__ out, int dk, int dv);
 
+__global__ void gdn_recurrent_v2_kernel(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ S,
+    float* __restrict__ out, int dk, int dv);
+
 __global__ void repeat_heads_kernel(const float* src, float* dst,
                                     int dk, int rep) {
     int j = blockIdx.x;      // output head (nv); HF repeat_interleave:
@@ -1152,16 +1245,17 @@ torch::Tensor gdn_layer_step(
         reinterpret_cast<const uint32_t*>(z_s.data_ptr()),
         reinterpret_cast<const __half*>(z_sc.data_ptr()), cb.data_ptr<float>(),
         z.data_ptr<float>(), value_dim, hidden, GROUP, st);
-    udcq_gemv_launch(
-        h.data_ptr<float>(), b_i.data_ptr<uint8_t>(),
+    udcq_gemv_dual_launch(
+        h.data_ptr<float>(),
+        b_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(b_s.data_ptr()),
-        reinterpret_cast<const __half*>(b_sc.data_ptr()), cb.data_ptr<float>(),
-        bo.data_ptr<float>(), nv, hidden, GROUP, st);
-    udcq_gemv_launch(
-        h.data_ptr<float>(), a_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(b_sc.data_ptr()),
+        a_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(a_s.data_ptr()),
-        reinterpret_cast<const __half*>(a_sc.data_ptr()), cb.data_ptr<float>(),
-        ao.data_ptr<float>(), nv, hidden, GROUP, st);
+        reinterpret_cast<const __half*>(a_sc.data_ptr()),
+        cb.data_ptr<float>(),
+        bo.data_ptr<float>(), ao.data_ptr<float>(),
+        nv, hidden, GROUP, st);
 
     conv1d_update_kernel<<<(conv_dim + 255) / 256, 256, 0, st>>>(
         qkv.data_ptr<float>(), conv_state.data_ptr<float>(),
@@ -1193,7 +1287,8 @@ torch::Tensor gdn_layer_step(
         ao.data_ptr<float>(), A_log.data_ptr<float>(),
         dt_bias.data_ptr<float>(), gvec.data_ptr<float>(), nv);
 
-    gdn_recurrent_kernel<<<nv, 256, 0, st>>>(
+    gdn_recurrent_v2_kernel<<<dim3((unsigned)nv, (unsigned)(dv / 32)), 128,
+                              0, st>>>(
         qh.data_ptr<float>(), kh.data_ptr<float>(),
         vr.data_ptr<float>(), gvec.data_ptr<float>(),
         beta.data_ptr<float>(), S.data_ptr<float>(),
@@ -1259,6 +1354,63 @@ __global__ void gdn_recurrent_kernel(
     for (int i = 0; i < dk; ++i)
         o += Sh[(long long)i * dv + j] * qh[i];
     oh[j] = o;
+}
+
+// v2: same math, parallel over BOTH i and j. grid = (nv, dv/32),
+// 128 threads = 4 i-chunks x 32 j. Reduction order differs from v1
+// (deterministic pairwise) -> not bit-exact; gate tier ~1e-6.
+__global__ void gdn_recurrent_v2_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    float* __restrict__ S,
+    float* __restrict__ out,
+    int dk, int dv)
+{
+    int h = blockIdx.x;
+    int j0 = blockIdx.y * 32;
+    int s = threadIdx.x >> 5;          // i-chunk 0..3
+    int jl = threadIdx.x & 31;
+    int j = j0 + jl;
+    float gt = (float)exp((double)g[h]);
+    float bt = beta[h];
+    const float* kh = k + (long long)h * dk;
+    const float* qh = q + (long long)h * dk;
+    float* Sh = S + (long long)h * dk * dv;
+    __shared__ float red[4][32];
+    __shared__ float kvs[32], dvs[32];
+    int i0 = s * (dk / 4);
+    int i1 = i0 + dk / 4;
+    float part = 0.f;
+    for (int i = i0; i < i1; ++i) {
+        float* sp = Sh + (long long)i * dv + j;
+        float sv = *sp * gt;
+        *sp = sv;
+        part += sv * kh[i];
+    }
+    red[s][jl] = part;
+    __syncthreads();
+    if (s == 0) {
+        float kv = (red[0][jl] + red[1][jl]) + (red[2][jl] + red[3][jl]);
+        kvs[jl] = kv;
+        dvs[jl] = (v[(long long)h * dv + j] - kv) * bt;
+    }
+    __syncthreads();
+    float delta = dvs[jl];
+    float po = 0.f;
+    for (int i = i0; i < i1; ++i) {
+        float* sp = Sh + (long long)i * dv + j;
+        float sv = *sp + kh[i] * delta;
+        *sp = sv;
+        po += sv * qh[i];
+    }
+    red[s][jl] = po;
+    __syncthreads();
+    if (s == 0)
+        out[(long long)h * dv + j] =
+            (red[0][jl] + red[1][jl]) + (red[2][jl] + red[3][jl]);
 }
 
 torch::Tensor gdn_recurrent_out(
@@ -2641,16 +2793,17 @@ torch::Tensor attn_layer_step(
     chunk_qgate_kernel<<<(unsigned)nh, (unsigned)hd, 0, st>>>(
         q2.data_ptr<float>(), qh.data_ptr<float>(),
         gt.data_ptr<float>(), (int)hd);
-    udcq_gemv_launch(
-        xn.data_ptr<float>(), k_i.data_ptr<uint8_t>(),
+    udcq_gemv_dual_launch(
+        xn.data_ptr<float>(),
+        k_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(k_s.data_ptr()),
-        reinterpret_cast<const __half*>(k_sc.data_ptr()), cb.data_ptr<float>(),
-        k2.data_ptr<float>(), nkv * hd, hidden, GROUP, st);
-    udcq_gemv_launch(
-        xn.data_ptr<float>(), v_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(k_sc.data_ptr()),
+        v_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(v_s.data_ptr()),
-        reinterpret_cast<const __half*>(v_sc.data_ptr()), cb.data_ptr<float>(),
-        v2.data_ptr<float>(), nkv * hd, hidden, GROUP, st);
+        reinterpret_cast<const __half*>(v_sc.data_ptr()),
+        cb.data_ptr<float>(),
+        k2.data_ptr<float>(), v2.data_ptr<float>(),
+        nkv * hd, hidden, GROUP, st);
     rmsnorm_fw_kernel<<<nh, 256, 0, st>>>(
         qh.data_ptr<float>(), q_norm_w.data_ptr<float>(),
         qh.data_ptr<float>(), hd, 1e-6f);

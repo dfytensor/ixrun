@@ -264,6 +264,19 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   current kernels. mt4 kept (gated, tests/test_gemv_mt.py) for any
   future T=8/draft work. PY-spec needs Q38_MIN_FREE_GB=1.2 on a busy
   desktop (1.5GB captured clean).
+- **PERF round 3 (2026/10/09 night)**: 30.8 -> 33.0 tok/s.
+  (a) gdn_recurrent_v2_kernel: parallel over BOTH i and j
+  (grid=(nv, dv/32), 128 thr = 4 i-chunks x 32 j, pairwise smem
+  reduce; not bit-exact vs v1, deterministic) => 1.9 -> 0.59ms.
+  (b) udcq_gemv_dual_kernel: b+a share one x => one launch
+  (2*ceil(out_f/8) blocks, half -> pack0/pack1) used for b/a
+  (48 calls saved) and attn k+v (16 saved) => 0.62ms total.
+  Eager profile budget now: v2 GEMV 25.8 + rec 0.59 + dual 0.62 +
+  rmsnorm 1.15 + rest 1.1 = ~29.3ms GPU, wall 30ms.
+  DRAM floor for 19.2GB/token ~= 20-21ms => hard ceiling ~45-50
+  tok/s with EVERYTHING else free; realistic ~35-38. The 1B's 2x
+  over PY does NOT carry to 27B at 6bpw (weight bytes/token is the
+  wall); PY-spec 25.7 vs our 33.0 = 1.28x.
 - Known polish: generate() does not reset states between calls.
 - All in engine_v5.cu, each with its own gate test, zero exceptions:
   UDCQ gemv/gemm (fp64 1e-7 tier; BUG: pack scale is f16 — kernel
