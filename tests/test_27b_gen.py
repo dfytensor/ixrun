@@ -1,0 +1,15 @@
+# -*- coding: utf-8 -*-
+"""First-ever 27B C++ e2e text generation via CUDA 12.6 nvcc."""
+import sys
+sys.path.insert(0, r'E:\IXRUN')
+from ixrun.cpp_engine_27b import CppQwen27bEngine
+
+eng = CppQwen27bEngine.from_blob(
+    r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt',
+    r'E:\models\Qwen3.8-27B', verbose=True)
+
+text = eng.generate("The capital of France is", max_new_tokens=32)
+print(f'TEXT: {text!r}', flush=True)
+
+text2 = eng.generate("北京最值得游览的三个景点是", max_new_tokens=32)
+print(f'TEXT2: {text2!r}', flush=True)
