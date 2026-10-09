@@ -92,6 +92,7 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
             if (a == l) { is_attn = true; break; }
         torch::Tensor hcur;
         if (is_attn) {
+            fprintf(stderr, "[A%d]", l); fflush(stderr);
             std::vector<torch::Tensor> P;
             for (int s = 0; s < 7; ++s) {
                 auto t3 = T3(l, s);
@@ -106,6 +107,7 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
                 24, 4, 256, hidden, inter, s27_ctx);
             ia++;
         } else {
+            fprintf(stderr, "[G%d]", l); fflush(stderr);
             std::vector<torch::Tensor> P;
             for (int s = 0; s < 8; ++s) {
                 auto t3 = T3(l, s);
