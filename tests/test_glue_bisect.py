@@ -142,6 +142,14 @@ at.to('cuda')
 torch.cuda.synchronize()
 with torch.no_grad():
     _ = at(xn.view(1, 1, -1).to(torch.bfloat16), None)
+    mod_out = None
+    def modhook(mod, inp, out):
+        mod_out = out.detach()
+    hkm = at.register_forward_hook(modhook)
+    mod_out2 = at(xn.view(1, 1, -1).to(torch.bfloat16), None)
+    hkm.remove()
+    py_mod = mod_out2[0, 0].float().cuda()
+    print(f'HF module(xn) out: norm {py_mod.norm().item():.3f} | cos vs C++ core {torch.nn.functional.cosine_similarity(core_a, py_mod, dim=0).item():.4f}', flush=True)
 hk.remove()
 py_core = hook_caps[0][0, -1].float().cuda()
 topv, topi = torch.topk(core_a.abs().flatten(), 5)
@@ -155,9 +163,9 @@ dg = (gated_flat - py_gated).abs()
 td, tdi = torch.topk(dg, 5)
 print(f'gated top5 diffs: {[(round(v.item(), 2), int(i)) for v, i in zip(td, tdi)]}', flush=True)
 # out_proj row 3994 check: HF weight row vs decoded row
-hf_row = m.model.layers[0].linear_attn.out_proj.weight.data[3994].float()
+hf_row = m.model.layers[0].linear_attn.out_proj.weight.data[3994].float().cuda()
 W_out_dec = decode0('out_proj')
-r_dec = W_out_dec[3994].cpu().float()
+r_dec = W_out_dec[3994].float()
 print(f"out_proj row 3994: HF {hf_row.norm().item():.3f} vs dec {r_dec.norm().item():.3f} | cos {torch.nn.functional.cosine_similarity(r_dec, hf_row, dim=0).item():.4f}", flush=True)
 
 core_b_top = torch.topk(core_b.abs().flatten(), 5)
