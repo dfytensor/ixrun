@@ -4,6 +4,7 @@ import sys, time
 sys.path.insert(0, r'E:\IXRUN')
 import pandas  # noqa: F401
 MAXCTX = int(__import__('os').environ.get('PY1B_CTX', '2048'))
+CODEC = __import__('os').environ.get('PY1B_CODEC', 'gsq')
 import torch
 from ixrun.config import MODEL_PATH, DATASET_CACHE
 from ixrun.eval_utils import load_wikitext
@@ -14,7 +15,7 @@ texts = load_wikitext(cache_dir=DATASET_CACHE)
 prompt = '\n'.join(texts)[20000:20600]
 
 from ixrun.step_graph import StepGraphEngine
-sg = StepGraphEngine.from_pretrained(MODEL_PATH, codec='gsq',
+sg = StepGraphEngine.from_pretrained(MODEL_PATH, codec=CODEC,
                                      max_ctx=MAXCTX, verbose=False)
 
 
@@ -32,5 +33,5 @@ dec = (t136 - t8) / 128
 print(f't8={t8:.2f}s t136={t136:.2f}s')
 out = sg.generate(prompt, max_new_tokens=136)
 print('gen token count:', len(tok(out).input_ids), flush=True)
-print(f'PY-gsq PURE decode: {1/dec:.1f} tok/s ({dec*1000:.1f} ms/tok)',
+print(f'PY-{CODEC} PURE decode: {1/dec:.1f} tok/s ({dec*1000:.1f} ms/tok)',
       flush=True)

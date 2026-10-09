@@ -140,6 +140,21 @@ class StepGraphEngine:
             stats.update({'bpw': 5.5, 'codec': 'gsq'})
             if verbose:
                 print('[gsq] all linears wrapped (5.50bpw)', flush=True)
+        elif codec == 'ig32':
+            # int5-g32+warm (user scheme): 4b code + 1b sign + per-group
+            # 16-level table; 5.75bpw, PPL 56.13 on MiniCPM5-1B
+            from .linear import iter_quantizable_linears, _set_parent_child
+            from benchmarks.ig32_runtime import Ig32Linear, ig32_pack
+
+            for name, mod in list(iter_quantizable_linears(model)):
+                W = mod.weight.data.float().cuda()
+                pk = ig32_pack(W)
+                del W
+                torch.cuda.empty_cache()
+                _set_parent_child(model, name, Ig32Linear(pk))
+            stats.update({'bpw': 5.75, 'codec': 'ig32'})
+            if verbose:
+                print('[ig32] all linears wrapped (5.75bpw)', flush=True)
         elif codec == 'bf16xl':
             from benchmarks.bf16xl_runtime import deploy_bf16xl
 
