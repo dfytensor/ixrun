@@ -277,6 +277,25 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   tok/s with EVERYTHING else free; realistic ~35-38. The 1B's 2x
   over PY does NOT carry to 27B at 6bpw (weight bytes/token is the
   wall); PY-spec 25.7 vs our 33.0 = 1.28x.
+- **PY-ENGINE OPTIMIZATION ROUND (2026/10/09 night)**: the "PY can't
+  reach C++" verdict was WRONG — most of the gap was kernel design +
+  operator fragmentation, both fixable in PY:
+  (a) 27B: ported the C++ v2 GEMV design (sign-fold 32-entry cb +
+  smem-x fp32 staging + float4 + fmaf) into experiments/
+  udcq_gemv_cuda/udcq_gemv_cuda.py (ext name udcq_gemv_cuda_v2;
+  mt kernel fold-only, x stays global). PY-graph engine 12.2 ->
+  26.2 tok/s (2.1x), now UDCQ_CUDA_GEMV=1 by DEFAULT (udcq.py;
+  =0 reverts; alignment guard %256 -> %16). PY-spec unchanged
+  (25.2 — its bottleneck is draft/queue logic, not the GEMV).
+  (b) 1B: same port for gsq (gsq_gemv_cuda v3) + torch.compile
+  (default mode, wrapped before the manual graph capture; inductor
+  fuses the HF norm/rotary/residual chains between graph breaks at
+  the custom GEMV op): PY-gsq pure decode ~150 -> 174.5 -> 251.6
+  tok/s = 95% of C++ (264.9). Test: tests/test_py1b_compile.py
+  (differential timing; the old bench's "126" was prefill-diluted).
+  Revised law: PY + hand-CUDA kernels + torch.compile reaches
+  ~80-95% of the C++ engine; the residual is fused-op depth +
+  zero-host-overhead, which is the C++ engine's reason to exist.
 - Known polish: generate() does not reset states between calls.
 - All in engine_v5.cu, each with its own gate test, zero exceptions:
   UDCQ gemv/gemm (fp64 1e-7 tier; BUG: pack scale is f16 — kernel
