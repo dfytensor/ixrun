@@ -191,6 +191,8 @@ torch.cuda.synchronize()
 xn = ext.s27d_get_xn().cuda().float()
 core0 = ext.s27d_get_core().cuda().float()
 h1_c = ext.s27d_get_h1().cuda().float()
+torch.save({'h1': h1_c.cpu(), 'w': nw2[0].cpu()},
+           r'C:\Users\Administrator\AppData\Local\Temp\opencode\h1_dump.pt')
 he0 = captured[0][0, -1].float().cuda()
 h1_ref = he0 + core0
 print(f'h1(L0): cpp norm {h1_c.float().norm().item():.3f} vs embed+core {h1_ref.float().norm().item():.3f} | cos {torch.nn.functional.cosine_similarity(h1_c.float(), h1_ref, dim=0).item():.4f}', flush=True)
