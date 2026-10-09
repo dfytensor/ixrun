@@ -127,7 +127,15 @@ class CppQwen27bEngine:
         for pos in range(len(ids) + max_new_tokens):
             t = ids[pos] if pos < len(ids) else (toks[-1] if toks else ids[0])
             he = self.emb[t].cuda().float()
-            nxt = self.ext.step27(he, pos, self.theta)
+            try:
+                nxt = self.ext.step27(he, pos, self.theta)
+                torch.cuda.synchronize()
+                err = torch.cuda.get_last_cuda_error() if hasattr(torch.cuda, 'get_last_cuda_error') else None
+            except RuntimeError as e:
+                print(f'ERROR at pos {pos}: {e}', flush=True)
+                raise
             if pos >= len(ids) - 1:
                 toks.append(nxt)
+            if pos < 3 or pos % 8 == 0:
+                print(f'  pos {pos} ok tok {nxt}', flush=True)
         return self.tok.decode(toks)
