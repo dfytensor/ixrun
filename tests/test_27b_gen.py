@@ -8,8 +8,8 @@ eng = CppQwen27bEngine.from_blob(
     r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt',
     r'E:\models\Qwen3.8-27B', verbose=True)
 
-text = eng.generate("The capital of France is", max_new_tokens=32)
+text = eng.generate("The capital of France is", max_new_tokens=8)
 print(f'TEXT: {text!r}', flush=True)
 
-text2 = eng.generate("北京最值得游览的三个景点是", max_new_tokens=32)
+text2 = eng.generate("北京最值得游览的三个景点是", max_new_tokens=8)
 print(f'TEXT2: {text2!r}', flush=True)
