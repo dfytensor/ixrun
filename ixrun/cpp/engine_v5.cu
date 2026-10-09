@@ -689,7 +689,8 @@ static void udcq_gemv_launch(
         }
         size_t sm = (size_t)in_f * sizeof(float) + 16 * sizeof(float);
         if ((int)sm <= max_sm) {
-            udcq_gemv_v2_kernel<<<(out_f + 7) / 8, 256, sm, st>>>(
+            int wpb = (in_f > 12288) ? 16 : 8;   // big smem -> 1 blk/SM: use all warps
+            udcq_gemv_v2_kernel<<<(out_f + wpb - 1) / wpb, wpb * 32, sm, st>>>(
                 x, idx, sign, scale, cb, y, in_f, out_f, group);
             return;
         }

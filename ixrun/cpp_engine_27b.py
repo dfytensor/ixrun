@@ -127,13 +127,12 @@ class CppQwen27bEngine:
     def generate(self, prompt, max_new_tokens=32):
         ids = self.tok(prompt, return_tensors='pt').input_ids[0].tolist()
         toks = []
+        he_buf = torch.empty(self.hidden, dtype=torch.float32, device='cuda')
         for pos in range(len(ids) + max_new_tokens):
             t = ids[pos] if pos < len(ids) else (toks[-1] if toks else ids[0])
-            he = self.emb[t].cuda().float()
+            he_buf.copy_(self.emb[t].float())
             try:
-                nxt = self.ext.step27(he, pos, self.theta)
-                torch.cuda.synchronize()
-                err = torch.cuda.get_last_cuda_error() if hasattr(torch.cuda, 'get_last_cuda_error') else None
+                nxt = self.ext.step27(he_buf, pos, self.theta)
             except RuntimeError as e:
                 print(f'ERROR at pos {pos}: {e}', flush=True)
                 raise
