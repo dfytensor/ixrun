@@ -19,14 +19,15 @@ def ig32_pack(W, group=32, nlev=16, lloyd=25):
 
     best_mse = torch.full((A.shape[0],), float('inf'), device=A.device)
     best_lv = torch.zeros(A.shape[0], nlev, device=A.device)
+    best_prm = torch.zeros(A.shape[0], dtype=torch.uint8, device=A.device)
 
     B_REL = torch.logspace(-3, 2, 15).tolist()
     BETAS = [0.50, 0.55, 0.65, 0.75, 0.85, 0.95, 1.00]
     TANH_B = [0.25, 0.4, 0.6, 0.85, 1.2, 1.8, 3.0]
 
-    for br in B_REL:
+    for bi, br in enumerate(B_REL):
         b = br * gmax
-        for beta in BETAS:
+        for bj, beta in enumerate(BETAS):
             f = A ** beta / (b + A ** beta)
             fmax = gmax ** beta / (b + gmax ** beta)
             q = torch.round(f / fmax * nm1).clamp_(0, nm1)
@@ -47,8 +48,11 @@ def ig32_pack(W, group=32, nlev=16, lloyd=25):
                     lv = lv ** (1.0 / beta)
                 lv = torch.minimum(lv, gmax)
                 best_lv = torch.where(imp.view(-1, 1), lv, best_lv)
+                pv = ((bi & 0xF) << 3) | (bj & 7)
+                best_prm = torch.where(
+                    imp, torch.full_like(best_prm, pv), best_prm)
 
-    for br in TANH_B:
+    for ti, br in enumerate(TANH_B):
         b = br * gmax
         f = torch.tanh(A / b)
         fmax = torch.tanh(gmax / b)
@@ -66,6 +70,9 @@ def ig32_pack(W, group=32, nlev=16, lloyd=25):
             lv = (b * torch.atanh(fdi)).clamp_min(0)
             lv = torch.minimum(lv, gmax)
             best_lv = torch.where(imp.view(-1, 1), lv, best_lv)
+            pv = 0x80 | ((ti & 0xF) << 3)
+            best_prm = torch.where(
+                imp, torch.full_like(best_prm, pv), best_prm)
 
     lv = best_lv.clone()
     for it in range(lloyd):
@@ -103,6 +110,9 @@ def ig32_pack(W, group=32, nlev=16, lloyd=25):
             'sign': signw.view(n_rows, inf // 32).cpu().contiguous(),
             'levels': lv.reshape(n_rows, inf // group, nlev).half()
                         .cpu().contiguous(),
+            'gmax': gmax.half().view(n_rows, inf // group).cpu()
+                         .contiguous(),
+            'prm': best_prm.view(n_rows, inf // group).cpu().contiguous(),
             'out_f': of, 'in_f': inf}
 
 

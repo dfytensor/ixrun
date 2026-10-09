@@ -5,10 +5,12 @@ sys.path.insert(0, r'E:\IXRUN')
 import pandas  # noqa: F401
 import torch
 from benchmarks.ig32_runtime import ig32_pack, ig32_decode_ref
-from experiments.ig32_gemv_cuda import ig32_gemv, _load
+from experiments.ig32_gemv_cuda import ig32_gemv, ig32p_gemv, install_tables, _load
 
 torch.manual_seed(0)
 _load()
+install_tables()
+print('tables readback:', _load().get_tables().cpu().tolist())
 print('ext built', flush=True)
 
 ok = True
@@ -23,7 +25,9 @@ for of, inf in [(512, 512), (2048, 6144), (5504, 1536)]:
     y = ig32_gemv(x, pk)
     y_ref = (dref @ x.float()).to(torch.bfloat16)
     gmax = (y.float() - y_ref.float()).abs().max().item()
-    ok &= gmax < 0.05
+    yp = ig32p_gemv(x, pk)
+    gmaxp = (yp.float() - y_ref.float()).abs().max().item()
+    ok &= gmax < 0.05 and gmaxp < 0.06
     bpw = 4 + 1 + (8 + 16) / 32
     for _ in range(20):
         ig32_gemv(x, pk)
@@ -37,6 +41,6 @@ for of, inf in [(512, 512), (2048, 6144), (5504, 1536)]:
         ev1.record()
         torch.cuda.synchronize()
         best = min(best, ev0.elapsed_time(ev1))
-    print(f'[{of}x{inf}] pack {tk:.1f}s rec-rel {rel:.4f} gmax {gmax:.4f} '
+    print(f'[{of}x{inf}] pack {tk:.1f}s rec-rel {rel:.4f} gmax {gmax:.4f}/{gmaxp:.4f} '
           f'{bpw:.2f}bpw {best:.3f}ms', flush=True)
 print('IG32 GATE:', 'PASS' if ok else 'FAIL', flush=True)
