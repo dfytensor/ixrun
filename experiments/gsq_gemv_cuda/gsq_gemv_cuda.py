@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """GSQ hand-CUDA GEMV: K32 scalar codebook (smem) + per-16 int8 scale
-+ 5-bit packed codes (10B per 16-elem group, one warp per row)."""
++ 5-bit packed codes (10B per 16-elem group, one warp per row).
+v3: x staged in smem once per block (fp32, float4 reads) — mirrors
+engine_v5.cu gsq_gemv_v2; the v2 kernel re-read x per warp from global."""
 import sys
 
 import torch
@@ -20,12 +22,13 @@ __global__ void gs_gemv_kernel(
     const uint8_t* __restrict__ s_i8,      // [nR*nGr]
     float s_base, float s_step,            // exp2(base + v*step)
     float* __restrict__ yf,                // [out_f]
-    int n_gr)                              // groups per row
+    int n_gr, int in_f)
 {
     __shared__ float cb_sm[32];
-    for (int i = threadIdx.x; i < 32; i += blockDim.x) {
-        cb_sm[i] = cb[i];
-    }
+    extern __shared__ float x_sm[];        // in_f floats
+    for (int i = threadIdx.x; i < 32; i += blockDim.x) cb_sm[i] = cb[i];
+    for (int i = threadIdx.x; i < in_f; i += blockDim.x)
+        x_sm[i] = __bfloat162float(x[i]);
     __syncthreads();
     int lane = threadIdx.x & 31;
     int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -41,21 +44,22 @@ __global__ void gs_gemv_kernel(
         unsigned long long lo = (unsigned long long)d0
             | ((unsigned long long)d1 << 32);
         float s = exp2f(s_base + (float)s_i8[gidx] * s_step);
-        const __nv_bfloat16* x16 = x + jb * 16;
+        float xr[16];
+        #pragma unroll
+        for (int q = 0; q < 4; ++q)
+            *reinterpret_cast<float4*>(&xr[q * 4]) =
+                *reinterpret_cast<const float4*>(x_sm + jb * 16 + q * 4);
         float inner = 0.f;
         #pragma unroll
-        for (int i = 0; i < 12; ++i) {
-            int c = (int)((lo >> (5 * i)) & 0x1F);
-            inner += cb_sm[c] * __bfloat162float(x16[i]);
-        }
+        for (int i = 0; i < 12; ++i)
+            inner = fmaf(cb_sm[(int)((lo >> (5 * i)) & 0x1F)], xr[i], inner);
         int c12 = (int)(((lo >> 60)
             | ((unsigned long long)d2 << 4)) & 0x1F);
-        inner += cb_sm[c12] * __bfloat162float(x16[12]);
+        inner = fmaf(cb_sm[c12], xr[12], inner);
         #pragma unroll
-        for (int i = 0; i < 3; ++i) {
-            int c = (int)((d2 >> (5 * i + 1)) & 0x1F);
-            inner += cb_sm[c] * __bfloat162float(x16[13 + i]);
-        }
+        for (int i = 0; i < 3; ++i)
+            inner = fmaf(cb_sm[(int)((d2 >> (5 * i + 1)) & 0x1F)],
+                         xr[13 + i], inner);
         acc += inner * s;
     }
     #pragma unroll
@@ -78,11 +82,12 @@ torch::Tensor gemv(torch::Tensor x, torch::Tensor codes,
     int wpb = 8;
     unsigned gx = (unsigned)(out_f / wpb);
     auto s0 = at::cuda::getCurrentCUDAStream();
-    gs_gemv_kernel<<<gx, wpb * 32, 0, s0>>>(
+    size_t sm = (size_t)in_f * sizeof(float) + 32 * sizeof(float);
+    gs_gemv_kernel<<<gx, wpb * 32, sm, s0>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
         codes.data_ptr<uint8_t>(), cb.data_ptr<float>(),
         s_i8.data_ptr<uint8_t>(), (float)s_base, (float)s_step,
-        yf.data_ptr<float>(), n_gr);
+        yf.data_ptr<float>(), n_gr, (int)in_f);
     return yf.to(torch::kBFloat16);
 }
 """
@@ -101,7 +106,7 @@ def _load():
     global _EXT
     if _EXT is None:
         _EXT = load_inline(
-            name='gsq_gemv_cuda_v2',
+            name='gsq_gemv_cuda_v3',
             cpp_sources=[_CPP_SRC],
             cuda_sources=[_CUDA_SRC],
             functions=['gemv'],
@@ -124,7 +129,7 @@ if __name__ == '__main__':
     sys.path.insert(0, r'E:\IXRUN')
     from benchmarks.gsq_runtime import gs_pack, gs_decode_ref
     torch.manual_seed(0)
-    for of, inf in [(512, 512), (2048, 6144)]:
+    for of, inf in [(512, 512), (2048, 6144), (5504, 1536)]:
         W = (torch.randn(of, inf) * 0.02).cuda()
         pk = gs_pack(W)
         pk['codes5'] = pk['codes5'].cuda()
@@ -142,8 +147,7 @@ if __name__ == '__main__':
         for _ in range(200):
             gs_gemv_cuda(x, pk)
         torch.cuda.synchronize()
-        t_g = (time.time() - t0) / reps_dummy() if False else \
-            (time.time() - t0) / 200 * 1000
+        t_g = (time.time() - t0) / 200 * 1000
         Wb = dref.float()
         for _ in range(5):
             Wb @ x.float()
@@ -152,8 +156,6 @@ if __name__ == '__main__':
         for _ in range(200):
             Wb @ x.float()
         torch.cuda.synchronize()
-        t_b = (time.time() - t0) / 200 * 1000
-        t_b = max(t_b, 1e-4)
-        t_b = max(t_b, 1e-4)
+        t_b = max((time.time() - t0) / 200 * 1000, 1e-4)
         print(f'[{of}x{inf}] gmax={gmax:.4f} gsq={t_g:.3f}ms '
               f'bf16={t_b:.3f}ms ({t_b/t_g:.2f}x)', flush=True)
