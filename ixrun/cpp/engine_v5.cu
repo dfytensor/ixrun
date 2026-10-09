@@ -2268,17 +2268,6 @@ static torch::Tensor s27d_core; // probe: gdn core output
 static torch::Tensor s27d_h1;   // probe: residual h + core
 int s27_probe_l = -1;           // probe (defined here)
 torch::Tensor s27_h_out;
-static torch::Tensor bf16_scratch;   // bf16 damping buffer
-static void bf16_round_inplace(torch::Tensor& x) {
-    auto st = at::cuda::getCurrentCUDAStream();
-    int n = (int)x.numel();
-    cast_f32_bf16<<<(n + 255) / 256, 256, 0, st>>>(
-        x.data_ptr<float>(),
-        reinterpret_cast<__nv_bfloat16*>(bf16_scratch.data_ptr()), n);
-    cast_bf16_f32<<<(n + 255) / 256, 256, 0, st>>>(
-        reinterpret_cast<const __nv_bfloat16*>(bf16_scratch.data_ptr()),
-        x.data_ptr<float>(), n);
-}
 torch::Tensor gdn_decoder_step(
     torch::Tensor h, torch::Tensor cb,
     std::vector<torch::Tensor> PK,
@@ -2309,20 +2298,11 @@ torch::Tensor gdn_decoder_step(
         h1  = torch::empty({hidden}, f32);
         xn2 = torch::empty({hidden}, f32);
         out = torch::empty({hidden}, f32);
-        bf16_scratch = torch::empty({hidden},
-            torch::TensorOptions().dtype(torch::kBFloat16)
-                .device(h.device()));
         init = true;
     }
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h.data_ptr<float>(), in_w.data_ptr<float>(),
         xn.data_ptr<float>(), hidden, 1e-6f);
-    cast_f32_bf16<<<(hidden + 255) / 256, 256, 0, st>>>(
-        xn.data_ptr<float>(),
-        reinterpret_cast<__nv_bfloat16*>(bf16_scratch.data_ptr()), hidden);
-    cast_bf16_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
-        reinterpret_cast<const __nv_bfloat16*>(bf16_scratch.data_ptr()),
-        xn.data_ptr<float>(), hidden);
     if ((int)l == s27_probe_l) s27d_xn = xn.clone();   // probe
     torch::Tensor core = gdn_layer_step(
         xn.view({-1}), cb,
@@ -2332,16 +2312,13 @@ torch::Tensor gdn_decoder_step(
         conv_w, conv_b, A_log, dt_bias, gnorm_w,
         conv_state, S, nv, nk, dk, dv, l);
     if ((int)l == s27_probe_l) s27d_core = core.clone();   // probe
-    bf16_round_inplace(core);
     add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
         h.data_ptr<float>(), core.data_ptr<float>(),
         h1.data_ptr<float>(), hidden);
     if ((int)l == s27_probe_l) s27d_h1 = h1.clone();       // probe
-    bf16_round_inplace(h1);
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h1.data_ptr<float>(), post_w.data_ptr<float>(),
         xn2.data_ptr<float>(), hidden, 1e-6f);
-    bf16_round_inplace(xn2);
     if ((int)l == s27_probe_l) s27d_xn2 = xn2.clone(); // probe
     // mlp (inter passed explicitly; shapes from checkpoint)
     torch::Tensor mg = udcq_gemv_out(
@@ -2357,7 +2334,6 @@ torch::Tensor gdn_decoder_step(
     add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
         h1.data_ptr<float>(), md.data_ptr<float>(),
         out.data_ptr<float>(), hidden);
-    bf16_round_inplace(out);
     return out;
 }
 

@@ -52,7 +52,7 @@ torch::Tensor rmsnorm_fw_out(torch::Tensor x2d, torch::Tensor w,
 torch::Tensor gated_rmsnorm_out(torch::Tensor o, torch::Tensor z,
     torch::Tensor w, double eps);
 '''
-ext = load_inline(name='ixrun_cpp_v5s4k5', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v5s4k7', cpp_sources=[proto],
                   cuda_sources=[src, src27],
                   functions=['init27', 'step27', 's27_set_probe',
                              's27_get_probe_h', 's27_get_lg',
@@ -218,6 +218,10 @@ topv, topi = torch.topk(h1_c.abs().flatten(), 5)
 print(f'C) h1 top5 abs: {[round(v, 2) for v in topv.tolist()]} at {topi.tolist()}', flush=True)
 torch.save({'h1': h1_c.cpu(), 'w': nw2[0].cpu()},
            r'C:\Users\Administrator\AppData\Local\Temp\opencode\h1_dump.pt')
+dv5 = (xn2_direct.float() - xn2_torch_ref).abs()
+topd, topdi = torch.topk(dv5, 5)
+print(f'ELEMENTWISE diffs: ' + str([(round(v.item(), 2), int(i)) for v, i in zip(topd, topdi)]), flush=True)
+print(f'w[3994] = ' + str(nw2[0][3994].item()) + ' | h1[3994] = ' + str(h1_c[3994].item()), flush=True)
 print(f'xn2 refs: DIRECT-kernel {xn2_direct.float().norm().item():.3f} | torch-formula {xn2_torch_ref.float().norm().item():.3f} | PY {py_mlp_in.norm().item():.3f} | cos(direct,torch) {torch.nn.functional.cosine_similarity(xn2_direct.float(), xn2_torch_ref, dim=0).item():.4f}', flush=True)
 print(f'DIRECT rmsnorm_fw_out(h1_c, nw2[0]): norm {xn2_direct.float().norm().item():.3f} | cos vs cpp-xn2 ' + str(torch.nn.functional.cosine_similarity(xn2_direct.float(), xn2, dim=0).item())[:6] + ' | cos vs PY ' + str(torch.nn.functional.cosine_similarity(xn2_direct.float(), py_mlp_in, dim=0).item())[:6], flush=True)
 print(f'xn2(L0) vs PY mlp-input: norm {xn2.norm():.3f} vs {py_mlp_in.norm():.3f} | cos {torch.nn.functional.cosine_similarity(xn2, py_mlp_in, dim=0).item():.4f}', flush=True)
