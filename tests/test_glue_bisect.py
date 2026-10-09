@@ -37,7 +37,7 @@ torch::Tensor gated_rmsnorm_out(torch::Tensor o, torch::Tensor z,
     torch::Tensor w, double eps);
 
 '''
-ext = load_inline(name='ixrun_cpp_v5gl126c', cpp_sources=[proto],
+ext = load_inline(name='ixrun_cpp_v5gl134a', cpp_sources=[proto],
                   cuda_sources=[src],
                   functions=['gdn_layer_step', 'udcq_gemv_out',
                              'conv1d_update_out', 'l2norm_out',

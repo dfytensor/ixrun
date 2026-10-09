@@ -3,8 +3,6 @@
 // packs normalized to 8 slots x 3 tensors per layer:
 //   GDN  slots: qkv,z,b,a,out,gate,up,down
 //   ATTN slots: q,k,v,o,gate,up,down,(unused)
-#include <cstdio>
-#include <cuda_bf16.h>
 static std::vector<torch::Tensor> s27_packs;     // [64*8*3]
 static std::vector<torch::Tensor> s27_nw1, s27_nw2;
 static std::vector<torch::Tensor> s27_gex;       // [48*4]
@@ -57,7 +55,6 @@ void init27(
     for (int i = 0; i < (int)attn_layers.size(); ++i)
         s27_kv.push_back(torch::zeros({8, ctx, 256}, bf));
     s27_init = true;
-    fprintf(stderr, "INIT27_OK\n"); fflush(stderr);
 }
 
 int64_t step27(torch::Tensor h, int64_t pos, double theta) {
@@ -87,7 +84,6 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
     };
     int ig = 0, ia = 0;
     for (int l = 0; l < nl; ++l) {
-        fprintf(stderr, "L%d ", l); fflush(stderr);
         bool is_attn = false;
         for (int64_t a : s27_attn_layers)
             if (a == l) { is_attn = true; break; }
@@ -127,11 +123,9 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
         s27_hnorm.push_back(hn.item<float>());
         if ((int)l == s27_probe_l) s27_h_out = hcur.clone();
     }
-    fprintf(stderr, "\nLAYERS_OK\n"); fflush(stderr);
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h.data_ptr<float>(), s27_fnw.data_ptr<float>(),
         fn.data_ptr<float>(), hidden, 1e-6f);
-    fprintf(stderr, "FNORM "); fflush(stderr);
     int64_t vocab = s27_lh_i.numel() * 2 / hidden;
     udcq_gemv_kernel<<<(unsigned)vocab, 256, 0, st>>>(
         fn.data_ptr<float>(), s27_lh_i.data_ptr<uint8_t>(),
@@ -139,11 +133,9 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
         reinterpret_cast<const __half*>(s27_lh_sc.data_ptr()),
         s27_cb.data_ptr<float>(),
         lg.data_ptr<float>(), hidden, GROUP);
-    fprintf(stderr, "LMHEAD "); fflush(stderr);
     argmax_f32<<<1, 256, 0, st>>>(
         lg.data_ptr<float>(), (int)vocab,
         tok.data_ptr<int64_t>());
-    fprintf(stderr, "\nARGMAX_OK\n"); fflush(stderr);
     s27_lg_out = lg;   // probe (diagnostics)
     return tok.item<int64_t>();
 }
