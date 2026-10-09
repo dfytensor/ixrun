@@ -119,20 +119,22 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
             ig++;
         }
         h = hcur;
-        torch::Tensor hn = hcur.norm();
-        s27_hnorm.push_back(hn.item<float>());
-        if ((int)l == s27_probe_l) s27_h_out = hcur.clone();
+        if (s27_probe_l >= 0) {   // diagnostics only (no syncs in hot path)
+            torch::Tensor hn = hcur.norm();
+            s27_hnorm.push_back(hn.item<float>());
+            if ((int)l == s27_probe_l) s27_h_out = hcur.clone();
+        }
     }
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h.data_ptr<float>(), s27_fnw.data_ptr<float>(),
         fn.data_ptr<float>(), hidden, 1e-6f);
     int64_t vocab = s27_lh_i.numel() * 2 / hidden;
-    udcq_gemv_kernel<<<(unsigned)vocab, 256, 0, st>>>(
+    udcq_gemv_launch(
         fn.data_ptr<float>(), s27_lh_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(s27_lh_s.data_ptr()),
         reinterpret_cast<const __half*>(s27_lh_sc.data_ptr()),
         s27_cb.data_ptr<float>(),
-        lg.data_ptr<float>(), hidden, GROUP);
+        lg.data_ptr<float>(), (int)vocab, hidden, GROUP, st);
     argmax_f32<<<1, 256, 0, st>>>(
         lg.data_ptr<float>(), (int)vocab,
         tok.data_ptr<int64_t>());

@@ -579,6 +579,11 @@ __global__ void udcq_gemv_kernel(
     }
 }
 
+static void udcq_gemv_launch(
+    const float* x, const uint8_t* idx, const uint32_t* sign,
+    const __half* scale, const float* cb, float* y,
+    int out_f, int in_f, int group, cudaStream_t st);
+
 torch::Tensor udcq_gemv_out(torch::Tensor x,
                             torch::Tensor idx, torch::Tensor sign,
                             torch::Tensor scale, torch::Tensor cb,
@@ -586,14 +591,111 @@ torch::Tensor udcq_gemv_out(torch::Tensor x,
                             int64_t group) {
     auto y = torch::zeros({out_f}, torch::dtype(torch::kFloat32)
                                          .device(x.device()));
-    udcq_gemv_kernel<<<(unsigned)out_f, 256, 0,
-                       at::cuda::getCurrentCUDAStream()>>>(
+    udcq_gemv_launch(
         x.data_ptr<float>(), idx.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(sign.data_ptr()),
         reinterpret_cast<const __half*>(scale.data_ptr()),
         cb.data_ptr<float>(), y.data_ptr<float>(),
-        (int)in_f, (int)group);
+        (int)out_f, (int)in_f, (int)group,
+        at::cuda::getCurrentCUDAStream());
     return y;
+}
+
+// UDCQ GEMV v2: warp-per-row + x staged in smem once per block (8 rows).
+// v1 re-read the whole x per row => ~5x L2 traffic; v2 streams only the
+// weight bytes. Per 16-elem group: 8B idx (uint2) + 2B scale + 4B sign
+// word (shared by 2 groups) + x from smem. Not bit-identical to v1
+// (different reduction order); gate vs fp64 at the 1e-7 tier.
+__global__ void udcq_gemv_v2_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ idx,
+    const uint32_t* __restrict__ sign,
+    const __half* __restrict__ scale,
+    const float* __restrict__ cb,
+    float* __restrict__ y,
+    int in_f, int out_f, int GROUP)
+{
+    extern __shared__ float smem[];
+    float* x_sm = smem;              // in_f floats
+    float* cb_sm = smem + in_f;      // 32 floats: [0..15]=cb, [16..31]=-cb
+    for (int i = threadIdx.x; i < 16; i += blockDim.x) {
+        cb_sm[i] = -cb[i];           // sign bit 0 -> negative
+        cb_sm[i + 16] = cb[i];       // sign bit 1 -> positive
+    }
+    for (int i = threadIdx.x; i < in_f; i += blockDim.x) x_sm[i] = x[i];
+    __syncthreads();
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (r >= out_f) return;
+    int n_gr = in_f / GROUP;
+    const uint8_t* irow = idx + (size_t)r * (in_f / 2);
+    const __half* srow = scale + (size_t)r * n_gr;
+    const uint32_t* wrow = sign + (size_t)r * (in_f / 32);
+    float acc = 0.f;
+    for (int g = lane; g < n_gr; g += 32) {
+        uint2 b2 = *reinterpret_cast<const uint2*>(irow + (size_t)g * 8);
+        uint32_t sw = wrow[g >> 1] >> (16 * (g & 1));
+        float sc = __half2float(srow[g]);
+        const float* xs = x_sm + (size_t)g * GROUP;
+        float xr[16];
+        #pragma unroll
+        for (int q = 0; q < 4; ++q)
+            *reinterpret_cast<float4*>(&xr[q * 4]) =
+                *reinterpret_cast<const float4*>(xs + q * 4);
+        float inner = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int b = (int)((b2.x >> (8 * i)) & 0xFF);
+            int s0 = (int)((sw >> (2 * i)) & 1u) << 4;
+            int s1 = (int)((sw >> (2 * i + 1)) & 1u) << 4;
+            inner = fmaf(cb_sm[(b & 0xF) | s0], xr[2 * i], inner);
+            inner = fmaf(cb_sm[(b >> 4) | s1], xr[2 * i + 1], inner);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int b = (int)((b2.y >> (8 * i)) & 0xFF);
+            int s0 = (int)((sw >> (8 + 2 * i)) & 1u) << 4;
+            int s1 = (int)((sw >> (8 + 2 * i + 1)) & 1u) << 4;
+            inner = fmaf(cb_sm[(b & 0xF) | s0], xr[8 + 2 * i], inner);
+            inner = fmaf(cb_sm[(b >> 4) | s1], xr[8 + 2 * i + 1], inner);
+        }
+        acc += inner * sc;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) y[r] = acc;
+}
+
+// dispatcher: v2 for the supported format, v1 fallback otherwise
+static void udcq_gemv_launch(
+    const float* x, const uint8_t* idx, const uint32_t* sign,
+    const __half* scale, const float* cb, float* y,
+    int out_f, int in_f, int group, cudaStream_t st)
+{
+    if (group == 16 && in_f % 32 == 0 && in_f > 0
+        && (long long)out_f * in_f >= 8LL * 1024 * 1024) {
+        static int max_sm = -1;
+        if (max_sm < 0) {
+            int dev = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&max_sm,
+                cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+            if (max_sm > 0)
+                cudaFuncSetAttribute(udcq_gemv_v2_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    max_sm);
+        }
+        size_t sm = (size_t)in_f * sizeof(float) + 16 * sizeof(float);
+        if ((int)sm <= max_sm) {
+            udcq_gemv_v2_kernel<<<(out_f + 7) / 8, 256, sm, st>>>(
+                x, idx, sign, scale, cb, y, in_f, out_f, group);
+            return;
+        }
+    }
+    udcq_gemv_kernel<<<(unsigned)out_f, 256, 0, st>>>(
+        x, idx, sign, scale, cb, y, in_f, group);
 }
 
 // UDCQ batched GEMM: [T,in_f] @ W^T -> [T,out_f], same walk as
@@ -927,26 +1029,26 @@ torch::Tensor gdn_layer_step(
         init = true;
     }
 
-    udcq_gemv_kernel<<<(unsigned)conv_dim, 256, 0, st>>>(
+    udcq_gemv_launch(
         h.data_ptr<float>(), qkv_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(qkv_s.data_ptr()),
         reinterpret_cast<const __half*>(qkv_sc.data_ptr()), cb.data_ptr<float>(),
-        qkv.data_ptr<float>(), hidden, GROUP);
-    udcq_gemv_kernel<<<(unsigned)value_dim, 256, 0, st>>>(
+        qkv.data_ptr<float>(), conv_dim, hidden, GROUP, st);
+    udcq_gemv_launch(
         h.data_ptr<float>(), z_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(z_s.data_ptr()),
         reinterpret_cast<const __half*>(z_sc.data_ptr()), cb.data_ptr<float>(),
-        z.data_ptr<float>(), hidden, GROUP);
-    udcq_gemv_kernel<<<(unsigned)nv, 256, 0, st>>>(
+        z.data_ptr<float>(), value_dim, hidden, GROUP, st);
+    udcq_gemv_launch(
         h.data_ptr<float>(), b_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(b_s.data_ptr()),
         reinterpret_cast<const __half*>(b_sc.data_ptr()), cb.data_ptr<float>(),
-        bo.data_ptr<float>(), hidden, GROUP);
-    udcq_gemv_kernel<<<(unsigned)nv, 256, 0, st>>>(
+        bo.data_ptr<float>(), nv, hidden, GROUP, st);
+    udcq_gemv_launch(
         h.data_ptr<float>(), a_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(a_s.data_ptr()),
         reinterpret_cast<const __half*>(a_sc.data_ptr()), cb.data_ptr<float>(),
-        ao.data_ptr<float>(), hidden, GROUP);
+        ao.data_ptr<float>(), nv, hidden, GROUP, st);
 
     conv1d_update_kernel<<<(conv_dim + 255) / 256, 256, 0, st>>>(
         qkv.data_ptr<float>(), conv_state.data_ptr<float>(),
@@ -994,11 +1096,11 @@ torch::Tensor gdn_layer_step(
         s27d_o = o.clone();
         s27d_gated = on.clone();
     }
-    udcq_gemv_kernel<<<(unsigned)hidden, 256, 0, st>>>(
+    udcq_gemv_launch(
         on.view(-1).data_ptr<float>(), o_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(o_s.data_ptr()),
         reinterpret_cast<const __half*>(o_sc.data_ptr()), cb.data_ptr<float>(),
-        out.data_ptr<float>(), value_dim, GROUP);
+        out.data_ptr<float>(), hidden, value_dim, GROUP, st);
     return out;
 }
 
@@ -2416,25 +2518,25 @@ torch::Tensor attn_layer_step(
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h.data_ptr<float>(), in_w.data_ptr<float>(),
         xn.data_ptr<float>(), hidden, 1e-6f);
-    udcq_gemv_kernel<<<(unsigned)(nh * hd * 2), 256, 0, st>>>(
+    udcq_gemv_launch(
         xn.data_ptr<float>(), q_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(q_s.data_ptr()),
         reinterpret_cast<const __half*>(q_sc.data_ptr()), cb.data_ptr<float>(),
-        q2.data_ptr<float>(), hidden, GROUP);
+        q2.data_ptr<float>(), nh * hd * 2, hidden, GROUP, st);
     // fused per-head gate: q2 [nh,512] -> q [nh,256] + gate [nh,256]
     chunk_qgate_kernel<<<(unsigned)nh, (unsigned)hd, 0, st>>>(
         q2.data_ptr<float>(), qh.data_ptr<float>(),
         gt.data_ptr<float>(), (int)hd);
-    udcq_gemv_kernel<<<(unsigned)(nkv * hd), 256, 0, st>>>(
+    udcq_gemv_launch(
         xn.data_ptr<float>(), k_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(k_s.data_ptr()),
         reinterpret_cast<const __half*>(k_sc.data_ptr()), cb.data_ptr<float>(),
-        k2.data_ptr<float>(), hidden, GROUP);
-    udcq_gemv_kernel<<<(unsigned)(nkv * hd), 256, 0, st>>>(
+        k2.data_ptr<float>(), nkv * hd, hidden, GROUP, st);
+    udcq_gemv_launch(
         xn.data_ptr<float>(), v_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(v_s.data_ptr()),
         reinterpret_cast<const __half*>(v_sc.data_ptr()), cb.data_ptr<float>(),
-        v2.data_ptr<float>(), hidden, GROUP);
+        v2.data_ptr<float>(), nkv * hd, hidden, GROUP, st);
     rmsnorm_fw_kernel<<<nh, 256, 0, st>>>(
         qh.data_ptr<float>(), q_norm_w.data_ptr<float>(),
         qh.data_ptr<float>(), hd, 1e-6f);
@@ -2460,35 +2562,35 @@ torch::Tensor attn_layer_step(
     sigmoid_mul_kernel<<<(unsigned)((nh * hd + 255) / 256), 256, 0,
                          st>>>(
         att.data_ptr<float>(), gt.data_ptr<float>(), nh * hd);
-    udcq_gemv_kernel<<<(unsigned)hidden, 256, 0, st>>>(
+    udcq_gemv_launch(
         att.data_ptr<float>(), o_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(o_s.data_ptr()),
         reinterpret_cast<const __half*>(o_sc.data_ptr()), cb.data_ptr<float>(),
-        o.data_ptr<float>(), nh * hd, GROUP);
+        o.data_ptr<float>(), hidden, nh * hd, GROUP, st);
     add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
         h.data_ptr<float>(), o.data_ptr<float>(),
         h1.data_ptr<float>(), hidden);
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h1.data_ptr<float>(), post_w.data_ptr<float>(),
         xn2.data_ptr<float>(), hidden, 1e-6f);
-    udcq_gemv_kernel<<<(unsigned)inter, 256, 0, st>>>(
+    udcq_gemv_launch(
         xn2.data_ptr<float>(), g_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(g_s.data_ptr()),
         reinterpret_cast<const __half*>(g_sc.data_ptr()), cb.data_ptr<float>(),
-        mg.data_ptr<float>(), hidden, GROUP);
-    udcq_gemv_kernel<<<(unsigned)inter, 256, 0, st>>>(
+        mg.data_ptr<float>(), inter, hidden, GROUP, st);
+    udcq_gemv_launch(
         xn2.data_ptr<float>(), u_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(u_s.data_ptr()),
         reinterpret_cast<const __half*>(u_sc.data_ptr()), cb.data_ptr<float>(),
-        mu.data_ptr<float>(), hidden, GROUP);
+        mu.data_ptr<float>(), inter, hidden, GROUP, st);
     silu_kernel<<<(unsigned)((inter + 255) / 256), 256, 0, st>>>(
         mg.data_ptr<float>(), mu.data_ptr<float>(),
         act.data_ptr<float>(), (int)inter);
-    udcq_gemv_kernel<<<(unsigned)hidden, 256, 0, st>>>(
+    udcq_gemv_launch(
         act.data_ptr<float>(), d_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(d_s.data_ptr()),
         reinterpret_cast<const __half*>(d_sc.data_ptr()), cb.data_ptr<float>(),
-        md.data_ptr<float>(), inter, GROUP);
+        md.data_ptr<float>(), hidden, inter, GROUP, st);
     add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
         h1.data_ptr<float>(), md.data_ptr<float>(),
         out.data_ptr<float>(), hidden);
