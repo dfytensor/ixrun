@@ -170,6 +170,8 @@ for pos, t in enumerate(ids):
     o_r = (S_r * q_r.unsqueeze(-1)).sum(1).reshape(-1)
     core_r = out_w @ o_r
     h1_r = h_r + core_r
+    if pos == 0:
+        print(f'torch-same-decode h1(pos0) norm: {h1_r.norm().item():.3f}', flush=True)
     xn2_r = post_w * h1_r * torch.rsqrt(
         h1_r.pow(2).mean() + 1e-6)
     mg_r = Wg @ xn2_r
