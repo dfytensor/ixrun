@@ -883,10 +883,11 @@ torch::Tensor gated_rmsnorm_out(torch::Tensor o, torch::Tensor z,
 __global__ void rope27_kernel(float* q, float* k,
                               int n_heads, int n_kv_heads,
                               int head_dim, float theta,
-                              int pos) {
+                              const int* dpos) {
     int h = blockIdx.x;
     int i = threadIdx.x;
     if (i >= 32) return;   // rotary_dim/2 = 32 pairs
+    int pos = *dpos;
     float th = pos * powf(theta, -2.0f * i / 64.0f);
     float c = cosf(th), s = sinf(th);
     int base = h * head_dim;
@@ -905,11 +906,13 @@ torch::Tensor rope27_out(torch::Tensor q, torch::Tensor k,
                          int64_t n_heads, int64_t n_kv_heads,
                          int64_t head_dim, double theta,
                          int64_t pos) {
+    auto dp = torch::tensor({(int)pos}, torch::TensorOptions()
+        .dtype(torch::kInt32).device(q.device()));
     rope27_kernel<<<(unsigned)n_heads, 32, 0,
                     at::cuda::getCurrentCUDAStream()>>>(
         q.data_ptr<float>(), k.data_ptr<float>(),
         (int)n_heads, (int)n_kv_heads, (int)head_dim,
-        (float)theta, (int)pos);
+        (float)theta, dp.data_ptr<int>());
     return q;
 }
 
@@ -1706,12 +1709,13 @@ __global__ void rope_b_kernel(float* q, float* k,
 __global__ void cache_write_b_kernel(
     const float* k2d, const float* v2d,
     __nv_bfloat16* kv_base, int hd, int ctx,
-    int n_kv_heads, int start_pos) {
+    int n_kv_heads, const int* dpos) {
     int tv = blockIdx.x;
     int t = tv / (2 * n_kv_heads);
     int kvi = tv % (2 * n_kv_heads);
     int i = threadIdx.x;
     if (i >= hd) return;
+    int start_pos = *dpos;
     const float* src = (kvi < n_kv_heads) ? k2d : v2d;
     int row = t * n_kv_heads + (kvi % n_kv_heads);
     kv_base[((long long)kvi * ctx + start_pos + t) * hd + i]
@@ -1723,11 +1727,11 @@ __global__ void attn_b_kernel(const float* q,
                               float* out,
                               int n_heads, int n_kv_heads,
                               int head_dim, int ctx,
-                              int start_pos) {
+                              const int* dpos) {
     int th = blockIdx.x;
     int t = th / n_heads;
     int h = th % n_heads;
-    int pos = start_pos + t;
+    int pos = *dpos + t;
     int d = threadIdx.x;
     if (d >= head_dim) return;
     int kvh = h / (n_heads / n_kv_heads);
@@ -1824,6 +1828,8 @@ torch::Tensor prefill_batch(torch::Tensor ids_gpu,   // int64 [T] cuda
     }
     long long TH = (long long)T * H;
     int nblkH = (int)((TH + 255) / 256);
+    auto dp = torch::tensor({(int)start_pos}, torch::TensorOptions()
+        .dtype(torch::kInt32).device(ids_gpu.device()));
 
     embed_rows_kernel<<<dim3(T, (H + 255) / 256), 256, 0, st>>>(
         reinterpret_cast<const __nv_bfloat16*>(g_embed.data_ptr()),
@@ -1864,14 +1870,14 @@ torch::Tensor prefill_batch(torch::Tensor ids_gpu,   // int64 [T] cuda
                                0, st>>>(
             k2.data_ptr<float>(), v2.data_ptr<float>(),
             reinterpret_cast<__nv_bfloat16*>(g_kcs[l].data_ptr()),
-            (int)g_hd, (int)g_ctx, (int)g_nkv, (int)start_pos);
+            (int)g_hd, (int)g_ctx, (int)g_nkv, dp.data_ptr<int>());
         attn_b_kernel<<<T * (unsigned)g_nheads, (unsigned)g_hd,
                         (size_t)g_ctx * 4, st>>>(
             q2.data_ptr<float>(),
             reinterpret_cast<const __nv_bfloat16*>(g_kcs[l].data_ptr()),
             at.data_ptr<float>(),
             (int)g_nheads, (int)g_nkv, (int)g_hd, (int)g_ctx,
-            (int)start_pos);
+            dp.data_ptr<int>());
         dim3 go_((unsigned)(oo / 8), T);
         gsq_gemm_kernel<<<go_, 256, (size_t)qo*4, st>>>(
             at.data_ptr<float>(), g_codes[b+3].data_ptr<uint8_t>(),
@@ -2476,7 +2482,7 @@ torch::Tensor attn_layer_step(
     torch::Tensor in_w, torch::Tensor post_w,
     torch::Tensor q_norm_w, torch::Tensor k_norm_w,
     torch::Tensor kv_cache,             // [8, ctx, 256] bf16
-    double theta, int64_t pos,
+    double theta, const int* dpos,
     int64_t nh, int64_t nkv, int64_t hd,
     int64_t hidden, int64_t inter, int64_t ctx)
 {
@@ -2514,8 +2520,6 @@ torch::Tensor attn_layer_step(
         out = torch::empty({hidden}, f32);
         init = true;
     }
-    int P = (int)pos;
-
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h.data_ptr<float>(), in_w.data_ptr<float>(),
         xn.data_ptr<float>(), hidden, 1e-6f);
@@ -2547,18 +2551,18 @@ torch::Tensor attn_layer_step(
         kh.data_ptr<float>(), hd, 1e-6f);
     rope27_kernel<<<(unsigned)nh, 32, 0, st>>>(
         qh.data_ptr<float>(), kh.data_ptr<float>(),
-        (int)nh, (int)nkv, (int)hd, (float)theta, P);
+        (int)nh, (int)nkv, (int)hd, (float)theta, dpos);
     cache_write_b_kernel<<<(unsigned)(2 * nkv), (unsigned)hd, 0,
                            st>>>(
         k2.data_ptr<float>(), v2.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(kv_cache.data_ptr()),
-        (int)hd, (int)ctx, (int)nkv, P);
+        (int)hd, (int)ctx, (int)nkv, dpos);
     attn_b_kernel<<<(unsigned)nh, (unsigned)hd,
                     (size_t)ctx * sizeof(float), st>>>(
         qh.data_ptr<float>(),
         reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr()),
         att.data_ptr<float>(), (int)nh, (int)nkv, (int)hd,
-        (int)ctx, P);
+        (int)ctx, dpos);
     // per-head sigmoid gate before o_proj
     sigmoid_mul_kernel<<<(unsigned)((nh * hd + 255) / 256), 256, 0,
                          st>>>(

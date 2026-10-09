@@ -15,6 +15,7 @@ static std::vector<int64_t> s27_attn_layers;
 static int64_t s27_hidden, s27_inter, s27_ctx;
 static bool s27_init = false;
 static torch::Tensor s27_lg_out;
+static torch::Tensor s27_tok;          // argmax output (device int64[1])
 static std::vector<float> s27_hnorm;   // per-layer probe
 static std::vector<torch::Tensor> s27_layer_h;
 extern int s27_probe_l;
@@ -57,10 +58,8 @@ void init27(
     s27_init = true;
 }
 
-int64_t step27(torch::Tensor h, int64_t pos, double theta) {
-    if (!s27_init) throw std::runtime_error("init27 not called");
-    s27_hnorm.clear();
-    s27_layer_h.clear();
+// graph-capture-safe core: no .item(), pos comes from a device scalar
+static void step27_impl(torch::Tensor h, const int* dpos, double theta) {
     auto st = at::cuda::getCurrentCUDAStream();
     int hidden = (int)s27_hidden;
     int inter = (int)s27_inter;
@@ -68,13 +67,13 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
     int GROUP = 16;
     auto f32 = torch::TensorOptions()
         .dtype(torch::kFloat32).device(h.device());
-    static torch::Tensor fn, lg, tok;
+    static torch::Tensor fn, lg;
     static bool init = false;
     if (!init) {
         fn  = torch::empty({hidden}, f32);
         int64_t vocab = s27_lh_i.numel() * 2 / hidden;
         lg  = torch::empty({vocab}, f32);
-        tok = torch::zeros({1}, torch::TensorOptions()
+        s27_tok = torch::zeros({1}, torch::TensorOptions()
             .dtype(torch::kInt64).device(h.device()));
         init = true;
     }
@@ -99,7 +98,7 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
                 h, s27_cb, P,
                 s27_nw1[l], s27_nw2[l],
                 s27_aex[ia * 2], s27_aex[ia * 2 + 1],
-                s27_kv[ia], theta, pos,
+                s27_kv[ia], theta, dpos,
                 24, 4, 256, hidden, inter, s27_ctx);
             ia++;
         } else {
@@ -137,10 +136,40 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta) {
         lg.data_ptr<float>(), (int)vocab, hidden, GROUP, st);
     argmax_f32<<<1, 256, 0, st>>>(
         lg.data_ptr<float>(), (int)vocab,
-        tok.data_ptr<int64_t>());
+        s27_tok.data_ptr<int64_t>());
     s27_lg_out = lg;   // probe (diagnostics)
-    return tok.item<int64_t>();
 }
+
+int64_t step27(torch::Tensor h, int64_t pos, double theta) {
+    if (!s27_init) throw std::runtime_error("init27 not called");
+    s27_hnorm.clear();
+    s27_layer_h.clear();
+    static torch::Tensor dpos_dev;
+    if (!dpos_dev.defined())
+        dpos_dev = torch::zeros({1}, torch::TensorOptions()
+            .dtype(torch::kInt32).device(h.device()));
+    dpos_dev.fill_(pos);
+    step27_impl(h, dpos_dev.data_ptr<int>(), theta);
+    return s27_tok.item<int64_t>();
+}
+
+// graph path: capture-safe (no sync inside); pos read from device at run time
+void step27_g(torch::Tensor h, torch::Tensor dpos, double theta) {
+    if (!s27_init) throw std::runtime_error("init27 not called");
+    step27_impl(h, dpos.data_ptr<int>(), theta);
+}
+
+void s27_reset() {
+    auto st = at::cuda::getCurrentCUDAStream();
+    for (auto& t : s27_convst)
+        cudaMemsetAsync(t.data_ptr(), 0, t.numel() * 4, st);
+    for (auto& t : s27_S)
+        cudaMemsetAsync(t.data_ptr(), 0, t.numel() * 4, st);
+    for (auto& t : s27_kv)
+        cudaMemsetAsync(t.data_ptr(), 0, t.numel() * 2, st);
+}
+
+torch::Tensor s27_get_tok() { return s27_tok; }
 
 torch::Tensor s27_get_lg() { return s27_lg_out.cpu(); }
 

@@ -236,6 +236,24 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   Build/run recipe: vcvars64 + CUDA_HOME/PATH=v12.6 + INCLUDE/LIB=v13.1
   (v12.6 install lacks headers; v13.1 nvcc has the cudafe++ AV;
   v13.4 (installed) nvcc is incompatible with torch cu126).
+- **PERF (2026/10/09 late)**: 10 -> 30.8 tok/s decode in one session.
+  (a) GEMV: the 6-bit decode was ALU-bound (~240GB/s even L2-hot),
+  NOT bandwidth. udcq_gemv_v2 = warp-per-row (8 rows/block, x staged
+  in smem; v1 re-read all of x per row), sign-folded 32-entry
+  codebook (bit=1 -> +cb — per v1 semantics), float4 x, FMA loop:
+  850-937GB/s on big shapes (gate 303->71us, lm_head 3719->1105us,
+  qkv 228->64us). Dispatcher: v2 if out_f*in_f >= 8M else v1.
+  Numeric gate vs torch dequant: rel 4.2e-6. Tools:
+  tests/test_gemv27_bench.py (per-shape + dequant check).
+  (b) CUDA GRAPH (WDDM = torch.cuda.CUDAGraph only): step27 split
+  into capture-safe step27_impl (rope27/cache_write_b/attn_b read
+  pos from a DEVICE scalar pointer; no .item inside) + eager step27
+  wrapper + step27_g(h, dpos, theta); s27_reset() zeros
+  conv/S/kv (multi-call hygiene). Warmup 2x -> reset -> capture ->
+  reset -> replay per token. 36ms eager -> 32ms graph, TOKEN-EXACT
+  vs eager. graph path is default in generate(graph=True).
+  (c) Baselines measured same box: PY udcq-graph 12.2 tok/s;
+  PY udcq-spec refused to load (2GB VRAM guard, desktop).
 - Known polish: generate() does not reset states between calls.
 - All in engine_v5.cu, each with its own gate test, zero exceptions:
   UDCQ gemv/gemm (fp64 1e-7 tier; BUG: pack scale is f16 — kernel

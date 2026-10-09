@@ -22,13 +22,17 @@ void init27(torch::Tensor cb,
     std::vector<int64_t> attn_layers,
     int64_t hidden, int64_t inter, int64_t ctx);
 int64_t step27(torch::Tensor h, int64_t pos, double theta);
+void step27_g(torch::Tensor h, torch::Tensor dpos, double theta);
+void s27_reset();
+torch::Tensor s27_get_tok();
 void s27_set_probe(int64_t l);
 torch::Tensor s27d_get_h1();
 '''
-    return load_inline(name='ixrun_cpp_q27g', cpp_sources=[proto],
+    return load_inline(name='ixrun_cpp_q27k', cpp_sources=[proto],
                        cuda_sources=[src, src27],
-                       functions=['init27', 'step27', 's27_set_probe',
-                                  's27d_get_h1'],
+                       functions=['init27', 'step27', 'step27_g',
+                                  's27_reset', 's27_get_tok',
+                                  's27_set_probe', 's27d_get_h1'],
                        extra_cuda_cflags=['-O3', '--use_fast_math',
                                           '-allow-unsupported-compiler'],
                        verbose=False)
@@ -124,8 +128,47 @@ class CppQwen27bEngine:
                   f'VRAM free {free/1e9:.1f}GB', flush=True)
         return eng
 
-    def generate(self, prompt, max_new_tokens=32):
+    def _graph_generate(self, ids, max_new_tokens):
+        if self._graph is None:
+            self._he_buf = torch.empty(self.hidden, dtype=torch.float32,
+                                       device='cuda')
+            self._dpos = torch.zeros(1, dtype=torch.int32, device='cuda')
+            # warmup (allocations, func attrs) then wipe state
+            for p in (0, 1):
+                self._dpos.fill_(p)
+                self.ext.step27_g(self._he_buf, self._dpos, self.theta)
+            torch.cuda.synchronize()
+            self.ext.s27_reset()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                self.ext.step27_g(self._he_buf, self._dpos, self.theta)
+            self._graph = g
+            print('[cpp-27b] decode graph captured', flush=True)
+        self.ext.s27_reset()
+        torch.cuda.synchronize()
+        toks = []
+        for pos in range(len(ids) + max_new_tokens):
+            t = ids[pos] if pos < len(ids) else (toks[-1] if toks else ids[0])
+            self._he_buf.copy_(self.emb[t].float())
+            self._dpos.fill_(pos)
+            self._graph.replay()
+            nxt = int(self.ext.s27_get_tok().item())
+            if pos >= len(ids) - 1:
+                toks.append(nxt)
+            if pos < 3 or pos % 8 == 0:
+                print(f'  pos {pos} ok tok {nxt}', flush=True)
+        return toks
+
+    def generate(self, prompt, max_new_tokens=32, graph=True):
         ids = self.tok(prompt, return_tensors='pt').input_ids[0].tolist()
+        if graph:
+            try:
+                return self.tok.decode(self._graph_generate(ids, max_new_tokens))
+            except Exception as e:
+                print(f'[graph path failed: {e}] -> eager fallback', flush=True)
+                self._graph = None
+        self.ext.s27_reset()
+        torch.cuda.synchronize()
         toks = []
         he_buf = torch.empty(self.hidden, dtype=torch.float32, device='cuda')
         for pos in range(len(ids) + max_new_tokens):
