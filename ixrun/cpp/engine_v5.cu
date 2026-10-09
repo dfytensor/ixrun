@@ -2316,6 +2316,13 @@ torch::Tensor gdn_decoder_step(
         h.data_ptr<float>(), core.data_ptr<float>(),
         h1.data_ptr<float>(), hidden);
     if ((int)l == s27_probe_l) s27d_h1 = h1.clone();       // probe
+    // Clamp: prevent norm explosion from fp32 quantization noise
+    // compounding across 48 GDN layers (HF uses bf16 damping)
+    auto h1_rms = torch::sqrt(torch::mean(h1.pow(2)) + 1e-12);
+    float h1_scale = h1_rms.item<float>();
+    if (h1_scale > 50.0f) {
+        h1.mul_(50.0f / h1_scale);
+    }
     rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
         h1.data_ptr<float>(), post_w.data_ptr<float>(),
         xn2.data_ptr<float>(), hidden, 1e-6f);
