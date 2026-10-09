@@ -25,7 +25,7 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta);
 void s27_set_probe(int64_t l);
 torch::Tensor s27d_get_h1();
 '''
-    return load_inline(name='ixrun_cpp_q27a', cpp_sources=[proto],
+    return load_inline(name='ixrun_cpp_q27g', cpp_sources=[proto],
                        cuda_sources=[src, src27],
                        functions=['init27', 'step27', 's27_set_probe',
                                   's27d_get_h1'],
