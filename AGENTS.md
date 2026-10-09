@@ -296,6 +296,23 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   Revised law: PY + hand-CUDA kernels + torch.compile reaches
   ~80-95% of the C++ engine; the residual is fused-op depth +
   zero-host-overhead, which is the C++ engine's reason to exist.
+- **COMPILE ROUND + CTX CONFOUND (2026/10/09 late)**: the 1B PY-vs-C++
+  comparison above was DOUBLE-CONFOUNDED (max_ctx 2048-vs-512 + no
+  compile). Fair matrix at ctx=512, min-of-3 differential timing:
+  PY-gsq 258.3 no-compile / **302.9 with torch.compile** vs C++
+  264.9 => PY+compile BEATS the current C++ 1B engine by 14%.
+  (1) attention cost scales ~linearly with max_ctx (StaticCache len)
+  - ALWAYS ctx-match engine comparisons. (2) compile real gain is
+  +8-17% (not +44% - that number had the ctx confound). (3) compile
+  is SAFE on the 1B (Llama-arch StaticCache, text verified coherent)
+  but CORRUPTS the 27B GDN engine (in-place conv/recurrent state
+  mutations get functionalized -> token-repetition degeneration,
+  +6.5% only) => q38_graph compile stays DEFAULT-OFF (Q38_COMPILE=1
+  to experiment); step_graph gsq compiles by DEFAULT
+  (STEP_GRAPH_COMPILE=0 disables; prefill routes through _orig_mod
+  to avoid the long-sequence recompile). Deferred-sync note: the PY
+  loop syncs every 16 tokens vs the C++ per-token .item() - part of
+  the PY edge; C++ could reclaim via device-side token history.
 - Known polish: generate() does not reset states between calls.
 - All in engine_v5.cu, each with its own gate test, zero exceptions:
   UDCQ gemv/gemm (fp64 1e-7 tier; BUG: pack scale is f16 — kernel

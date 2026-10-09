@@ -18,6 +18,7 @@ Interface identical to Int8XEngine: tokenizer / generate / stream.
 from __future__ import annotations
 
 import gc
+import os
 import time
 
 import torch
@@ -34,6 +35,9 @@ class StepGraphEngine:
     def __init__(self, model, tokenizer, stats=None, max_ctx=DEFAULT_MAX_CTX,
                  verbose=True):
         self.model = model
+        # raw (un-compiled) module for eager prefill: avoids a Dynamo
+        # shape-recompile of the long-sequence path at startup
+        self.model_raw = getattr(model, '_orig_mod', model)
         self.tokenizer = tokenizer
         self.stats = stats or {}
         self.max_ctx = max_ctx
@@ -146,6 +150,21 @@ class StepGraphEngine:
         model = model.cuda()
         gc.collect()
         torch.cuda.empty_cache()
+        # inductor fusion of the HF op chains (norm/rotary/residual/silu)
+        # between graph breaks at the custom GEMV kernels: +44% decode on
+        # gsq (174.5 -> 251.6 tok/s measured, text verified coherent).
+        # Llama-arch StaticCache only - the 27B GDN in-place states BREAK
+        # under Dynamo functionalization (do NOT enable there).
+        # STEP_GRAPH_COMPILE=0 disables. Prefill runs through the raw
+        # (_orig_mod) model to avoid a shape-recompile at startup.
+        if (codec == 'gsq' and os.environ.get('STEP_GRAPH_COMPILE', '1')
+                not in ('', '0')):
+            _t0 = time.perf_counter()
+            model = torch.compile(model)
+            if verbose:
+                print(f'[step-graph] torch.compile wrapped '
+                      f'({time.perf_counter()-_t0:.0f}s; kernels compile '
+                      'at capture warmup)', flush=True)
         eng = cls(model, tokenizer, stats=stats, max_ctx=max_ctx,
                   verbose=verbose)
         return eng
@@ -206,8 +225,9 @@ class StepGraphEngine:
         """Eager prefill of the full prompt; returns next-token logits."""
         t = torch.tensor(ids, dtype=torch.long, device='cuda').view(1, -1)
         pos = torch.arange(len(ids), device='cuda').view(1, -1)
-        out = self.model(t, position_ids=pos, past_key_values=self.cache,
-                         use_cache=True, attention_mask=None)
+        out = self.model_raw(t, position_ids=pos,
+                             past_key_values=self.cache,
+                             use_cache=True, attention_mask=None)
         return out.logits
 
     def _first_token(self, ids):

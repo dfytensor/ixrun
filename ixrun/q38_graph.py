@@ -25,6 +25,7 @@ Known hard-won pitfalls baked in (see AGENTS.md):
 from __future__ import annotations
 
 import gc
+import os
 import json
 import time
 
@@ -253,6 +254,23 @@ class Q38GraphEngine:
         # graph output static buffer (pool-aliasing safe)
         self.log1 = torch.zeros(1, 1, m.lm_head.out_features,
                                 dtype=torch.bfloat16, device=dev)
+
+        # optional inductor fusion of the HF op chains. DEFAULT OFF:
+        # on the 27B the GDN layers mutate conv/recurrent states in
+        # place and Dynamo functionalization breaks the state pipeline
+        # (text degenerates to token repetition, measured 2026/10/09);
+        # the +6.5% is not worth it. Q38_COMPILE=1 enables (experiment).
+        if os.environ.get('Q38_COMPILE', '0') not in ('', '0'):
+            _t0 = time.perf_counter()
+            _mode = os.environ.get('Q38_COMPILE_MODE', 'default')
+            self.layers = torch.nn.ModuleList(
+                [torch.compile(l, mode=_mode) for l in self.layers])
+            self.final_norm = torch.compile(self.final_norm)
+            self.model.lm_head = torch.compile(self.model.lm_head)
+            if verbose:
+                print(f'[q38] torch.compile({_mode}) wrapped '
+                      f'{time.perf_counter()-_t0:.0f}s (kernels lazily '
+                      'compiled at warmup)', flush=True)
 
         self._capture(verbose=verbose)
 
