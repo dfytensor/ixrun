@@ -699,6 +699,115 @@ static void udcq_gemv_launch(
         x, idx, sign, scale, cb, y, in_f, group);
 }
 
+// UDCQ GEMV multi-token T=4: weights decoded ONCE per 4 tokens.
+// Same warp-per-row walk + same per-group fmaf sequence as v2 for each
+// token => bit-exact vs 4 separate v2 calls. x read directly as float4
+// from global (L1/L2-hot). Measured 1.65x vs 4xT=1 (smem-chunked variant
+// is SLOWER: 1 blk/SM occupancy loss > L2 savings). Keep for any future
+// speculative path; NOT deployed (T=1 kernel is already near-BW).
+__global__ void udcq_gemv_mt4_kernel(
+    const float* __restrict__ x,      // [4, in_f]
+    const uint8_t* __restrict__ idx,
+    const uint32_t* __restrict__ sign,
+    const __half* __restrict__ scale,
+    const float* __restrict__ cb,
+    float* __restrict__ y,            // [4, out_f]
+    int in_f, int out_f, int GROUP)
+{
+    __shared__ float cb_sm[32];
+    for (int i = threadIdx.x; i < 16; i += blockDim.x) {
+        cb_sm[i] = -cb[i];
+        cb_sm[i + 16] = cb[i];
+    }
+    __syncthreads();
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * (blockDim.x >> 5) + warp;
+    int n_gr = in_f / GROUP;
+    const uint8_t* irow = idx + (size_t)r * (in_f / 2);
+    const __half* srow = scale + (size_t)r * n_gr;
+    const uint32_t* wrow = sign + (size_t)r * (in_f / 32);
+    const float* xp0 = x;
+    const float* xp1 = x + in_f;
+    const float* xp2 = x + 2 * (size_t)in_f;
+    const float* xp3 = x + 3 * (size_t)in_f;
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+    for (int g = lane; g < n_gr; g += 32) {
+        uint2 b2 = *reinterpret_cast<const uint2*>(irow + (size_t)g * 8);
+        uint32_t sw = wrow[g >> 1] >> (16 * (g & 1));
+        float sc = __half2float(srow[g]);
+        const size_t xo = (size_t)g * GROUP;
+        float in0 = 0.f, in1 = 0.f, in2 = 0.f, in3 = 0.f;
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            float4 v0 = *reinterpret_cast<const float4*>(xp0 + xo + 4 * q);
+            float4 v1 = *reinterpret_cast<const float4*>(xp1 + xo + 4 * q);
+            float4 v2 = *reinterpret_cast<const float4*>(xp2 + xo + 4 * q);
+            float4 v3 = *reinterpret_cast<const float4*>(xp3 + xo + 4 * q);
+            uint32_t w = (q < 2) ? b2.x : b2.y;
+            int bo = (q & 1) * 16;
+            int so = q * 4;
+            int b0 = (int)((w >> bo) & 0xFF);
+            int b1 = (int)((w >> (bo + 8)) & 0xFF);
+            float c00 = cb_sm[(b0 & 0xF) | ((int)((sw >> so) & 1u) << 4)];
+            float c01 = cb_sm[(b0 >> 4) | ((int)((sw >> (so + 1)) & 1u) << 4)];
+            float c10 = cb_sm[(b1 & 0xF) | ((int)((sw >> (so + 2)) & 1u) << 4)];
+            float c11 = cb_sm[(b1 >> 4) | ((int)((sw >> (so + 3)) & 1u) << 4)];
+            in0 = fmaf(c00, v0.x, in0); in0 = fmaf(c01, v0.y, in0);
+            in0 = fmaf(c10, v0.z, in0); in0 = fmaf(c11, v0.w, in0);
+            in1 = fmaf(c00, v1.x, in1); in1 = fmaf(c01, v1.y, in1);
+            in1 = fmaf(c10, v1.z, in1); in1 = fmaf(c11, v1.w, in1);
+            in2 = fmaf(c00, v2.x, in2); in2 = fmaf(c01, v2.y, in2);
+            in2 = fmaf(c10, v2.z, in2); in2 = fmaf(c11, v2.w, in2);
+            in3 = fmaf(c00, v3.x, in3); in3 = fmaf(c01, v3.y, in3);
+            in3 = fmaf(c10, v3.z, in3); in3 = fmaf(c11, v3.w, in3);
+        }
+        acc0 += in0 * sc;
+        acc1 += in1 * sc;
+        acc2 += in2 * sc;
+        acc3 += in3 * sc;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc0 += __shfl_down_sync(0xffffffff, acc0, off);
+        acc1 += __shfl_down_sync(0xffffffff, acc1, off);
+        acc2 += __shfl_down_sync(0xffffffff, acc2, off);
+        acc3 += __shfl_down_sync(0xffffffff, acc3, off);
+    }
+    if (lane == 0) {
+        y[r] = acc0;
+        y[(size_t)out_f + r] = acc1;
+        y[(size_t)2 * out_f + r] = acc2;
+        y[(size_t)3 * out_f + r] = acc3;
+    }
+}
+
+static void udcq_gemv_mt4_launch(
+    const float* x, const uint8_t* idx, const uint32_t* sign,
+    const __half* scale, const float* cb, float* y,
+    int out_f, int in_f, int group, cudaStream_t st)
+{
+    udcq_gemv_mt4_kernel<<<(unsigned)((out_f + 7) / 8), 256, 0, st>>>(
+        x, idx, sign, scale, cb, y, in_f, out_f, group);
+}
+
+torch::Tensor udcq_gemv_mt4_out(torch::Tensor x, torch::Tensor idx,
+                                torch::Tensor sign, torch::Tensor scale,
+                                torch::Tensor cb,
+                                int64_t out_f, int64_t in_f,
+                                int64_t group) {
+    auto y = torch::empty({4, out_f}, torch::dtype(torch::kFloat32)
+                                          .device(x.device()));
+    udcq_gemv_mt4_launch(
+        x.data_ptr<float>(), idx.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(sign.data_ptr()),
+        reinterpret_cast<const __half*>(scale.data_ptr()),
+        cb.data_ptr<float>(), y.data_ptr<float>(),
+        (int)out_f, (int)in_f, (int)group,
+        at::cuda::getCurrentCUDAStream());
+    return y;
+}
+
 // UDCQ batched GEMM: [T,in_f] @ W^T -> [T,out_f], same walk as
 // udcq_gemv_kernel per row (bit-exact by construction), grid.y = t.
 __global__ void udcq_gemm_kernel(

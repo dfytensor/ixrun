@@ -254,6 +254,16 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   vs eager. graph path is default in generate(graph=True).
   (c) Baselines measured same box: PY udcq-graph 12.2 tok/s;
   PY udcq-spec refused to load (2GB VRAM guard, desktop).
+- **SPEC-PORT MATH VERDICT (2026/10/09)**: the PY spec engine's 2x
+  gain (25.7 vs 12.2 tok/s measured; 32-53 documented) comes from
+  amortizing a SLOW T=1 kernel (Triton ~234GB/s). Our v2 T=1 is
+  already 815-938GB/s (near DRAM peak) so mt-amortization gains
+  little: udcq_gemv_mt4_kernel (T=4, bit-exact vs 4x v2, x direct
+  float4 reads; smem-chunked variant SLOWER — 1 blk/SM occupancy)
+  measures only 1.3-1.65x per 4 tokens => spec net = LOSS with
+  current kernels. mt4 kept (gated, tests/test_gemv_mt.py) for any
+  future T=8/draft work. PY-spec needs Q38_MIN_FREE_GB=1.2 on a busy
+  desktop (1.5GB captured clean).
 - Known polish: generate() does not reset states between calls.
 - All in engine_v5.cu, each with its own gate test, zero exceptions:
   UDCQ gemv/gemm (fp64 1e-7 tier; BUG: pack scale is f16 — kernel
