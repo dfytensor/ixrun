@@ -350,7 +350,11 @@ __global__ void cast_bf16_f32(const __nv_bfloat16* src,
                               float* dst, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __bfloat162float(src[i]);
+}__global__ void bf16_round_kernel(float* x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = __bfloat162float(__float2bfloat16(x[i]));
 }
+
 __global__ void cast_f32_bf16(const float* src,
                               __nv_bfloat16* dst, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
