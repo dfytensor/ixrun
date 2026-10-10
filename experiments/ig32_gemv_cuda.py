@@ -24,6 +24,7 @@ _CUDA_SRC = r"""
 
 __device__ __constant__ float c_brel[15];
 __device__ __constant__ float c_beta[7];
+__device__ __constant__ float c_tanh[7];
 
 __global__ __launch_bounds__(WARPS * 32) void ig32_gemv_kernel(
     const __nv_bfloat16* __restrict__ x,     // [IN_F]
@@ -107,7 +108,8 @@ __device__ __forceinline__ void ig32_levels_prm(
     float gmx, int prm, float* lv, int nlev)
 {
     bool tanh_f = (prm & 0x80) != 0;
-    float b = c_brel[(prm >> 3) & 0xF] * gmx;
+    float brev = (tanh_f ? c_tanh : c_brel)[(prm >> 3) & 0xF];
+    float b = brev * gmx;
     float beta = c_beta[prm & 7];
     float l2g = __log2f(gmx);
     float gb = exp2f(beta * l2g);
@@ -179,8 +181,10 @@ __global__ __launch_bounds__(WARPS * 32) void ig32p_gemv_kernel(
 }
 
 void install_tables(torch::Tensor brel, torch::Tensor beta) {
+    float tanhb[7] = {0.25f, 0.4f, 0.6f, 0.85f, 1.2f, 1.8f, 3.0f};
     cudaMemcpyToSymbol(c_brel, brel.data_ptr<float>(), 15 * sizeof(float));
     cudaMemcpyToSymbol(c_beta, beta.data_ptr<float>(), 7 * sizeof(float));
+    cudaMemcpyToSymbol(c_tanh, tanhb, 7 * sizeof(float));
 }
 
 torch::Tensor get_tables() {
