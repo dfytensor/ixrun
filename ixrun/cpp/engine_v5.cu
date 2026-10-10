@@ -2103,6 +2103,75 @@ __global__ void rope27_t_kernel(float* __restrict__ q, float* __restrict__ k,
     }
 }
 
+// T-token GDN recurrence with the state slice pinned in SMEM across all
+// tokens. The per-token kernel re-reads and rewrites the whole [dk,dv]
+// state from DRAM every step (6.3MB per layer-token => 77GB per 256-token
+// segment, the segment's largest single cost); here the state never leaves
+// the SM. Thread layout, accumulation order and reduction tree are IDENTICAL
+// to gdn_recurrent_v2_kernel => same values (up to fp32 reorder noise).
+__global__ void gdn_recurrent_v2t_kernel(
+    const float* __restrict__ q,      // [T, nv, dk]
+    const float* __restrict__ k,
+    const float* __restrict__ v,      // [T, nv, dv]
+    const float* __restrict__ g,      // [T, nv]
+    const float* __restrict__ beta,   // [T, nv]
+    float* __restrict__ S,            // [nv, dk, dv]
+    float* __restrict__ out,          // [T, nv, dv]
+    int T, int dk, int dv)
+{
+    int h = blockIdx.x;
+    int j0 = blockIdx.y * 32;
+    int s = threadIdx.x >> 5;          // i-chunk 0..3
+    int jl = threadIdx.x & 31;
+    int j = j0 + jl;
+    int nv = gridDim.x;
+    extern __shared__ float s_sm[];    // [dk][32] state slice
+    float* Sh = S + (long long)h * dk * dv;
+    int i0 = s * (dk / 4);
+    int i1 = i0 + dk / 4;
+    for (int i = i0; i < i1; ++i)
+        s_sm[i * 32 + jl] = Sh[(long long)i * dv + j];
+    __syncthreads();
+    __shared__ float red[4][32];
+    __shared__ float dvs[32];
+    for (int t = 0; t < T; ++t) {
+        const float* kh = k + ((size_t)t * nv + h) * dk;
+        const float* qh = q + ((size_t)t * nv + h) * dk;
+        float gt = (float)exp((double)g[(size_t)t * nv + h]);
+        float bt = beta[(size_t)t * nv + h];
+        float part = 0.f;
+        for (int i = i0; i < i1; ++i) {
+            float* sp = &s_sm[i * 32 + jl];
+            float sv = *sp * gt;
+            *sp = sv;
+            part += sv * kh[i];
+        }
+        red[s][jl] = part;
+        __syncthreads();
+        if (s == 0) {
+            float kv = (red[0][jl] + red[1][jl]) + (red[2][jl] + red[3][jl]);
+            dvs[jl] = (v[((size_t)t * nv + h) * dv + j] - kv) * bt;
+        }
+        __syncthreads();
+        float delta = dvs[jl];
+        float po = 0.f;
+        for (int i = i0; i < i1; ++i) {
+            float* sp = &s_sm[i * 32 + jl];
+            float sv = *sp + kh[i] * delta;
+            *sp = sv;
+            po += sv * qh[i];
+        }
+        red[s][jl] = po;
+        __syncthreads();
+        if (s == 0)
+            out[((size_t)t * nv + h) * dv + j] =
+                (red[0][jl] + red[1][jl]) + (red[2][jl] + red[3][jl]);
+        __syncthreads();               // red/dvs reuse next token
+    }
+    for (int i = i0; i < i1; ++i)
+        Sh[(long long)i * dv + j] = s_sm[i * 32 + jl];
+}
+
 // batched GDN core (same math as T per-token gdn_core_from_proj calls)
 static void gdn_core_batch(
     const float* qkvT, const float* zT, const float* boT, const float* aoT,
@@ -2155,16 +2224,11 @@ static void gdn_core_batch(
     ggate_b_kernel<<<(unsigned)((T * nv + 255) / 256), 256, 0, st>>>(
         aoT, A_log.data_ptr<float>(), dt_bias.data_ptr<float>(),
         gvecT.data_ptr<float>(), T, nv);
-    for (int t = 0; t < T; ++t)
-        gdn_recurrent_v2_kernel<<<dim3((unsigned)nv, (unsigned)(dv / 32)),
-                                  128, 0, st>>>(
-            qhT.data_ptr<float>() + (size_t)t * nv * dk,
-            khT.data_ptr<float>() + (size_t)t * nv * dk,
-            vrT.data_ptr<float>() + (size_t)t * nv * dv,
-            gvecT.data_ptr<float>() + (size_t)t * nv,
-            betaT.data_ptr<float>() + (size_t)t * nv,
-            S.data_ptr<float>(),
-            oT2.data_ptr<float>() + (size_t)t * nv * dv, dk, dv);
+    gdn_recurrent_v2t_kernel<<<dim3((unsigned)nv, (unsigned)(dv / 32)), 128,
+                               (size_t)dk * 32 * sizeof(float), st>>>(
+        qhT.data_ptr<float>(), khT.data_ptr<float>(), vrT.data_ptr<float>(),
+        gvecT.data_ptr<float>(), betaT.data_ptr<float>(), S.data_ptr<float>(),
+        oT2.data_ptr<float>(), T, dk, dv);
     gated_rmsnorm_kernel<<<(unsigned)(T * nv), 256, 0, st>>>(
         oT2.data_ptr<float>(), zrT.data_ptr<float>(),
         norm_w.data_ptr<float>(), onT, dv, 1e-6f);
