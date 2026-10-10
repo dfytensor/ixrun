@@ -1228,6 +1228,42 @@ torch::Tensor rmsnorm_fw_out(torch::Tensor x2d, torch::Tensor w,
     return y;
 }
 
+// fused residual add + rms-norm in ONE launch:
+//   y_add = a + b;  y_norm = w * y_add * rsqrt(mean(y_add^2) + eps)
+// Same per-thread accumulation order as add_f32 + rmsnorm_fw_kernel (thread i
+// walks i, i+256, ...), so the pair is bit-identical to the two-kernel
+// sequence. Replaces 2 launches/layer x 2 with 1 (norm calls were 4.2% of
+// step time at 7.4us/call, pure launch overhead for d=5120).
+__global__ void add_norm_f32(const float* __restrict__ a,
+                             const float* __restrict__ b,
+                             const float* __restrict__ w,
+                             float* __restrict__ y_add,
+                             float* __restrict__ y_norm,
+                             int d, float eps) {
+    __shared__ float red[32];
+    float sq = 0.f;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float v = a[i] + b[i];
+        y_add[i] = v;
+        sq += v * v;
+    }
+    if (threadIdx.x < 32) red[threadIdx.x] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        sq += __shfl_down_sync(0xffffffff, sq, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sq;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int k = 0; k < (int)(blockDim.x >> 5); ++k) t += red[k];
+        red[0] = __frsqrt_rn(t / (float)d + eps);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < d; i += blockDim.x)
+        y_norm[i] = w[i] * y_add[i] * red[0];
+}
+
 // ---------------- Stage 4 step 3a: GDN layer step --------------------- //
 __global__ void gdn_recurrent_kernel(
     const float* __restrict__ q, const float* __restrict__ k,
@@ -2705,9 +2741,11 @@ static torch::Tensor g_input;   // static input buffer (address baked in graph)
 
 
 // ---------------- Stage 4 step 4: full GDN decoder layer -------------- //
-// Wraps the gated gdn_layer_step CORE with decoder semantics:
-// h1 = h + core(rmsnorm(h, in_w)); out = h1 + mlp(rmsnorm(h1, post_w))
-// All pieces already gated individually. conv_state/S updated in place.
+// Decoder semantics with fused add+norm (ONE add_norm_f32 launch each):
+//   core = gdn_core(xn);  h1,xn2 = add_norm(h, core, post_w)
+//   out,xn_next = add_norm(h1, mlp(xn2), in_w_next)
+// xn is the ALREADY-NORMED input (produced by the previous layer's final
+// add_norm, or primed by step27 for layer 0). conv_state/S update in place.
 // packs: 24 tensors = qkv(3),z(3),b(3),a(3),o(3),g(3),u(3),d(3)
 static torch::Tensor s27d_xn;   // diagnostics probe (file scope)
 static torch::Tensor s27d_xn2;  // probe: MLP input (post-norm)
@@ -2715,10 +2753,10 @@ static torch::Tensor s27d_core; // probe: gdn core output
 static torch::Tensor s27d_h1;   // probe: residual h + core
 int s27_probe_l = -1;           // probe (defined here)
 torch::Tensor s27_h_out;
-torch::Tensor gdn_decoder_step(
-    torch::Tensor h, torch::Tensor cb,
+std::vector<torch::Tensor> gdn_decoder_step(
+    torch::Tensor h, torch::Tensor xn, torch::Tensor cb,
     std::vector<torch::Tensor> PK,
-    torch::Tensor in_w, torch::Tensor post_w,
+    torch::Tensor post_w, torch::Tensor in_w_next,
     torch::Tensor conv_w, torch::Tensor conv_b,
     torch::Tensor A_log, torch::Tensor dt_bias,
     torch::Tensor gnorm_w,
@@ -2738,18 +2776,15 @@ torch::Tensor gdn_decoder_step(
     int hidden = (int)h.numel();
     auto f32 = torch::TensorOptions()
         .dtype(torch::kFloat32).device(h.device());
-    static torch::Tensor xn, h1, xn2, out;
+    static torch::Tensor h1, xn2, out, xn_out;
     static bool init = false;
     if (!init) {
-        xn  = torch::empty({hidden}, f32);
         h1  = torch::empty({hidden}, f32);
         xn2 = torch::empty({hidden}, f32);
         out = torch::empty({hidden}, f32);
+        xn_out = torch::empty({hidden}, f32);
         init = true;
     }
-    rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
-        h.data_ptr<float>(), in_w.data_ptr<float>(),
-        xn.data_ptr<float>(), hidden, 1e-6f);
     if ((int)l == s27_probe_l) s27d_xn = xn.clone();   // probe
     torch::Tensor core = gdn_layer_step(
         xn.view({-1}), cb,
@@ -2759,13 +2794,11 @@ torch::Tensor gdn_decoder_step(
         conv_w, conv_b, A_log, dt_bias, gnorm_w,
         conv_state, S, nv, nk, dk, dv, l);
     if ((int)l == s27_probe_l) s27d_core = core.clone();   // probe
-    add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
+    add_norm_f32<<<1, 1024, 0, st>>>(
         h.data_ptr<float>(), core.data_ptr<float>(),
-        h1.data_ptr<float>(), hidden);
-    if ((int)l == s27_probe_l) s27d_h1 = h1.clone();       // probe
-    rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
-        h1.data_ptr<float>(), post_w.data_ptr<float>(),
+        post_w.data_ptr<float>(), h1.data_ptr<float>(),
         xn2.data_ptr<float>(), hidden, 1e-6f);
+    if ((int)l == s27_probe_l) s27d_h1 = h1.clone();       // probe
     if ((int)l == s27_probe_l) s27d_xn2 = xn2.clone(); // probe
     // mlp (inter passed explicitly; shapes from checkpoint)
     torch::Tensor mg = udcq_gemv_out(
@@ -2778,10 +2811,11 @@ torch::Tensor gdn_decoder_step(
         act.data_ptr<float>(), (int)inter);
     torch::Tensor md = udcq_gemv_out(
         act, dd_i, dd_s, dd_sc, cb, hidden, 17408, 16);
-    add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
+    add_norm_f32<<<1, 1024, 0, st>>>(
         h1.data_ptr<float>(), md.data_ptr<float>(),
-        out.data_ptr<float>(), hidden);
-    return out;
+        in_w_next.data_ptr<float>(), out.data_ptr<float>(),
+        xn_out.data_ptr<float>(), hidden, 1e-6f);
+    return {out, xn_out};
 }
 
 torch::Tensor s27d_get_xn() { return s27d_xn.cpu(); }
@@ -2811,13 +2845,15 @@ __global__ void sigmoid_mul_kernel(float* y, const float* g,
 }
 
 // ---------------- Stage 4 step 3b: full-attn layer step ---------------- //
+// Fused add+norm decoder semantics (xn input pre-normed by the previous
+// layer's final add_norm; this layer's final add_norm emits xn_next).
 // packs: 21 tensors = q(3),k(3),v(3),o(3),g(3),u(3),d(3) idx/sign/scale
-// (long explicit arg lists trigger a cudafe++ frontend AV at call sites)
-torch::Tensor attn_layer_step(
-    torch::Tensor h,                    // [5120] fp32 in/out value
+std::vector<torch::Tensor> attn_layer_step(
+    torch::Tensor h,                    // [5120] fp32 residual stream
+    torch::Tensor xn,                   // [5120] fp32 normed layer input
     torch::Tensor cb,
     std::vector<torch::Tensor> PK,
-    torch::Tensor in_w, torch::Tensor post_w,
+    torch::Tensor post_w, torch::Tensor in_w_next,
     torch::Tensor q_norm_w, torch::Tensor k_norm_w,
     torch::Tensor kv_cache,             // [8, ctx, 256] bf16
     double theta, const int* dpos,
@@ -2835,11 +2871,10 @@ torch::Tensor attn_layer_step(
     int GROUP = 16;
     auto f32 = torch::TensorOptions()
         .dtype(torch::kFloat32).device(h.device());
-    static torch::Tensor xn, q2, gt, k2, v2, qh, kh, o2, att, o,
-                        h1, xn2, mg, mu, act, md, out;
+    static torch::Tensor q2, gt, k2, v2, qh, kh, o2, att, o,
+                        h1, xn2, mg, mu, act, md, out, xn_out;
     static bool init = false;
     if (!init) {
-        xn  = torch::empty({1, hidden}, f32);
         q2  = torch::empty({nh * hd * 2}, f32);
         gt  = torch::empty({nh * hd}, f32);
         k2  = torch::empty({1, nkv * hd}, f32);
@@ -2850,17 +2885,15 @@ torch::Tensor attn_layer_step(
         att = torch::empty({1, nh * hd}, f32);
         o   = torch::empty({hidden}, f32);
         h1  = torch::empty({hidden}, f32);
-        xn2 = torch::empty({1, hidden}, f32);
+        xn2 = torch::empty({hidden}, f32);
         mg  = torch::empty({inter}, f32);
         mu  = torch::empty({inter}, f32);
         act = torch::empty({inter}, f32);
         md  = torch::empty({hidden}, f32);
         out = torch::empty({hidden}, f32);
+        xn_out = torch::empty({hidden}, f32);
         init = true;
     }
-    rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
-        h.data_ptr<float>(), in_w.data_ptr<float>(),
-        xn.data_ptr<float>(), hidden, 1e-6f);
     udcq_gemv_launch(
         xn.data_ptr<float>(), q_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(q_s.data_ptr()),
@@ -2911,11 +2944,9 @@ torch::Tensor attn_layer_step(
         reinterpret_cast<const uint32_t*>(o_s.data_ptr()),
         reinterpret_cast<const __half*>(o_sc.data_ptr()), cb.data_ptr<float>(),
         o.data_ptr<float>(), hidden, nh * hd, GROUP, st);
-    add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
+    add_norm_f32<<<1, 1024, 0, st>>>(
         h.data_ptr<float>(), o.data_ptr<float>(),
-        h1.data_ptr<float>(), hidden);
-    rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
-        h1.data_ptr<float>(), post_w.data_ptr<float>(),
+        post_w.data_ptr<float>(), h1.data_ptr<float>(),
         xn2.data_ptr<float>(), hidden, 1e-6f);
     udcq_gemv_launch(
         xn2.data_ptr<float>(), g_i.data_ptr<uint8_t>(),
@@ -2935,8 +2966,9 @@ torch::Tensor attn_layer_step(
         reinterpret_cast<const uint32_t*>(d_s.data_ptr()),
         reinterpret_cast<const __half*>(d_sc.data_ptr()), cb.data_ptr<float>(),
         md.data_ptr<float>(), hidden, inter, GROUP, st);
-    add_f32<<<(hidden + 255) / 256, 256, 0, st>>>(
+    add_norm_f32<<<1, 1024, 0, st>>>(
         h1.data_ptr<float>(), md.data_ptr<float>(),
-        out.data_ptr<float>(), hidden);
-    return out;
+        in_w_next.data_ptr<float>(), out.data_ptr<float>(),
+        xn_out.data_ptr<float>(), hidden, 1e-6f);
+    return {out, xn_out};
 }

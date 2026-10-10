@@ -67,10 +67,11 @@ static void step27_impl(torch::Tensor h, const int* dpos, double theta) {
     int GROUP = 16;
     auto f32 = torch::TensorOptions()
         .dtype(torch::kFloat32).device(h.device());
-    static torch::Tensor fn, lg;
+    static torch::Tensor fn, lg, xn0;
     static bool init = false;
     if (!init) {
         fn  = torch::empty({hidden}, f32);
+        xn0 = torch::empty({hidden}, f32);
         int64_t vocab = s27_lh_i.numel() * 2 / hidden;
         lg  = torch::empty({vocab}, f32);
         s27_tok = torch::zeros({1}, torch::TensorOptions()
@@ -81,12 +82,18 @@ static void step27_impl(torch::Tensor h, const int* dpos, double theta) {
         int k = (l * 8 + s) * 3;
         return {s27_packs[k], s27_packs[k + 1], s27_packs[k + 2]};
     };
+    // prime layer 0's normed input; every layer's final add_norm emits the
+    // next layer's xn (last layer uses fnw) -- no separate in_norm calls.
+    rmsnorm_fw_kernel<<<1, 1024, 0, st>>>(
+        h.data_ptr<float>(), s27_nw1[0].data_ptr<float>(),
+        xn0.data_ptr<float>(), hidden, 1e-6f);
+    torch::Tensor xn = xn0;
     int ig = 0, ia = 0;
     for (int l = 0; l < nl; ++l) {
         bool is_attn = false;
         for (int64_t a : s27_attn_layers)
             if (a == l) { is_attn = true; break; }
-        torch::Tensor hcur;
+        torch::Tensor next_w = (l + 1 < nl) ? s27_nw1[l + 1] : s27_fnw;
         if (is_attn) {
             std::vector<torch::Tensor> P;
             for (int s = 0; s < 7; ++s) {
@@ -94,12 +101,13 @@ static void step27_impl(torch::Tensor h, const int* dpos, double theta) {
                 P.push_back(t3[0]); P.push_back(t3[1]);
                 P.push_back(t3[2]);
             }
-            hcur = attn_layer_step(
-                h, s27_cb, P,
-                s27_nw1[l], s27_nw2[l],
+            auto res = attn_layer_step(
+                h, xn, s27_cb, P,
+                s27_nw2[l], next_w,
                 s27_aex[ia * 2], s27_aex[ia * 2 + 1],
                 s27_kv[ia], theta, dpos,
                 24, 4, 256, hidden, inter, s27_ctx);
+            h = res[0]; xn = res[1];
             ia++;
         } else {
             std::vector<torch::Tensor> P;
@@ -108,28 +116,27 @@ static void step27_impl(torch::Tensor h, const int* dpos, double theta) {
                 P.push_back(t3[0]); P.push_back(t3[1]);
                 P.push_back(t3[2]);
             }
-            hcur = gdn_decoder_step(
-                h, s27_cb, P,
-                s27_nw1[l], s27_nw2[l],
+            auto res = gdn_decoder_step(
+                h, xn, s27_cb, P,
+                s27_nw2[l], next_w,
                 s27_gex[ig * 4], s27_gex[ig * 4 + 1],
                 s27_gex[ig * 4 + 2], s27_gex[ig * 4 + 3],
                 s27_gnorm[ig], s27_convst[ig], s27_S[ig],
                 48, 16, 128, 128, inter, l);
+            h = res[0]; xn = res[1];
             ig++;
         }
-        h = hcur;
         if (s27_probe_l >= 0) {   // diagnostics only (no syncs in hot path)
-            torch::Tensor hn = hcur.norm();
+            torch::Tensor hn = h.norm();
             s27_hnorm.push_back(hn.item<float>());
-            if ((int)l == s27_probe_l) s27_h_out = hcur.clone();
+            if ((int)l == s27_probe_l) s27_h_out = h.clone();
         }
     }
-    rmsnorm_fw_kernel<<<1, 256, 0, st>>>(
-        h.data_ptr<float>(), s27_fnw.data_ptr<float>(),
-        fn.data_ptr<float>(), hidden, 1e-6f);
+    // xn now holds norm(h_final, fnw) -- written by the last layer's
+    // add_norm (in_w_next = fnw); feed it straight to lm_head.
     int64_t vocab = s27_lh_i.numel() * 2 / hidden;
     udcq_gemv_launch(
-        fn.data_ptr<float>(), s27_lh_i.data_ptr<uint8_t>(),
+        xn.data_ptr<float>(), s27_lh_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(s27_lh_s.data_ptr()),
         reinterpret_cast<const __half*>(s27_lh_sc.data_ptr()),
         s27_cb.data_ptr<float>(),

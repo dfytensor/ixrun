@@ -7,6 +7,22 @@ from torch.utils.cpp_extension import load_inline
 _DIR = os.path.dirname(__file__)
 
 def _build_ext():
+    name = 'ixrun_cpp_q27m'
+    if os.environ.get('IXRUN_PREBUILT', '') not in ('', '0'):
+        # workaround: cudafe++ AVs when nvcc is spawned from the python
+        # process tree (flaky, source-independent); build via
+        # tests/build_27b_ext.cmd (regen cuda.cu from python, then ninja
+        # from cmd) and load the prebuilt .pyd directly.
+        import importlib, sys
+        from torch.utils.cpp_extension import _get_build_directory
+        bd = _get_build_directory(name, False)
+        sys.path.insert(0, bd)
+        m = importlib.import_module(name)
+        pyd = os.path.join(bd, name + ('.pyd' if os.name == 'nt' else '.so'))
+        print(f'[cpp-27b] IXRUN_PREBUILT: {pyd} '
+              f'({time.strftime("%H:%M:%S", time.localtime(os.path.getmtime(pyd)))})',
+              flush=True)
+        return m
     src = open(os.path.join(_DIR, 'cpp', 'engine_v5.cu'), encoding='utf-8').read()
     src27 = open(os.path.join(_DIR, 'cpp', 'engine_27b.cu'), encoding='utf-8').read()
     proto = '''
@@ -33,7 +49,7 @@ torch::Tensor s27_get_tok();
 void s27_set_probe(int64_t l);
 torch::Tensor s27d_get_h1();
 '''
-    return load_inline(name='ixrun_cpp_q27l', cpp_sources=[proto],
+    return load_inline(name='ixrun_cpp_q27m', cpp_sources=[proto],
                        cuda_sources=[src, src27],
                        functions=['init27', 'step27', 'step27_g',
                                   's27_reset', 's27_get_tok',
