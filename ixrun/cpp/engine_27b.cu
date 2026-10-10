@@ -106,7 +106,7 @@ static void step27_impl(torch::Tensor h, const int* dpos, double theta) {
                 s27_nw2[l], next_w,
                 s27_aex[ia * 2], s27_aex[ia * 2 + 1],
                 s27_kv[ia], theta, dpos,
-                24, 4, 256, hidden, inter, s27_ctx);
+                24, 4, 256, hidden, inter, s27_ctx, l);
             h = res[0]; xn = res[1];
             ia++;
         } else {

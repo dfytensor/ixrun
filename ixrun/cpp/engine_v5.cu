@@ -960,6 +960,156 @@ static void udcq_gemv_dual_launch(
             x, i0, s0, sc0, i1, s1, sc1, cb, y0, y1, in_f, out_f, group);
 }
 
+// multi-pack GEMV: ONE launch covers several packs that share x (qkv+z+b+a
+// in GDN layers; q+k+v and gate+up in attn layers). grid.x covers
+// ceil(sum(out_f)/8) blocks; each warp locates its pack with a short linear
+// scan over out_tab (npack <= 8). The per-pack walk is IDENTICAL to
+// udcq_gemv_v2_kernel, so every output is bit-equal to the separate calls
+// it replaces (the launch/dual-call overhead is what gets saved).
+// tables layout per slot (288B): 8x ptr64 idx @0, 8x ptr64 sign @64,
+// 8x ptr64 sc @128, 8x ptr64 y @192, 8x i32 out_f @256.
+template <bool ULS>
+__global__ void udcq_gemv_multi_kernel(
+    const float* __restrict__ x,
+    const uint8_t* const* __restrict__ idx_tab,
+    const uint32_t* const* __restrict__ sign_tab,
+    const __half* const* __restrict__ sc_tab,
+    float* const* __restrict__ y_tab,
+    const int* __restrict__ out_tab,
+    const float* __restrict__ cb,
+    int npack, int in_f, int GROUP)
+{
+    extern __shared__ float smem[];
+    float* x_sm = smem;              // in_f floats
+    float* cb_sm = smem + in_f;      // 32 floats: [0..15]=cb, [16..31]=-cb
+    for (int i = threadIdx.x; i < 16; i += blockDim.x) {
+        cb_sm[i] = -cb[i];
+        cb_sm[i + 16] = cb[i];
+    }
+    for (int i = threadIdx.x; i < in_f; i += blockDim.x) x_sm[i] = x[i];
+    __syncthreads();
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r_g = blockIdx.x * (blockDim.x >> 5) + warp;
+    int total = 0;
+    for (int p = 0; p < npack; ++p) total += out_tab[p];
+    if (r_g >= total) return;
+    int p = 0, rem = r_g;
+    while (rem >= out_tab[p]) { rem -= out_tab[p]; ++p; }
+    int n_gr = in_f / GROUP;
+    const uint8_t* irow = idx_tab[p] + (size_t)rem * (in_f / 2);
+    const uint32_t* wrow = sign_tab[p] + (size_t)rem * (in_f / 32);
+    const __half* srow = sc_tab[p] + (size_t)rem * n_gr;
+    const uint8_t* urow = reinterpret_cast<const uint8_t*>(sc_tab[p])
+                          + (size_t)rem * (size_t)(n_gr + 8);
+    float sbase = 0.f, sstep = 0.f;
+    if (ULS) {
+        sbase = *reinterpret_cast<const float*>(urow);
+        sstep = *reinterpret_cast<const float*>(urow + 4);
+    }
+    float acc = 0.f;
+    for (int g = lane; g < n_gr; g += 32) {
+        uint2 b2 = *reinterpret_cast<const uint2*>(irow + (size_t)g * 8);
+        uint32_t sw = wrow[g >> 1] >> (16 * (g & 1));
+        float sc = ULS ? exp2f(sbase + sstep * (float)urow[8 + g])
+                       : __half2float(srow[g]);
+        const float* xs = x_sm + (size_t)g * GROUP;
+        float xr[16];
+        #pragma unroll
+        for (int q = 0; q < 4; ++q)
+            *reinterpret_cast<float4*>(&xr[q * 4]) =
+                *reinterpret_cast<const float4*>(xs + q * 4);
+        float inner = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int b = (int)((b2.x >> (8 * i)) & 0xFF);
+            int s0 = (int)((sw >> (2 * i)) & 1u) << 4;
+            int s1 = (int)((sw >> (2 * i + 1)) & 1u) << 4;
+            inner = fmaf(cb_sm[(b & 0xF) | s0], xr[2 * i], inner);
+            inner = fmaf(cb_sm[(b >> 4) | s1], xr[2 * i + 1], inner);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int b = (int)((b2.y >> (8 * i)) & 0xFF);
+            int s0 = (int)((sw >> (8 + 2 * i)) & 1u) << 4;
+            int s1 = (int)((sw >> (8 + 2 * i + 1)) & 1u) << 4;
+            inner = fmaf(cb_sm[(b & 0xF) | s0], xr[8 + 2 * i], inner);
+            inner = fmaf(cb_sm[(b >> 4) | s1], xr[8 + 2 * i + 1], inner);
+        }
+        acc += inner * sc;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) y_tab[p][rem] = acc;
+}
+
+// per-layer pack tables (built lazily on first call, before graph capture).
+// Slot map: l*2+0 = input-projection group, l*2+1 = gate/up group.
+static torch::Tensor g_mt_tables;   // [128, 288] uint8
+static bool g_mt_ready[128] = {false};
+static const int MT_SLOT = 288;
+
+static void mt_build_table(int slot, cudaStream_t st,
+                           const void* idx[], const void* sg[],
+                           const void* sc[], const void* y[],
+                           const int out[], int npack) {
+    if (!g_mt_tables.defined())
+        g_mt_tables = torch::zeros({128, MT_SLOT}, torch::TensorOptions()
+            .dtype(torch::kUInt8).device(torch::kCUDA));
+    uint8_t host[MT_SLOT] = {0};
+    for (int i = 0; i < npack; ++i) {
+        reinterpret_cast<const void**>(host)[i] = idx[i];
+        reinterpret_cast<const void**>(host + 64)[i] = sg[i];
+        reinterpret_cast<const void**>(host + 128)[i] = sc[i];
+        reinterpret_cast<const void**>(host + 192)[i] = y[i];
+        reinterpret_cast<int*>(host + 256)[i] = out[i];
+    }
+    // SYNC copy: host[] is stack memory; an async H2D would read it after
+    // the frame is gone (pinned-buffer race class).
+    cudaMemcpy(g_mt_tables.data_ptr<uint8_t>() + (size_t)slot * MT_SLOT,
+               host, MT_SLOT, cudaMemcpyHostToDevice);
+    g_mt_ready[slot] = true;
+}
+
+static void mt_gemv_launch(const float* x, const float* cb, int l,
+                           int total, int npack, int in_f, int group,
+                           cudaStream_t st) {
+    static int max_sm = -1;
+    if (max_sm < 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&max_sm,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        if (max_sm > 0) {
+            cudaFuncSetAttribute(udcq_gemv_multi_kernel<false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, max_sm);
+            cudaFuncSetAttribute(udcq_gemv_multi_kernel<true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, max_sm);
+        }
+    }
+    const uint8_t* base = g_mt_tables.data_ptr<uint8_t>() + (size_t)l * MT_SLOT;
+    const uint8_t* const* idx_tab =
+        reinterpret_cast<const uint8_t* const*>(base);
+    const uint32_t* const* sign_tab =
+        reinterpret_cast<const uint32_t* const*>(base + 64);
+    const __half* const* sc_tab =
+        reinterpret_cast<const __half* const*>(base + 128);
+    float* const* y_tab = reinterpret_cast<float* const*>(base + 192);
+    const int* out_tab = reinterpret_cast<const int*>(base + 256);
+    size_t sm = (size_t)in_f * sizeof(float) + 32 * sizeof(float);
+    int wpb = (in_f > 12288) ? 16 : 8;
+    int grid = (total + wpb - 1) / wpb;
+    if (g_uls)
+        udcq_gemv_multi_kernel<true><<<grid, wpb * 32, sm, st>>>(
+            x, idx_tab, sign_tab, sc_tab, y_tab, out_tab, cb,
+            npack, in_f, group);
+    else
+        udcq_gemv_multi_kernel<false><<<grid, wpb * 32, sm, st>>>(
+            x, idx_tab, sign_tab, sc_tab, y_tab, out_tab, cb,
+            npack, in_f, group);
+}
+
 // UDCQ batched GEMM: [T,in_f] @ W^T -> [T,out_f], same walk as
 // udcq_gemv_kernel per row (bit-exact by construction), grid.y = t.
 template <bool ULS>
@@ -1348,27 +1498,22 @@ torch::Tensor gdn_layer_step(
         init = true;
     }
 
-    udcq_gemv_launch(
-        h.data_ptr<float>(), qkv_i.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint32_t*>(qkv_s.data_ptr()),
-        reinterpret_cast<const __half*>(qkv_sc.data_ptr()), cb.data_ptr<float>(),
-        qkv.data_ptr<float>(), conv_dim, hidden, GROUP, st);
-    udcq_gemv_launch(
-        h.data_ptr<float>(), z_i.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint32_t*>(z_s.data_ptr()),
-        reinterpret_cast<const __half*>(z_sc.data_ptr()), cb.data_ptr<float>(),
-        z.data_ptr<float>(), value_dim, hidden, GROUP, st);
-    udcq_gemv_dual_launch(
-        h.data_ptr<float>(),
-        b_i.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint32_t*>(b_s.data_ptr()),
-        reinterpret_cast<const __half*>(b_sc.data_ptr()),
-        a_i.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint32_t*>(a_s.data_ptr()),
-        reinterpret_cast<const __half*>(a_sc.data_ptr()),
-        cb.data_ptr<float>(),
-        bo.data_ptr<float>(), ao.data_ptr<float>(),
-        nv, hidden, GROUP, st);
+    // input projections share h: qkv+z+b+a in ONE multi-pack launch
+    int mslot = (int)l * 2;
+    if (!g_mt_ready[mslot]) {
+        const void* ii[4] = {qkv_i.data_ptr(), z_i.data_ptr(),
+                             b_i.data_ptr(), a_i.data_ptr()};
+        const void* ss[4] = {qkv_s.data_ptr(), z_s.data_ptr(),
+                             b_s.data_ptr(), a_s.data_ptr()};
+        const void* cc[4] = {qkv_sc.data_ptr(), z_sc.data_ptr(),
+                             b_sc.data_ptr(), a_sc.data_ptr()};
+        const void* yy[4] = {qkv.data_ptr(), z.data_ptr(),
+                             bo.data_ptr(), ao.data_ptr()};
+        int oo[4] = {conv_dim, value_dim, (int)nv, (int)nv};
+        mt_build_table(mslot, st, ii, ss, cc, yy, oo, 4);
+    }
+    mt_gemv_launch(h.data_ptr<float>(), cb.data_ptr<float>(), mslot,
+                   conv_dim + value_dim + 2 * (int)nv, 4, hidden, GROUP, st);
 
     conv1d_update_kernel<<<(conv_dim + 255) / 256, 256, 0, st>>>(
         qkv.data_ptr<float>(), conv_state.data_ptr<float>(),
@@ -2776,13 +2921,16 @@ std::vector<torch::Tensor> gdn_decoder_step(
     int hidden = (int)h.numel();
     auto f32 = torch::TensorOptions()
         .dtype(torch::kFloat32).device(h.device());
-    static torch::Tensor h1, xn2, out, xn_out;
+    static torch::Tensor h1, xn2, out, xn_out, mgs, mus, acts;
     static bool init = false;
     if (!init) {
         h1  = torch::empty({hidden}, f32);
         xn2 = torch::empty({hidden}, f32);
         out = torch::empty({hidden}, f32);
         xn_out = torch::empty({hidden}, f32);
+        mgs = torch::empty({inter}, f32);
+        mus = torch::empty({inter}, f32);
+        acts = torch::empty({inter}, f32);
         init = true;
     }
     if ((int)l == s27_probe_l) s27d_xn = xn.clone();   // probe
@@ -2800,17 +2948,23 @@ std::vector<torch::Tensor> gdn_decoder_step(
         xn2.data_ptr<float>(), hidden, 1e-6f);
     if ((int)l == s27_probe_l) s27d_h1 = h1.clone();       // probe
     if ((int)l == s27_probe_l) s27d_xn2 = xn2.clone(); // probe
-    // mlp (inter passed explicitly; shapes from checkpoint)
-    torch::Tensor mg = udcq_gemv_out(
-        xn2.view({-1}), gg_i, gg_s, gg_sc, cb, inter, hidden, 16);
-    torch::Tensor mu = udcq_gemv_out(
-        xn2.view({-1}), uu_i, uu_s, uu_sc, cb, inter, hidden, 16);
-    torch::Tensor act = torch::empty_like(mg);
+    // mlp: gate+up share xn2 in ONE multi-pack launch
+    int gslot = (int)l * 2 + 1;
+    if (!g_mt_ready[gslot]) {
+        const void* ii[2] = {gg_i.data_ptr(), uu_i.data_ptr()};
+        const void* ss[2] = {gg_s.data_ptr(), uu_s.data_ptr()};
+        const void* cc[2] = {gg_sc.data_ptr(), uu_sc.data_ptr()};
+        const void* yy[2] = {mgs.data_ptr(), mus.data_ptr()};
+        int oo[2] = {(int)inter, (int)inter};
+        mt_build_table(gslot, st, ii, ss, cc, yy, oo, 2);
+    }
+    mt_gemv_launch(xn2.data_ptr<float>(), cb.data_ptr<float>(), gslot,
+                   2 * (int)inter, 2, hidden, 16, st);
     silu_kernel<<<(unsigned)((inter + 255) / 256), 256, 0, st>>>(
-        mg.data_ptr<float>(), mu.data_ptr<float>(),
-        act.data_ptr<float>(), (int)inter);
+        mgs.data_ptr<float>(), mus.data_ptr<float>(),
+        acts.data_ptr<float>(), (int)inter);
     torch::Tensor md = udcq_gemv_out(
-        act, dd_i, dd_s, dd_sc, cb, hidden, 17408, 16);
+        acts, dd_i, dd_s, dd_sc, cb, hidden, 17408, 16);
     add_norm_f32<<<1, 1024, 0, st>>>(
         h1.data_ptr<float>(), md.data_ptr<float>(),
         in_w_next.data_ptr<float>(), out.data_ptr<float>(),
@@ -2858,7 +3012,7 @@ std::vector<torch::Tensor> attn_layer_step(
     torch::Tensor kv_cache,             // [8, ctx, 256] bf16
     double theta, const int* dpos,
     int64_t nh, int64_t nkv, int64_t hd,
-    int64_t hidden, int64_t inter, int64_t ctx)
+    int64_t hidden, int64_t inter, int64_t ctx, int64_t l)
 {
     auto st = at::cuda::getCurrentCUDAStream();
     torch::Tensor q_i = PK[0], q_s = PK[1], q_sc = PK[2];
@@ -2894,26 +3048,22 @@ std::vector<torch::Tensor> attn_layer_step(
         xn_out = torch::empty({hidden}, f32);
         init = true;
     }
-    udcq_gemv_launch(
-        xn.data_ptr<float>(), q_i.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint32_t*>(q_s.data_ptr()),
-        reinterpret_cast<const __half*>(q_sc.data_ptr()), cb.data_ptr<float>(),
-        q2.data_ptr<float>(), nh * hd * 2, hidden, GROUP, st);
+    // q+k+v share xn in ONE multi-pack launch (slot l*2)
+    int qslot = (int)l * 2;
+    if (!g_mt_ready[qslot]) {
+        const void* ii[3] = {q_i.data_ptr(), k_i.data_ptr(), v_i.data_ptr()};
+        const void* ss[3] = {q_s.data_ptr(), k_s.data_ptr(), v_s.data_ptr()};
+        const void* cc[3] = {q_sc.data_ptr(), k_sc.data_ptr(), v_sc.data_ptr()};
+        const void* yy[3] = {q2.data_ptr(), k2.data_ptr(), v2.data_ptr()};
+        int oo[3] = {(int)(nh * hd * 2), (int)(nkv * hd), (int)(nkv * hd)};
+        mt_build_table(qslot, st, ii, ss, cc, yy, oo, 3);
+    }
+    mt_gemv_launch(xn.data_ptr<float>(), cb.data_ptr<float>(), qslot,
+                   (int)(nh * hd * 2 + 2 * nkv * hd), 3, hidden, GROUP, st);
     // fused per-head gate: q2 [nh,512] -> q [nh,256] + gate [nh,256]
     chunk_qgate_kernel<<<(unsigned)nh, (unsigned)hd, 0, st>>>(
         q2.data_ptr<float>(), qh.data_ptr<float>(),
         gt.data_ptr<float>(), (int)hd);
-    udcq_gemv_dual_launch(
-        xn.data_ptr<float>(),
-        k_i.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint32_t*>(k_s.data_ptr()),
-        reinterpret_cast<const __half*>(k_sc.data_ptr()),
-        v_i.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint32_t*>(v_s.data_ptr()),
-        reinterpret_cast<const __half*>(v_sc.data_ptr()),
-        cb.data_ptr<float>(),
-        k2.data_ptr<float>(), v2.data_ptr<float>(),
-        nkv * hd, hidden, GROUP, st);
     rmsnorm_fw_kernel<<<nh, 256, 0, st>>>(
         qh.data_ptr<float>(), q_norm_w.data_ptr<float>(),
         qh.data_ptr<float>(), hd, 1e-6f);
@@ -2948,16 +3098,17 @@ std::vector<torch::Tensor> attn_layer_step(
         h.data_ptr<float>(), o.data_ptr<float>(),
         post_w.data_ptr<float>(), h1.data_ptr<float>(),
         xn2.data_ptr<float>(), hidden, 1e-6f);
-    udcq_gemv_launch(
-        xn2.data_ptr<float>(), g_i.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint32_t*>(g_s.data_ptr()),
-        reinterpret_cast<const __half*>(g_sc.data_ptr()), cb.data_ptr<float>(),
-        mg.data_ptr<float>(), inter, hidden, GROUP, st);
-    udcq_gemv_launch(
-        xn2.data_ptr<float>(), u_i.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint32_t*>(u_s.data_ptr()),
-        reinterpret_cast<const __half*>(u_sc.data_ptr()), cb.data_ptr<float>(),
-        mu.data_ptr<float>(), inter, hidden, GROUP, st);
+    // mlp: gate+up share xn2 in ONE multi-pack launch (slot l*2+1)
+    if (!g_mt_ready[(int)l * 2 + 1]) {
+        const void* ii[2] = {g_i.data_ptr(), u_i.data_ptr()};
+        const void* ss[2] = {g_s.data_ptr(), u_s.data_ptr()};
+        const void* cc[2] = {g_sc.data_ptr(), u_sc.data_ptr()};
+        const void* yy[2] = {mg.data_ptr(), mu.data_ptr()};
+        int oo[2] = {(int)inter, (int)inter};
+        mt_build_table((int)l * 2 + 1, st, ii, ss, cc, yy, oo, 2);
+    }
+    mt_gemv_launch(xn2.data_ptr<float>(), cb.data_ptr<float>(),
+                   (int)l * 2 + 1, 2 * (int)inter, 2, hidden, 16, st);
     silu_kernel<<<(unsigned)((inter + 255) / 256), 256, 0, st>>>(
         mg.data_ptr<float>(), mu.data_ptr<float>(),
         act.data_ptr<float>(), (int)inter);
