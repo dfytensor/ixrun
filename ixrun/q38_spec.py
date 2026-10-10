@@ -32,6 +32,10 @@ __all__ = ["Q38SpecEngine"]
 
 MAX_CTX = 256
 
+# verify/chain window: T tokens per iteration (4 = original; 8 = long
+# chain mode, Q38_TOK=8). E(T=8)~2.6-3.0 vs E(T=4)=1.6 measured.
+TOK = int(os.environ.get('Q38_TOK', '4'))
+
 from transformers.models.qwen3_5.modeling_qwen3_5 import (  # noqa: E402
     Qwen3_5Attention, Qwen3_5RMSNorm, apply_rotary_pos_emb)
 
@@ -172,11 +176,11 @@ class Q38SpecEngine:
         self.cos1 = torch.zeros(1, 1, cd, dtype=cos_all.dtype, device=dev)
         self.sin1 = torch.zeros_like(self.cos1)
         self.pos1 = torch.zeros(1, dtype=torch.long, device=dev)
-        self.emb4 = torch.zeros(1, 4, self.H, dtype=torch.bfloat16,
+        self.emb4 = torch.zeros(1, TOK, self.H, dtype=torch.bfloat16,
                                 device=dev)
-        self.cos4 = torch.zeros(1, 4, cd, dtype=cos_all.dtype, device=dev)
+        self.cos4 = torch.zeros(1, TOK, cd, dtype=cos_all.dtype, device=dev)
         self.sin4 = torch.zeros_like(self.cos4)
-        self.pos4 = torch.zeros(4, dtype=torch.long, device=dev)
+        self.pos4 = torch.zeros(TOK, dtype=torch.long, device=dev)
         # greedy-graph buffers (sampling fallback when knobs are active)
         if not self.greedy_only:
             self.log1 = torch.zeros(1, 1, self.V, dtype=torch.bfloat16,
@@ -254,22 +258,22 @@ class Q38SpecEngine:
                 self._srcs.append(torch.empty_like(cum))
     def _static_buffers(self):
         dev = self.dev
-        self.out_h4 = torch.zeros(1, 4, self.H, dtype=torch.bfloat16,
+        self.out_h4 = torch.zeros(1, TOK, self.H, dtype=torch.bfloat16,
                                   device=dev)
         if not self.greedy_only:
-            self.out_l4 = torch.zeros(1, 4, self.V, dtype=torch.bfloat16,
+            self.out_l4 = torch.zeros(1, TOK, self.V, dtype=torch.bfloat16,
                                       device=dev)
-        self.a_buf = torch.zeros(4, dtype=torch.long, device=dev)
-        self.dec_gpu = torch.zeros(6, dtype=torch.long, device=dev)
-        self.tok_out = torch.zeros(4, dtype=torch.long, device=dev)
+        self.a_buf = torch.zeros(TOK, dtype=torch.long, device=dev)
+        self.dec_gpu = torch.zeros(TOK + 2, dtype=torch.long, device=dev)
+        self.tok_out = torch.zeros(TOK, dtype=torch.long, device=dev)
         self.mtp_h_buf = torch.zeros(1, 1, self.H, dtype=torch.bfloat16,
                                      device=dev)
         self.mtp_pos_buf = torch.zeros(1, 1, dtype=torch.long, device=dev)
         self.pin_t = torch.zeros(1, dtype=torch.long, pin_memory=True)
         self.t_gpu = torch.zeros(1, dtype=torch.long, device=dev)
-        self.ar4 = torch.arange(4, device=dev)
+        self.ar4 = torch.arange(TOK, device=dev)
         self.temp_g = torch.ones(1, device=dev)   # draft temperature
-        self.draft_p = torch.ones(4, device=dev)  # p(d) per block slot
+        self.draft_p = torch.ones(TOK, device=dev)  # p(d) per block slot
         self._ev = torch.cuda.Event()
 
     # ------------------------------------------------------------------ #
@@ -383,21 +387,21 @@ class Q38SpecEngine:
         def prep_body():
             self.t_gpu.copy_(self.pin_t, non_blocking=True)
             idx = self.t_gpu + self.ar4
-            self.emb4.copy_(self.emb_rows(self.tok_out).view(1, 4, self.H))
+            self.emb4.copy_(self.emb_rows(self.tok_out).view(1, TOK, self.H))
             self.cos4.copy_(torch.index_select(
-                self._cos_all, 0, idx).view(1, 4, -1))
+                self._cos_all, 0, idx).view(1, TOK, -1))
             self.sin4.copy_(torch.index_select(
-                self._sin_all, 0, idx).view(1, 4, -1))
+                self._sin_all, 0, idx).view(1, TOK, -1))
             self.pos4.copy_(idx)
             torch._foreach_copy_(self._srcs, self._dsts)   # fast_snap
 
         def make_chain_body(p, temp=False):
-            n_drafts = 4 - p
+            n_drafts = TOK - p
             root_slot = p - 1
 
             def body():
                 if p == 1:
-                    self.tok_out[0].copy_(self.a_buf[3])
+                    self.tok_out[0].copy_(self.a_buf[TOK - 1])
                     h = self.mtp_h_buf
                 else:
                     self.tok_out[root_slot].copy_(self.a_buf[p - 2])
@@ -433,7 +437,7 @@ class Q38SpecEngine:
             else:
                 self.out_l4.copy_(lg)
 
-        bodies = {p: make_chain_body(p) for p in (1, 2, 3, 4)}
+        bodies = {p: make_chain_body(p) for p in range(1, TOK + 1)}
         if verbose:
             print('[q38-spec] capturing g1/g_cp[1..4]/g4dec...', flush=True)
         # CRITICAL: seed the cache FIRST so the T=4 verify captures the
@@ -477,27 +481,27 @@ class Q38SpecEngine:
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                for p in (1, 2, 3, 4):
+                for p in range(1, TOK + 1):
                     bodies[p]()
                 g4dec_body()
         torch.cuda.current_stream().wait_stream(s)
         self.g_cp = {}
-        for p in (1, 2, 3, 4):
+        for p in range(1, TOK + 1):
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g, pool=pool):
                 bodies[p]()
             self.g_cp[p] = g
         # temperature-sampled draft chains (probabilistic acceptance)
-        bodies_t = {p: make_chain_body(p, temp=True) for p in (1, 2, 3, 4)}
+        bodies_t = {p: make_chain_body(p, temp=True) for p in range(1, TOK + 1)}
         s_t = torch.cuda.Stream()
         s_t.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s_t):
             for _ in range(3):
-                for p in (1, 2, 3, 4):
+                for p in range(1, TOK + 1):
                     bodies_t[p]()
         torch.cuda.current_stream().wait_stream(s_t)
         self.g_cp_t = {}
-        for p in (1, 2, 3, 4):
+        for p in range(1, TOK + 1):
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g, pool=pool):
                 bodies_t[p]()
@@ -556,12 +560,12 @@ class Q38SpecEngine:
         sampling = bool(temperature > 0) or top_p < 1.0 or top_k > 0
         if not sampling:
             if not self.greedy_only:
-                for j in range(4):
+                for j in range(TOK):
                     self.a_buf[j] = self.out_l4[0, j].argmax()
-            # greedy_only: g4dec already wrote a_buf via in-graph argmax
+            # greedy_only: gTdec already wrote a_buf via in-graph argmax
         else:
-            # batched: one temperature-scaled softmax over all 4 rows
-            lg = self.out_l4[0].float()          # [4, V]
+            # batched: one temperature-scaled softmax over all rows
+            lg = self.out_l4[0].float()          # [TOK, V]
             if top_k and top_k > 0:
                 k = min(top_k, lg.shape[-1])
                 vals = torch.topk(lg, k, dim=-1).values
@@ -569,7 +573,7 @@ class Q38SpecEngine:
                                  lg, torch.tensor(float('-inf'),
                                                   device=lg.device))
             if top_p < 1.0:
-                for j in range(4):
+                for j in range(TOK):
                     s, order = torch.sort(lg[j], descending=True)
                     cum = torch.cumsum(torch.softmax(s, dim=0), dim=0)
                     keep = cum <= top_p
@@ -582,17 +586,13 @@ class Q38SpecEngine:
             if temperature and temperature > 0:
                 lg = lg / temperature
             probs = torch.softmax(lg, dim=-1)
-            for j in range(4):
+            for j in range(TOK):
                 self.a_buf[j] = torch.multinomial(probs[j], 1).squeeze()
-        m1 = self.a_buf[0] == self.tok_out[1]
-        m2 = (self.a_buf[1] == self.tok_out[2]) & m1
-        m3 = (self.a_buf[2] == self.tok_out[3]) & m2
-        L = 1 + m1.to(torch.long) + m2.to(torch.long) + m3.to(torch.long)
+        m = (self.a_buf[:TOK - 1] == self.tok_out[1:TOK])
+        cm = torch.cumprod(m.to(torch.long), 0)
+        L = 1 + int(cm.sum())
         self.dec_gpu[0] = L
-        self.dec_gpu[1] = self.tok_out[0]
-        self.dec_gpu[2] = self.tok_out[1]
-        self.dec_gpu[3] = self.tok_out[2]
-        self.dec_gpu[4] = self.tok_out[3]
+        self.dec_gpu[1:TOK + 1] = self.tok_out
 
     @torch.no_grad()
     def _verify_temp(self, pend, temperature):
@@ -602,12 +602,12 @@ class Q38SpecEngine:
         under the SAME temperature. Rejected positions fall back to the
         target sample (a_buf). Pending/replayed slots are not judged."""
         lg = self.out_l4[0].float() / max(temperature, 1e-6)
-        probs = torch.softmax(lg, dim=-1)        # [4, V]
-        for j in range(4):
+        probs = torch.softmax(lg, dim=-1)        # [TOK, V]
+        for j in range(TOK):
             self.a_buf[j] = torch.multinomial(probs[j], 1).squeeze()
         n_acc = 0
         ok = True
-        for k in range(pend, 4):
+        for k in range(pend, TOK):
             if not ok:
                 break
             d = self.tok_out[k].long()
@@ -618,30 +618,27 @@ class Q38SpecEngine:
                 n_acc += 1
             else:
                 ok = False
-        L = min(pend + n_acc, 4)
+        L = min(pend + n_acc, TOK)
         self.dec_gpu[0] = L
-        self.dec_gpu[1] = self.tok_out[0]
-        self.dec_gpu[2] = self.tok_out[1]
-        self.dec_gpu[3] = self.tok_out[2]
-        self.dec_gpu[4] = self.tok_out[3]
+        self.dec_gpu[1:TOK + 1] = self.tok_out
 
     def _spec_iter(self, ids, max_new_tokens, temperature=0.0,
                    top_p=1.0, top_k=0):
         """Generator: yields batches of newly committed tokens. Sampling
         happens at VERIFICATION only (drafts stay argmax) so speculation
         stays fully active under temperature/top_p/top_k."""
-        dec_pin = torch.zeros(6, dtype=torch.long, pin_memory=True)
+        dec_pin = torch.zeros(TOK + 2, dtype=torch.long, pin_memory=True)
         self.hard_reset()
         h_last, logits_last = self._prefill(ids)
         root = int(logits_last[:, -1].argmax(-1).item())
-        self.a_buf[3] = root
+        self.a_buf[TOK - 1] = root
         self.mtp_h_buf.copy_(h_last)
         pend_cpu = 1
         stops = self._stop_ids()
         gen = []
         t = len(ids)
         temp = bool(temperature > 0)
-        while len(gen) < max_new_tokens and t < self.max_ctx - 6:
+        while len(gen) < max_new_tokens and t < self.max_ctx - (TOK + 2):
             self.pin_t[0] = t - (pend_cpu - 1)
             if temp:
                 self.temp_g[0] = temperature
@@ -658,14 +655,13 @@ class Q38SpecEngine:
             while not self._ev.query():
                 pass
             L = int(dec_pin[0])
-            tv = [int(dec_pin[1]), int(dec_pin[2]),
-                  int(dec_pin[3]), int(dec_pin[4])]
+            tv = [int(dec_pin[i]) for i in range(1, TOK + 1)]
             committed = tv[pend_cpu - 1: max(L, pend_cpu - 1)]
             gen.extend(committed)
             t += len(committed)
-            if L == 4:
+            if L == TOK:
                 pend_cpu = 1
-                self.mtp_h_buf.copy_(self.out_h4[:, 3:4])
+                self.mtp_h_buf.copy_(self.out_h4[:, TOK - 1:TOK])
             else:
                 self._fast_rollback()
                 pend_cpu = L + 1
@@ -676,7 +672,7 @@ class Q38SpecEngine:
     def _clip_ids(self, ids):
         """Trim over-long prompts to the KV window (keeps the tail —
         standard sliding-window chat behaviour)."""
-        budget = self.max_ctx - 8
+        budget = self.max_ctx - (TOK + 4)
         if len(ids) > budget:
             print(f'[q38-spec] prompt {len(ids)} > window {budget}: '
                   f'trimming to tail', flush=True)

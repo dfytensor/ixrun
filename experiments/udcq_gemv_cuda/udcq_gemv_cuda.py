@@ -184,6 +184,96 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_mt_cuda_kernel(
     }
 }
 
+
+// T=8 variant: same walk, 8 token accumulators, x direct float4 reads.
+#define TOK8 8
+__global__ __launch_bounds__(WARPS * 32) void udcq_gemv_mt8_cuda_kernel(
+    const __nv_bfloat16* __restrict__ x,     // [TOK8, IN_F]
+    __nv_bfloat16* __restrict__ y,           // [TOK8, OUT_F]
+    const uint8_t* __restrict__ idx,
+    const int* __restrict__ sign,
+    const __half* __restrict__ scale,
+    int OUT_F, int IN_F)
+{
+    __shared__ float cb_sm[32];
+    for (int i = threadIdx.x; i < 16; i += blockDim.x) {
+        cb_sm[i] = -c_cb[i];
+        cb_sm[i + 16] = c_cb[i];
+    }
+    __syncthreads();
+    const int row = blockIdx.x * WARPS + threadIdx.x / 32;
+    const int t = threadIdx.x & 31;
+    if (row >= OUT_F) return;
+    const int NSTEP = IN_F / 256;
+    const uint8_t* irow = idx + (size_t)row * (IN_F / 2);
+    const int* srow = sign + (size_t)row * (IN_F / 32);
+    const __half* crow = scale + (size_t)row * (IN_F / 16);
+    float a[TOK8][4];
+    #pragma unroll
+    for (int tk = 0; tk < TOK8; tk++)
+        #pragma unroll
+        for (int u = 0; u < 4; u++) a[tk][u] = 0.f;
+    const int sb = (t & 3) * 8;
+    int j = 0;
+    for (; j + 3 < NSTEP; j += 4) {
+        #pragma unroll
+        for (int u = 0; u < 4; u++) {
+            const int k0 = (j + u) * 256;
+            const uint32_t b = *(const uint32_t*)(irow + k0 / 2 + (size_t)t * 4);
+            const uint32_t sw = (uint32_t)*(const int*)(srow + (k0 >> 5) + (t >> 2));
+            const float sc = __half2float(crow[(k0 >> 4) + (t >> 1)]);
+            float wv[8];
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                wv[i] = cb_sm[((b >> (4 * i)) & 0xF)
+                              | (int)((sw >> (sb + i)) & 1u) << 4] * sc;
+            #pragma unroll
+            for (int tk = 0; tk < TOK8; tk++) {
+                const uint4 xv = *(const uint4*)(x + (size_t)tk * IN_F +
+                                                 k0 + (size_t)t * 8);
+                float acc = 0.f;
+                #pragma unroll
+                for (int i = 0; i < 8; i++)
+                    acc = fmaf(wv[i], __bfloat162float(
+                        ((const __nv_bfloat16*)&xv)[i]), acc);
+                a[tk][u] += acc;
+            }
+        }
+    }
+    for (; j < NSTEP; j++) {
+        const int k0 = j * 256;
+        const uint32_t b = *(const uint32_t*)(irow + k0 / 2 + (size_t)t * 4);
+        const uint32_t sw = (uint32_t)*(const int*)(srow + (k0 >> 5) + (t >> 2));
+        const float sc = __half2float(crow[(k0 >> 4) + (t >> 1)]);
+        float wv[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            wv[i] = cb_sm[((b >> (4 * i)) & 0xF)
+                          | (int)((sw >> (sb + i)) & 1u) << 4] * sc;
+        #pragma unroll
+        for (int tk = 0; tk < TOK8; tk++) {
+            float acc = 0.f;
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                acc = fmaf(wv[i], __bfloat162float(
+                    x[(size_t)tk * IN_F + k0 + (size_t)t * 8 + i]), acc);
+            a[tk][0] += acc;
+        }
+    }
+    float s[TOK8];
+    #pragma unroll
+    for (int tk = 0; tk < TOK8; tk++) {
+        s[tk] = (a[tk][0] + a[tk][1]) + (a[tk][2] + a[tk][3]);
+        #pragma unroll
+        for (int o = 16; o; o >>= 1)
+            s[tk] += __shfl_xor_sync(0xffffffffu, s[tk], o);
+    }
+    if (t == 0) {
+        #pragma unroll
+        for (int tk = 0; tk < TOK8; tk++)
+            y[(size_t)tk * OUT_F + row] = __float2bfloat16_rn(s[tk]);
+    }
+}
 torch::Tensor gemv_mt_cuda(torch::Tensor x, torch::Tensor idx,
                            torch::Tensor sign, torch::Tensor scale,
                            int64_t out_f, int64_t in_f) {
@@ -191,6 +281,20 @@ torch::Tensor gemv_mt_cuda(torch::Tensor x, torch::Tensor idx,
     int grid = (out_f + WARPS - 1) / WARPS;
     udcq_gemv_mt_cuda_kernel<<<grid, WARPS * 32, 0,
                                at::cuda::getCurrentCUDAStream()>>>(
+        (const __nv_bfloat16*)x.data_ptr(),
+        (__nv_bfloat16*)y.data_ptr(),
+        (const uint8_t*)idx.data_ptr(), (const int*)sign.data_ptr(),
+        (const __half*)scale.data_ptr(), (int)out_f, (int)in_f);
+    return y;
+}
+
+torch::Tensor gemv_mt8_cuda(torch::Tensor x, torch::Tensor idx,
+                            torch::Tensor sign, torch::Tensor scale,
+                            int64_t out_f, int64_t in_f) {
+    auto y = torch::empty({TOK8, out_f}, x.options());
+    int grid = (out_f + WARPS - 1) / WARPS;
+    udcq_gemv_mt8_cuda_kernel<<<grid, WARPS * 32, 0,
+                                at::cuda::getCurrentCUDAStream()>>>(
         (const __nv_bfloat16*)x.data_ptr(),
         (__nv_bfloat16*)y.data_ptr(),
         (const uint8_t*)idx.data_ptr(), (const int*)sign.data_ptr(),
@@ -232,7 +336,7 @@ def _load():
     global _EXT
     if _EXT is None:
         _EXT = load_inline(
-            name='udcq_gemv_cuda_v2',
+            name='udcq_gemv_cuda_v3',
             cpp_sources=['torch::Tensor gemv_cuda(torch::Tensor x, '
                          'torch::Tensor idx, torch::Tensor sign, '
                          'torch::Tensor scale, torch::Tensor cb, '
@@ -241,11 +345,15 @@ def _load():
                          'torch::Tensor idx, torch::Tensor sign, '
                          'torch::Tensor scale, '
                          'int64_t out_f, int64_t in_f);',
+                         'torch::Tensor gemv_mt8_cuda(torch::Tensor x, '
+                         'torch::Tensor idx, torch::Tensor sign, '
+                         'torch::Tensor scale, '
+                         'int64_t out_f, int64_t in_f);',
                          'void install_codebook(torch::Tensor cb);',
                          'void install_attr(int64_t max_sm);'],
             cuda_sources=CUDA_SRC,
-            functions=['gemv_cuda', 'gemv_mt_cuda', 'install_codebook',
-                       'install_attr'],
+            functions=['gemv_cuda', 'gemv_mt_cuda', 'gemv_mt8_cuda',
+                       'install_codebook', 'install_attr'],
             extra_cuda_cflags=['-O3', '--use_fast_math',
                                '-allow-unsupported-compiler'],
             verbose=False)
@@ -276,6 +384,13 @@ def cuda_gemv_mt(x, idx, sign, scale, out_f, in_f):
     ext = _load()
     return ext.gemv_mt_cuda(x.reshape(4, in_f), idx, sign, scale,
                             out_f, in_f)
+
+
+def cuda_gemv_mt8(x, idx, sign, scale, out_f, in_f):
+    """x: [8, in_f] bf16 -> y: [8, out_f]. Decodes each weight once."""
+    ext = _load()
+    return ext.gemv_mt8_cuda(x.reshape(8, in_f), idx, sign, scale,
+                             out_f, in_f)
 
 
 if __name__ == '__main__':

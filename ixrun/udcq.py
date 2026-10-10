@@ -618,16 +618,17 @@ class UdcqLinear(nn.Module):
         #               fused re-decodes per m-tile and loses ~8x at M=4096)
         M = x.numel() // self.in_features
         _cg = _cuda_gemv_mod() if _gemv_env \
-            and M == 4 and x.shape[-1] == self.in_features \
+            and M in (4, 8) and x.shape[-1] == self.in_features \
             and self.in_features % 16 == 0 else None
         if _cg is not None:
             if not getattr(_cg, "_cb_installed", False):
                 _cg.install_codebook(self._cb.float())
                 _cg._cb_installed = True
             try:
-                y = _cg.cuda_gemv_mt(x, self._idx, self._sign,
-                                     self._scale, self.out_features,
-                                     self.in_features).to(x.dtype)
+                fn = _cg.cuda_gemv_mt8 if M == 8 else _cg.cuda_gemv_mt
+                y = fn(x, self._idx, self._sign,
+                       self._scale, self.out_features,
+                       self.in_features).to(x.dtype)
                 if self._bias is not None:
                     y = y + self._bias.to(x.dtype)
                 return y.view(*x.shape[:-1], self.out_features)
