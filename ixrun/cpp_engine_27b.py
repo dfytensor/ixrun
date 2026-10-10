@@ -215,11 +215,11 @@ class CppQwen27bEngine:
             # text-identical to the legacy path at 3x+ throughput)
             self._graph_gemm = {}
             try:
-                self._hT = torch.empty(256, self.hidden, dtype=torch.float32,
+                self._hT = torch.empty(1024, self.hidden, dtype=torch.float32,
                                        device='cuda')
-                self._dposT = torch.zeros(256, dtype=torch.int32,
+                self._dposT = torch.zeros(1024, dtype=torch.int32,
                                           device='cuda')
-                for tsz in (256, 64):
+                for tsz in (1024, 256, 64):
                     hv = self._hT.narrow(0, 0, tsz)
                     dv = self._dposT.narrow(0, 0, tsz)
                     for _ in range(2):
@@ -251,7 +251,7 @@ class CppQwen27bEngine:
         if M > 0 and use_gemm:
             # gemm segments first (256, then 64s): weights dequantized once
             # per layer per segment + cuBLAS matmuls over the segment
-            for tsz in (256, 64):
+            for tsz in (1024, 256, 64):
                 g = self._graph_gemm[tsz]
                 while n - pos >= tsz:
                     self._hT[:tsz].copy_(

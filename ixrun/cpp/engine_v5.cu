@@ -1980,7 +1980,7 @@ __global__ void scale_kernel(float* x, float c, int n) {
 
 // ---------------- batched (T-row) GDN/attn core for GEMM prefill ------ //
 // Same arithmetic order as the per-token kernels => token-exact.
-#define GT_MAXT 256
+#define GT_MAXT 1024
 
 // sliding-window causal conv over T tokens, one thread per channel.
 // acc order matches conv1d_update_kernel exactly (k=0..2, then last tap,

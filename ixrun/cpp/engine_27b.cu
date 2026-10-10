@@ -173,7 +173,7 @@ void step27_g(torch::Tensor h, torch::Tensor dpos, double theta) {
 // conv/recurrent/norms, attention) are unchanged. All shapes are static for
 // a given T => graph-capturable. lm_head runs on the last row every call
 // (cheap; the caller ignores s27_tok for non-final segments).
-#define GEMM_TMAX 256
+#define GEMM_TMAX 1024
 
 void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta) {
     if (!s27_init) throw std::runtime_error("init27 not called");
