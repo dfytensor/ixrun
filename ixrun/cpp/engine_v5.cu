@@ -2384,6 +2384,27 @@ std::vector<torch::Tensor> i8_dequant_test(
 // segment). x staged fp32->bf16 in smem; W decoded per k-chunk (32) into
 // smem bf16; A = W (m16k16 row-major), B = x (k16n8, col-major layout
 // b[k][n] with n = token).
+__device__ __forceinline__ uint32_t mg_pack(float lo, float hi) {
+    __nv_bfloat162 p = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<uint32_t*>(&p);
+}
+
+__device__ __forceinline__ void mg_ldmatrix_x4(uint32_t (&r)[4],
+                                               const void* p) {
+    uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+
+__device__ __forceinline__ void mg_ldmatrix_x2_trans(uint32_t (&r)[2],
+                                                     const void* p) {
+    uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+        : "=r"(r[0]), "=r"(r[1]) : "r"(a));
+}
+
 #define MG_BT 128
 #define MG_TT 128
 #define MG_KC 32
@@ -2405,14 +2426,14 @@ udcq_mma_gemm_kernel(
 {
     __shared__ float cb_sm[16];
     extern __shared__ char mg_smem[];
-    __nv_bfloat16 (*xs)[MG_KC] =
-        reinterpret_cast<__nv_bfloat16(*)[MG_KC]>(mg_smem);
-    __nv_bfloat16 (*ws)[MG_KC] =
-        reinterpret_cast<__nv_bfloat16(*)[MG_KC]>(
-            mg_smem + MG_TT * MG_KC * 2);
-    float (*es)[MG_TT / 4 + 1] =
-        reinterpret_cast<float(*)[MG_TT / 4 + 1]>(
-            mg_smem + (MG_TT + MG_BT) * MG_KC * 2);
+    __nv_bfloat16 (*xs)[MG_TT][MG_KC] =
+        reinterpret_cast<__nv_bfloat16(*)[MG_TT][MG_KC]>(mg_smem);
+    __nv_bfloat16 (*ws)[MG_BT][MG_KC] =
+        reinterpret_cast<__nv_bfloat16(*)[MG_BT][MG_KC]>(
+            mg_smem + 2 * MG_TT * MG_KC * 2);
+    float (*es)[MG_TT / 8 + 1] =
+        reinterpret_cast<float(*)[MG_TT / 8 + 1]>(
+            mg_smem + 2 * (MG_TT + MG_BT) * MG_KC * 2);
     if (threadIdx.x < 16) cb_sm[threadIdx.x] = cb[threadIdx.x];
     int tid = threadIdx.x;
     int r0 = blockIdx.x * MG_BT;
@@ -2429,10 +2450,10 @@ udcq_mma_gemm_kernel(
         #pragma unroll
         for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
     int nchunk = (in_f + MG_KC - 1) / MG_KC;
-    for (int c = 0; c < nchunk; ++c) {
+    auto stage = [&](int buf, int c) {
         int k0 = c * MG_KC;
         int klen = min(MG_KC, in_f - k0);
-        // ---- stage x tile: [toks, klen] fp32 -> bf16
+        // x tile: [toks, klen] fp32 -> bf16
         for (int i = tid; i < toks * (klen >> 2); i += blockDim.x) {
             int t = i / (klen >> 2);
             int j = i - t * (klen >> 2);
@@ -2440,10 +2461,10 @@ udcq_mma_gemm_kernel(
                 x + (size_t)(t0 + t) * in_f + k0 + 4 * j);
             __nv_bfloat162 ab = __floats2bfloat162_rn(v.x, v.y);
             __nv_bfloat162 cd = __floats2bfloat162_rn(v.z, v.w);
-            *reinterpret_cast<__nv_bfloat162*>(&xs[t][4 * j]) = ab;
-            *reinterpret_cast<__nv_bfloat162*>(&xs[t][4 * j + 2]) = cd;
+            *reinterpret_cast<__nv_bfloat162*>(&xs[buf][t][4 * j]) = ab;
+            *reinterpret_cast<__nv_bfloat162*>(&xs[buf][t][4 * j + 2]) = cd;
         }
-        // ---- decode W tile: [rows, klen]; one 16-elem group per thread
+        // W tile: [rows, klen]; one 16-elem group per thread
         for (int i = tid; i < rows * (klen >> 4); i += blockDim.x) {
             int r = i / (klen >> 4);
             int gp = i - r * (klen >> 4);
@@ -2480,83 +2501,88 @@ udcq_mma_gemm_kernel(
                 }
                 int base16 = gp * 16 + 8 * q;
                 *reinterpret_cast<__nv_bfloat162*>(
-                    &ws[r][base16 + 0]) = pk[0];
+                    &ws[buf][r][base16 + 0]) = pk[0];
                 *reinterpret_cast<__nv_bfloat162*>(
-                    &ws[r][base16 + 2]) = pk[1];
+                    &ws[buf][r][base16 + 2]) = pk[1];
                 *reinterpret_cast<__nv_bfloat162*>(
-                    &ws[r][base16 + 4]) = pk[2];
+                    &ws[buf][r][base16 + 4]) = pk[2];
                 *reinterpret_cast<__nv_bfloat162*>(
-                    &ws[r][base16 + 6]) = pk[3];
+                    &ws[buf][r][base16 + 6]) = pk[3];
             }
         }
-        __syncthreads();
-        // ---- mma: A = W (m16k16), B = x (k16n8, n = token)
-        int ra = warp * 16 + lr;            // A rows: lr and lr+8
-        int ra8 = ra + 8;
+    };
+    stage(0, 0);
+    for (int c = 0; c < nchunk; ++c) {
+        __syncthreads();                    // staged buffer visible
+        if (c + 1 < nchunk) stage((c + 1) & 1, c + 1);   // overlap next tile
+        int buf = c & 1;
+        int k0 = c * MG_KC;
+        int klen = min(MG_KC, in_f - k0);
+        int kkm = (klen + 15) >> 4;
+        int ntm = (toks + 7) >> 3;
+        int ra0 = warp * 16;
+        int a_off = (lane >> 4) << 3;       // k+8 for lanes 16-31
+        int b_koff = ((lane >> 3) & 1) << 3;
         #pragma unroll
         for (int kk = 0; kk < MG_KC / 16; ++kk) {
-            if (16 * kk + 15 >= klen) break;
+            if (kk >= kkm) break;
+            int ra = warp * 16 + lr;        // scalar fallback (bisect)
+            int ra8 = ra + 8;
             int ka = 16 * kk + lk * 2;
-            uint32_t a0 = *reinterpret_cast<const uint32_t*>(
-                &ws[ra][ka]);
-            uint32_t a1 = *reinterpret_cast<const uint32_t*>(
-                &ws[ra8][ka]);
-            uint32_t a2 = *reinterpret_cast<const uint32_t*>(
-                &ws[ra][ka + 8]);
-            uint32_t a3 = *reinterpret_cast<const uint32_t*>(
-                &ws[ra8][ka + 8]);
+            uint32_t af[4];
+            af[0] = *reinterpret_cast<const uint32_t*>(&ws[buf][ra][ka]);
+            af[1] = *reinterpret_cast<const uint32_t*>(&ws[buf][ra8][ka]);
+            af[2] = *reinterpret_cast<const uint32_t*>(&ws[buf][ra][ka + 8]);
+            af[3] = *reinterpret_cast<const uint32_t*>(&ws[buf][ra8][ka + 8]);
+            (void)k0;
             #pragma unroll
             for (int n = 0; n < MG_TT / 8; ++n) {
-                int ncol = n * 8 + lr;      // B col: token index in tile
-                if (ncol >= toks) continue;
-                uint32_t b0 = *reinterpret_cast<const uint32_t*>(
-                    &xs[ncol][16 * kk + lk * 2]);
-                uint32_t b1 = *reinterpret_cast<const uint32_t*>(
-                    &xs[ncol][16 * kk + lk * 2 + 8]);
+                if (n >= ntm) break;
+                uint32_t bf[2];
+                bf[0] = *reinterpret_cast<const uint32_t*>(
+                    &xs[buf][n * 8 + lr][16 * kk + lk * 2]);
+                bf[1] = *reinterpret_cast<const uint32_t*>(
+                    &xs[buf][n * 8 + lr][16 * kk + lk * 2 + 8]);
                 float c0 = acc[n][0], c1 = acc[n][1],
                       c2 = acc[n][2], c3 = acc[n][3];
                 asm volatile(
                     "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                     : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
-                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                    : "r"(af[0]), "r"(af[1]), "r"(af[2]), "r"(af[3]),
+                      "r"(bf[0]), "r"(bf[1]));
                 acc[n][0] = c0; acc[n][1] = c1; acc[n][2] = c2; acc[n][3] = c3;
             }
         }
-        __syncthreads();
     }
-    // ---- epilogue: warps flush their acc fragments to es in 4 token
-    // slivers of 32; the block then writes coalesced [token, 128 rows]
-    for (int s = 0; s < MG_TT / 32; ++s) {
-        int nob = s * 4;                    // n-tech offsets 4 per sliver
+    // ---- epilogue: warps flush their acc fragments to es in 8 token
+    // slivers of 16; the block then writes coalesced [token, 128 rows]
+    for (int s = 0; s < MG_TT / 16; ++s) {
         #pragma unroll
-        for (int nn = 0; nn < 4; ++nn) {
-            int n = nob + nn;
-            int col0 = n * 8 + lk * 2;      // token cols
-            int tok_col = n * 8 + lk * 2 - s * 32;
+        for (int nn = 0; nn < 2; ++nn) {
+            int n = s * 2 + nn;
+            int tok_col = nn * 8 + lk * 2;   // token cols within sliver
             if (n * 8 + lk * 2 >= toks) continue;
             es[warp * 16 + lr][tok_col] = acc[n][0];
             es[warp * 16 + lr][tok_col + 1] = acc[n][1];
             es[warp * 16 + lr + 8][tok_col] = acc[n][2];
             es[warp * 16 + lr + 8][tok_col + 1] = acc[n][3];
-            (void)col0;
         }
         __syncthreads();
-        // write: thread handles (token, 16-row chunk)
         {
-            int token = tid >> 3;           // 32 tokens / 8 lanes
-            int rl = tid & 7;               // 16-row chunk id
-            int t = t0 + s * 32 + token;
-            if (token < toks - s * 32 && t < T) {
-                float* dst = y + (size_t)t * out_f + r0 + rl * 16;
+            int token = tid >> 4;           // 16 tokens / 16 lanes
+            int rl = tid & 15;              // 8-row chunk id
+            int t = t0 + s * 16 + token;
+            if (token < toks - s * 16 && t < T) {
+                float* dst = y + (size_t)t * out_f + r0 + rl * 8;
                 #pragma unroll
-                for (int q = 0; q < 4; ++q) {
+                for (int q = 0; q < 2; ++q) {
                     float4 v;
-                    v.x = es[rl * 16 + 4 * q + 0][token];
-                    v.y = es[rl * 16 + 4 * q + 1][token];
-                    v.z = es[rl * 16 + 4 * q + 2][token];
-                    v.w = es[rl * 16 + 4 * q + 3][token];
-                    if (r0 + rl * 16 + 4 * q + 3 < out_f)
+                    v.x = es[rl * 8 + 4 * q + 0][token];
+                    v.y = es[rl * 8 + 4 * q + 1][token];
+                    v.z = es[rl * 8 + 4 * q + 2][token];
+                    v.w = es[rl * 8 + 4 * q + 3][token];
+                    if (r0 + rl * 8 + 4 * q + 3 < out_f)
                         *reinterpret_cast<float4*>(dst + 4 * q) = v;
                 }
             }
@@ -2573,8 +2599,8 @@ torch::Tensor mma_gemm_test(torch::Tensor x, torch::Tensor idx,
     auto y = torch::zeros({T, of}, torch::TensorOptions()
         .dtype(torch::kFloat32).device(x.device()));
     static bool attr_done = false;
-    size_t sm = (size_t)(MG_TT + MG_BT) * MG_KC * 2
-                + (size_t)MG_BT * (MG_TT / 4 + 1) * 4;
+    size_t sm = (size_t)(MG_TT + MG_BT) * MG_KC * 4
+                + (size_t)MG_BT * (MG_TT / 8 + 1) * 4;
     if (!attr_done) {
         int dev = 0;
         cudaGetDevice(&dev);
@@ -2609,11 +2635,6 @@ torch::Tensor mma_gemm_test(torch::Tensor x, torch::Tensor idx,
 }
 
 // minimal mma unit test: D[16,8] = A[16,16] @ B[16,8] (bf16 inputs, fp32 out)
-__device__ __forceinline__ uint32_t mg_pack(float lo, float hi) {
-    __nv_bfloat162 p = __floats2bfloat162_rn(lo, hi);
-    return *reinterpret_cast<uint32_t*>(&p);
-}
-
 __global__ void dyn_smem_probe_kernel(float* __restrict__ d) {
     extern __shared__ char sm[];
     float* s = reinterpret_cast<float*>(sm);
