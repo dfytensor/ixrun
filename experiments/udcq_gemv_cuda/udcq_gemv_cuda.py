@@ -33,7 +33,7 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_cuda_kernel(
     const uint8_t* __restrict__ idx,         // [OUT_F * IN_F / 2]
     const int* __restrict__ sign,            // int32 [OUT_F * IN_F / 32]
     const __half* __restrict__ scale,        // [OUT_F * IN_F / 16]
-    int OUT_F, int IN_F)
+    int OUT_F, int IN_F, int ULS)
 {
     extern __shared__ float smem[];
     float* x_sm = smem;                      // IN_F floats
@@ -52,11 +52,19 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_cuda_kernel(
     const uint8_t* irow = idx + (size_t)r * (IN_F / 2);
     const int* srow = sign + (size_t)r * (IN_F / 32);
     const __half* crow = scale + (size_t)r * n_gr;
+    const uint8_t* urow = reinterpret_cast<const uint8_t*>(scale)
+                          + (size_t)r * (size_t)(n_gr + 8);
+    float sbase = 0.f, sstep = 0.f;
+    if (ULS) {
+        sbase = *reinterpret_cast<const float*>(urow);
+        sstep = *reinterpret_cast<const float*>(urow + 4);
+    }
     float acc = 0.f;
     for (int g = lane; g < n_gr; g += 32) {
         uint2 b2 = *reinterpret_cast<const uint2*>(irow + (size_t)g * 8);
         uint32_t sw = (uint32_t)srow[g >> 1] >> (16 * (g & 1));
-        float sc = __half2float(crow[g]);
+        float sc = ULS ? exp2f(sbase + sstep * (float)urow[8 + g])
+                       : __half2float(crow[g]);
         const float* xs = x_sm + (size_t)g * 16;
         float xr[16];
         #pragma unroll
@@ -101,7 +109,7 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_mt_cuda_kernel(
     const uint8_t* __restrict__ idx,
     const int* __restrict__ sign,
     const __half* __restrict__ scale,
-    int OUT_F, int IN_F)
+    int OUT_F, int IN_F, int ULS)
 {
     __shared__ float cb_sm[32];
     for (int i = threadIdx.x; i < 16; i += blockDim.x) {
@@ -116,6 +124,13 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_mt_cuda_kernel(
     const uint8_t* irow = idx + (size_t)row * (IN_F / 2);
     const int* srow = sign + (size_t)row * (IN_F / 32);
     const __half* crow = scale + (size_t)row * (IN_F / 16);
+    const uint8_t* urow = reinterpret_cast<const uint8_t*>(scale)
+                          + (size_t)row * (size_t)(IN_F / 16 + 8);
+    float sbase = 0.f, sstep = 0.f;
+    if (ULS) {
+        sbase = *reinterpret_cast<const float*>(urow);
+        sstep = *reinterpret_cast<const float*>(urow + 4);
+    }
     float a[TOK][4];
     #pragma unroll
     for (int tk = 0; tk < TOK; tk++)
@@ -128,7 +143,8 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_mt_cuda_kernel(
             const int k0 = (j + u) * 256;
             const uint32_t b = *(const uint32_t*)(irow + k0 / 2 + (size_t)t * 4);
             const uint32_t sw = (uint32_t)*(const int*)(srow + (k0 >> 5) + (t >> 2));
-            const float sc = __half2float(crow[(k0 >> 4) + (t >> 1)]);
+            const float sc = ULS ? exp2f(sbase + sstep * (float)urow[8 + (k0 >> 4) + (t >> 1)])
+                             : __half2float(crow[(k0 >> 4) + (t >> 1)]);
             const int sb = (t & 3) * 8;
             float wv[8];
             #pragma unroll
@@ -152,7 +168,8 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_mt_cuda_kernel(
         const int k0 = j * 256;
         const uint32_t b = *(const uint32_t*)(irow + k0 / 2 + (size_t)t * 4);
         const uint32_t sw = (uint32_t)*(const int*)(srow + (k0 >> 5) + (t >> 2));
-        const float sc = __half2float(crow[(k0 >> 4) + (t >> 1)]);
+        const float sc = ULS ? exp2f(sbase + sstep * (float)urow[8 + (k0 >> 4) + (t >> 1)])
+                             : __half2float(crow[(k0 >> 4) + (t >> 1)]);
         const int sb = (t & 3) * 8;
         float wv[8];
         #pragma unroll
@@ -193,7 +210,7 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_mt8_cuda_kernel(
     const uint8_t* __restrict__ idx,
     const int* __restrict__ sign,
     const __half* __restrict__ scale,
-    int OUT_F, int IN_F)
+    int OUT_F, int IN_F, int ULS)
 {
     __shared__ float cb_sm[32];
     for (int i = threadIdx.x; i < 16; i += blockDim.x) {
@@ -208,6 +225,13 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_mt8_cuda_kernel(
     const uint8_t* irow = idx + (size_t)row * (IN_F / 2);
     const int* srow = sign + (size_t)row * (IN_F / 32);
     const __half* crow = scale + (size_t)row * (IN_F / 16);
+    const uint8_t* urow = reinterpret_cast<const uint8_t*>(scale)
+                          + (size_t)row * (size_t)(IN_F / 16 + 8);
+    float sbase = 0.f, sstep = 0.f;
+    if (ULS) {
+        sbase = *reinterpret_cast<const float*>(urow);
+        sstep = *reinterpret_cast<const float*>(urow + 4);
+    }
     float a[TOK8][4];
     #pragma unroll
     for (int tk = 0; tk < TOK8; tk++)
@@ -221,7 +245,8 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_mt8_cuda_kernel(
             const int k0 = (j + u) * 256;
             const uint32_t b = *(const uint32_t*)(irow + k0 / 2 + (size_t)t * 4);
             const uint32_t sw = (uint32_t)*(const int*)(srow + (k0 >> 5) + (t >> 2));
-            const float sc = __half2float(crow[(k0 >> 4) + (t >> 1)]);
+            const float sc = ULS ? exp2f(sbase + sstep * (float)urow[8 + (k0 >> 4) + (t >> 1)])
+                             : __half2float(crow[(k0 >> 4) + (t >> 1)]);
             float wv[8];
             #pragma unroll
             for (int i = 0; i < 8; i++)
@@ -244,7 +269,8 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_mt8_cuda_kernel(
         const int k0 = j * 256;
         const uint32_t b = *(const uint32_t*)(irow + k0 / 2 + (size_t)t * 4);
         const uint32_t sw = (uint32_t)*(const int*)(srow + (k0 >> 5) + (t >> 2));
-        const float sc = __half2float(crow[(k0 >> 4) + (t >> 1)]);
+        const float sc = ULS ? exp2f(sbase + sstep * (float)urow[8 + (k0 >> 4) + (t >> 1)])
+                             : __half2float(crow[(k0 >> 4) + (t >> 1)]);
         float wv[8];
         #pragma unroll
         for (int i = 0; i < 8; i++)
@@ -276,7 +302,7 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_mt8_cuda_kernel(
 }
 torch::Tensor gemv_mt_cuda(torch::Tensor x, torch::Tensor idx,
                            torch::Tensor sign, torch::Tensor scale,
-                           int64_t out_f, int64_t in_f) {
+                           int64_t out_f, int64_t in_f, int64_t uls) {
     auto y = torch::empty({TOK, out_f}, x.options());
     int grid = (out_f + WARPS - 1) / WARPS;
     udcq_gemv_mt_cuda_kernel<<<grid, WARPS * 32, 0,
@@ -284,13 +310,13 @@ torch::Tensor gemv_mt_cuda(torch::Tensor x, torch::Tensor idx,
         (const __nv_bfloat16*)x.data_ptr(),
         (__nv_bfloat16*)y.data_ptr(),
         (const uint8_t*)idx.data_ptr(), (const int*)sign.data_ptr(),
-        (const __half*)scale.data_ptr(), (int)out_f, (int)in_f);
+        (const __half*)scale.data_ptr(), (int)out_f, (int)in_f, (int)uls);
     return y;
 }
 
 torch::Tensor gemv_mt8_cuda(torch::Tensor x, torch::Tensor idx,
                             torch::Tensor sign, torch::Tensor scale,
-                            int64_t out_f, int64_t in_f) {
+                            int64_t out_f, int64_t in_f, int64_t uls) {
     auto y = torch::empty({TOK8, out_f}, x.options());
     int grid = (out_f + WARPS - 1) / WARPS;
     udcq_gemv_mt8_cuda_kernel<<<grid, WARPS * 32, 0,
@@ -298,13 +324,14 @@ torch::Tensor gemv_mt8_cuda(torch::Tensor x, torch::Tensor idx,
         (const __nv_bfloat16*)x.data_ptr(),
         (__nv_bfloat16*)y.data_ptr(),
         (const uint8_t*)idx.data_ptr(), (const int*)sign.data_ptr(),
-        (const __half*)scale.data_ptr(), (int)out_f, (int)in_f);
+        (const __half*)scale.data_ptr(), (int)out_f, (int)in_f, (int)uls);
     return y;
 }
 
 torch::Tensor gemv_cuda(torch::Tensor x, torch::Tensor idx,
                         torch::Tensor sign, torch::Tensor scale,
-                        torch::Tensor cb, int64_t out_f, int64_t in_f) {
+                        torch::Tensor cb, int64_t out_f, int64_t in_f,
+                        int64_t uls) {
     auto y = torch::empty({out_f}, x.options());
     int grid = (out_f + WARPS - 1) / WARPS;
     size_t sm = (size_t)in_f * sizeof(float) + 32 * sizeof(float);
@@ -313,7 +340,7 @@ torch::Tensor gemv_cuda(torch::Tensor x, torch::Tensor idx,
         (const __nv_bfloat16*)x.data_ptr(),
         (__nv_bfloat16*)y.data_ptr(),
         (const uint8_t*)idx.data_ptr(), (const int*)sign.data_ptr(),
-        (const __half*)scale.data_ptr(), (int)out_f, (int)in_f);
+        (const __half*)scale.data_ptr(), (int)out_f, (int)in_f, (int)uls);
     return y;
 }
 
@@ -336,19 +363,19 @@ def _load():
     global _EXT
     if _EXT is None:
         _EXT = load_inline(
-            name='udcq_gemv_cuda_v3',
+            name='udcq_gemv_cuda_v4',
             cpp_sources=['torch::Tensor gemv_cuda(torch::Tensor x, '
                          'torch::Tensor idx, torch::Tensor sign, '
                          'torch::Tensor scale, torch::Tensor cb, '
-                         'int64_t out_f, int64_t in_f);',
+                         'int64_t out_f, int64_t in_f, int64_t uls);',
                          'torch::Tensor gemv_mt_cuda(torch::Tensor x, '
                          'torch::Tensor idx, torch::Tensor sign, '
                          'torch::Tensor scale, '
-                         'int64_t out_f, int64_t in_f);',
+                         'int64_t out_f, int64_t in_f, int64_t uls);',
                          'torch::Tensor gemv_mt8_cuda(torch::Tensor x, '
                          'torch::Tensor idx, torch::Tensor sign, '
                          'torch::Tensor scale, '
-                         'int64_t out_f, int64_t in_f);',
+                         'int64_t out_f, int64_t in_f, int64_t uls);',
                          'void install_codebook(torch::Tensor cb);',
                          'void install_attr(int64_t max_sm);'],
             cuda_sources=CUDA_SRC,
@@ -365,12 +392,13 @@ def _load():
     return _EXT
 
 
-def cuda_gemv(x, idx, sign, scale, cb_f32, out_f, in_f):
+def cuda_gemv(x, idx, sign, scale, cb_f32, out_f, in_f, uls=0):
     """cb_f32: float32 [16]. Returns bf16 [out_f].
-    install_codebook() must have been called once with the model codebook."""
+    install_codebook() must have been called once with the model codebook.
+    uls=1: scale is the uint8 log2 stream (per-row base/step header)."""
     ext = _load()
     return ext.gemv_cuda(x.reshape(-1), idx, sign, scale, cb_f32,
-                         out_f, in_f)
+                         out_f, in_f, uls)
 
 
 def install_codebook(cb_f32):
@@ -379,18 +407,18 @@ def install_codebook(cb_f32):
     ext.install_codebook(cb_f32.cuda())
 
 
-def cuda_gemv_mt(x, idx, sign, scale, out_f, in_f):
+def cuda_gemv_mt(x, idx, sign, scale, out_f, in_f, uls=0):
     """x: [4, in_f] bf16 -> y: [4, out_f]. Decodes each weight once."""
     ext = _load()
     return ext.gemv_mt_cuda(x.reshape(4, in_f), idx, sign, scale,
-                            out_f, in_f)
+                            out_f, in_f, uls)
 
 
-def cuda_gemv_mt8(x, idx, sign, scale, out_f, in_f):
+def cuda_gemv_mt8(x, idx, sign, scale, out_f, in_f, uls=0):
     """x: [8, in_f] bf16 -> y: [8, out_f]. Decodes each weight once."""
     ext = _load()
     return ext.gemv_mt8_cuda(x.reshape(8, in_f), idx, sign, scale,
-                             out_f, in_f)
+                             out_f, in_f, uls)
 
 
 if __name__ == '__main__':

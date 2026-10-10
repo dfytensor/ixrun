@@ -525,6 +525,7 @@ class UdcqLinear(nn.Module):
         self._cache = cache
         self._w = None
         self._w_buf = None
+        self._uls = 1 if packed["scale"].dtype == torch.uint8 else 0
         if bias is not None:
             self.register_buffer("_bias", bias.detach().clone())
         else:
@@ -545,6 +546,8 @@ class UdcqLinear(nn.Module):
             self.packed["codebook"] = None     # staged on GPU already
 
     def _stream_decode(self):
+        if self._uls:
+            raise RuntimeError("ULS blob has no Triton decode path")
         import triton
 
         total = self.out_features * self.in_features
@@ -565,9 +568,38 @@ class UdcqLinear(nn.Module):
         return w_flat.view(self.out_features, self.in_features)
 
     def _decode(self, device):
+        if self._uls:
+            raise RuntimeError("ULS blob has no Triton decode path")
         if self._w is None or self._w.device != device:
             self._w = decode_udcq_triton(self.packed, device)
         return self._w
+
+    @torch.no_grad()
+    def _uls_dequant_torch(self, device):
+        """ULS -> bf16 [out, in] via torch ops (prefill/fallback path).
+        Row-chunked to bound transient memory (~4MB fp32 per chunk)."""
+        out_f, in_f = self.out_features, self.in_features
+        n_gr = in_f // 16
+        buf = self._scale
+        hdr = buf[:, :8].contiguous().view(torch.float32).view(out_f, 2)
+        i8 = buf[:, 8:]
+        idx = self._idx.view(out_f, in_f // 2)
+        sign = self._sign.view(out_f, in_f // 32)
+        cb = self._cb.float()
+        bits32 = torch.arange(32, device=device, dtype=torch.int32)
+        W = torch.empty(out_f, in_f, dtype=torch.bfloat16, device=device)
+        step = max(1, (1 << 20) // in_f)
+        for r0 in range(0, out_f, step):
+            r1 = min(r0 + step, out_f)
+            nib = torch.empty(r1 - r0, in_f, dtype=torch.uint8, device=device)
+            nib[:, 0::2] = idx[r0:r1] & 0xF
+            nib[:, 1::2] = idx[r0:r1] >> 4
+            sgn = (((sign[r0:r1].unsqueeze(-1) >> bits32) & 1)
+                   .reshape(r1 - r0, in_f).float() * 2 - 1)
+            sd = torch.exp2(hdr[r0:r1, 0:1] + hdr[r0:r1, 1:2] * i8[r0:r1].float())
+            W[r0:r1] = (cb[nib.long()] * sd.repeat_interleave(16, 1) * sgn
+                        ).to(torch.bfloat16)
+        return W
 
     def forward(self, x):
         if self._cache == "full":
@@ -585,6 +617,9 @@ class UdcqLinear(nn.Module):
         if x.numel() == self.in_features:
             _cg = _cuda_gemv_mod() if _gemv_env \
                 and self.in_features % 16 == 0 else None
+            if _cg is None and self._uls:
+                raise RuntimeError(
+                    "ULS blob requires UDCQ_CUDA_GEMV=1 (no Triton path)")
             if _cg is not None:
                 if not getattr(_cg, "_cb_installed", False):
                     _cg.install_codebook(self._cb.float())
@@ -593,8 +628,11 @@ class UdcqLinear(nn.Module):
                     y = _cg.cuda_gemv(x, self._idx, self._sign,
                                       self._scale, self._cb.float(),
                                       self.out_features,
-                                      self.in_features).to(x.dtype)
+                                      self.in_features,
+                                      uls=self._uls).to(x.dtype)
                 except Exception:
+                    if self._uls:
+                        raise
                     y = udcq_fused_gemv(
                         x, self._idx, self._sign, self._scale, self._cb,
                         self.out_features, self.in_features,
@@ -628,12 +666,48 @@ class UdcqLinear(nn.Module):
                 fn = _cg.cuda_gemv_mt8 if M == 8 else _cg.cuda_gemv_mt
                 y = fn(x, self._idx, self._sign,
                        self._scale, self.out_features,
-                       self.in_features).to(x.dtype)
+                       self.in_features,
+                       uls=self._uls).to(x.dtype)
                 if self._bias is not None:
                     y = y + self._bias.to(x.dtype)
                 return y.view(*x.shape[:-1], self.out_features)
             except Exception:
-                pass   # fall through to Triton below
+                pass   # fall through (torch ULS dequant if uls)
+        if self._uls:
+            # ULS multi-token: chunk through the existing mt kernels
+            # (8+4+singles); the torch dequant is a last-resort fallback.
+            cg = _cuda_gemv_mod() if _gemv_env \
+                and self.in_features % 16 == 0 else None
+            if cg is not None:
+                if not getattr(cg, "_cb_installed", False):
+                    cg.install_codebook(self._cb.float())
+                    cg._cb_installed = True
+                x2 = x.reshape(M, self.in_features)
+                y = torch.empty(M, self.out_features, dtype=x.dtype,
+                                device=x.device)
+                r = 0
+                while M - r >= 8:
+                    y[r:r + 8] = cg.cuda_gemv_mt8(
+                        x2[r:r + 8], self._idx, self._sign, self._scale,
+                        self.out_features, self.in_features, uls=1)
+                    r += 8
+                while M - r >= 4:
+                    y[r:r + 4] = cg.cuda_gemv_mt(
+                        x2[r:r + 4], self._idx, self._sign, self._scale,
+                        self.out_features, self.in_features, uls=1)
+                    r += 4
+                while r < M:
+                    y[r] = cg.cuda_gemv(
+                        x2[r], self._idx, self._sign, self._scale,
+                        self._cb.float(), self.out_features,
+                        self.in_features, uls=1)
+                    r += 1
+                if self._bias is not None:
+                    y = y + self._bias.to(x.dtype)
+                return y.view(*x.shape[:-1], self.out_features)
+            w = self._uls_dequant_torch(x.device).to(x.dtype)
+            b = self._bias.to(x.dtype) if self._bias is not None else None
+            return F.linear(x, w, b)
         if (M in (2, 4, 8) and x.shape[-1] == self.in_features
                 and self.in_features % UDCQ_GEMV_BK == 0):
             x2 = x.reshape(M, self.in_features)

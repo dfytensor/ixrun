@@ -6,7 +6,8 @@ import pandas  # noqa
 import torch
 
 from ixrun.q38_spec import Q38SpecEngine
-BLOB = r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt'
+BLOB = sys.argv[1] if len(sys.argv) > 1 \
+    else r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt'
 MODEL = r'E:\models\Qwen3.8-27B'
 CTX = int(os.environ.get('SPEC_CTX', '128'))
 eng = Q38SpecEngine.from_blob(BLOB, MODEL, max_ctx=CTX)

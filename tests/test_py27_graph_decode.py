@@ -9,7 +9,8 @@ import pandas  # noqa: F401
 import torch
 from ixrun.q38_graph import Q38GraphEngine
 
-BLOB = r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt'
+BLOB = sys.argv[1] if len(sys.argv) > 1 \
+    else r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt'
 MODEL = r'E:\models\Qwen3.8-27B'
 eng = Q38GraphEngine.from_blob(BLOB, MODEL, max_ctx=256)
 prompt = "The capital of France is"
