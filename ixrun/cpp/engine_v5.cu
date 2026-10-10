@@ -2377,6 +2377,490 @@ std::vector<torch::Tensor> i8_dequant_test(
     return {q, rs};
 }
 
+// ---------------- fused UDCQ decode + bf16 mma GEMM ------------------- //
+// Reads the PACKED weight bytes once per [BT=128 row x TT=128 token] tile
+// and feeds m16n8k16 bf16 tensor-core mma directly - eliminates the
+// dequant->bf16-write->cublas-read round trip (102GB per 256-token
+// segment). x staged fp32->bf16 in smem; W decoded per k-chunk (32) into
+// smem bf16; A = W (m16k16 row-major), B = x (k16n8, col-major layout
+// b[k][n] with n = token).
+#define MG_BT 128
+#define MG_TT 128
+#define MG_KC 32
+
+__device__ __forceinline__ __nv_bfloat16 mg_ld_bf16(const float* p) {
+    return __float2bfloat16_rn(*p);
+}
+
+template <bool ULS>
+__global__ void __launch_bounds__(256)
+udcq_mma_gemm_kernel(
+    const float* __restrict__ x,          // [T, in_f] fp32
+    float* __restrict__ y,                // [T, out_f] fp32
+    const uint8_t* __restrict__ idx,
+    const uint32_t* __restrict__ sign,
+    const __half* __restrict__ scale,
+    const float* __restrict__ cb,
+    int T, int in_f, int out_f)
+{
+    __shared__ float cb_sm[16];
+    extern __shared__ char mg_smem[];
+    __nv_bfloat16 (*xs)[MG_KC] =
+        reinterpret_cast<__nv_bfloat16(*)[MG_KC]>(mg_smem);
+    __nv_bfloat16 (*ws)[MG_KC] =
+        reinterpret_cast<__nv_bfloat16(*)[MG_KC]>(
+            mg_smem + MG_TT * MG_KC * 2);
+    float (*es)[MG_TT / 4 + 1] =
+        reinterpret_cast<float(*)[MG_TT / 4 + 1]>(
+            mg_smem + (MG_TT + MG_BT) * MG_KC * 2);
+    if (threadIdx.x < 16) cb_sm[threadIdx.x] = cb[threadIdx.x];
+    int tid = threadIdx.x;
+    int r0 = blockIdx.x * MG_BT;
+    int t0 = blockIdx.y * MG_TT;
+    int rows = min(MG_BT, out_f - r0);
+    int toks = min(MG_TT, T - t0);
+    int warp = tid >> 5, lane = tid & 31;
+    // W fragment row band: warp covers rows [warp*16, warp*16+16)
+    int lr = lane >> 2;                     // 0..7
+    int lk = lane & 3;                      // 0..3
+    float acc[MG_TT / 8][4];                // 16 n-tiles x 4
+    #pragma unroll
+    for (int i = 0; i < MG_TT / 8; ++i)
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
+    int nchunk = (in_f + MG_KC - 1) / MG_KC;
+    for (int c = 0; c < nchunk; ++c) {
+        int k0 = c * MG_KC;
+        int klen = min(MG_KC, in_f - k0);
+        // ---- stage x tile: [toks, klen] fp32 -> bf16
+        for (int i = tid; i < toks * (klen >> 2); i += blockDim.x) {
+            int t = i / (klen >> 2);
+            int j = i - t * (klen >> 2);
+            float4 v = *reinterpret_cast<const float4*>(
+                x + (size_t)(t0 + t) * in_f + k0 + 4 * j);
+            __nv_bfloat162 ab = __floats2bfloat162_rn(v.x, v.y);
+            __nv_bfloat162 cd = __floats2bfloat162_rn(v.z, v.w);
+            *reinterpret_cast<__nv_bfloat162*>(&xs[t][4 * j]) = ab;
+            *reinterpret_cast<__nv_bfloat162*>(&xs[t][4 * j + 2]) = cd;
+        }
+        // ---- decode W tile: [rows, klen]; one 16-elem group per thread
+        for (int i = tid; i < rows * (klen >> 4); i += blockDim.x) {
+            int r = i / (klen >> 4);
+            int gp = i - r * (klen >> 4);
+            int g = (k0 >> 4) + gp;        // global 16-group index in the row
+            const uint8_t* irow = idx + (size_t)(r0 + r) * (in_f / 2);
+            const uint32_t* wrow = sign + (size_t)(r0 + r) * (in_f / 32);
+            uint32_t sw = wrow[g >> 1] >> (16 * (g & 1));
+            float sc;
+            if (ULS) {
+                const uint8_t* urow =
+                    reinterpret_cast<const uint8_t*>(scale)
+                    + (size_t)(r0 + r) * (size_t)(in_f / 16 + 8);
+                sc = exp2f(*reinterpret_cast<const float*>(urow)
+                           + *reinterpret_cast<const float*>(urow + 4)
+                             * (float)urow[8 + g]);
+            } else {
+                sc = __half2float(
+                    scale[(size_t)(r0 + r) * (in_f / 16) + g]);
+            }
+            const uint8_t* gsrc = irow + (size_t)g * 8;
+            #pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                uint32_t b = *reinterpret_cast<const uint32_t*>(gsrc + 4 * q);
+                __nv_bfloat162 pk[4];
+                #pragma unroll
+                for (int j2 = 0; j2 < 4; ++j2) {
+                    int nb0 = (int)((b >> (8 * j2)) & 0xF);
+                    int nb1 = (int)((b >> (8 * j2 + 4)) & 0xF);
+                    int s0 = (int)((sw >> (8 * q + 2 * j2)) & 1u);
+                    int s1 = (int)((sw >> (8 * q + 2 * j2 + 1)) & 1u);
+                    float w0 = (s0 ? cb_sm[nb0] : -cb_sm[nb0]) * sc;
+                    float w1 = (s1 ? cb_sm[nb1] : -cb_sm[nb1]) * sc;
+                    pk[j2] = __floats2bfloat162_rn(w0, w1);
+                }
+                int base16 = gp * 16 + 8 * q;
+                *reinterpret_cast<__nv_bfloat162*>(
+                    &ws[r][base16 + 0]) = pk[0];
+                *reinterpret_cast<__nv_bfloat162*>(
+                    &ws[r][base16 + 2]) = pk[1];
+                *reinterpret_cast<__nv_bfloat162*>(
+                    &ws[r][base16 + 4]) = pk[2];
+                *reinterpret_cast<__nv_bfloat162*>(
+                    &ws[r][base16 + 6]) = pk[3];
+            }
+        }
+        __syncthreads();
+        // ---- mma: A = W (m16k16), B = x (k16n8, n = token)
+        int ra = warp * 16 + lr;            // A rows: lr and lr+8
+        int ra8 = ra + 8;
+        #pragma unroll
+        for (int kk = 0; kk < MG_KC / 16; ++kk) {
+            if (16 * kk + 15 >= klen) break;
+            int ka = 16 * kk + lk * 2;
+            uint32_t a0 = *reinterpret_cast<const uint32_t*>(
+                &ws[ra][ka]);
+            uint32_t a1 = *reinterpret_cast<const uint32_t*>(
+                &ws[ra8][ka]);
+            uint32_t a2 = *reinterpret_cast<const uint32_t*>(
+                &ws[ra][ka + 8]);
+            uint32_t a3 = *reinterpret_cast<const uint32_t*>(
+                &ws[ra8][ka + 8]);
+            #pragma unroll
+            for (int n = 0; n < MG_TT / 8; ++n) {
+                int ncol = n * 8 + lr;      // B col: token index in tile
+                if (ncol >= toks) continue;
+                uint32_t b0 = *reinterpret_cast<const uint32_t*>(
+                    &xs[ncol][16 * kk + lk * 2]);
+                uint32_t b1 = *reinterpret_cast<const uint32_t*>(
+                    &xs[ncol][16 * kk + lk * 2 + 8]);
+                float c0 = acc[n][0], c1 = acc[n][1],
+                      c2 = acc[n][2], c3 = acc[n][3];
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                acc[n][0] = c0; acc[n][1] = c1; acc[n][2] = c2; acc[n][3] = c3;
+            }
+        }
+        __syncthreads();
+    }
+    // ---- epilogue: warps flush their acc fragments to es in 4 token
+    // slivers of 32; the block then writes coalesced [token, 128 rows]
+    for (int s = 0; s < MG_TT / 32; ++s) {
+        int nob = s * 4;                    // n-tech offsets 4 per sliver
+        #pragma unroll
+        for (int nn = 0; nn < 4; ++nn) {
+            int n = nob + nn;
+            int col0 = n * 8 + lk * 2;      // token cols
+            int tok_col = n * 8 + lk * 2 - s * 32;
+            if (n * 8 + lk * 2 >= toks) continue;
+            es[warp * 16 + lr][tok_col] = acc[n][0];
+            es[warp * 16 + lr][tok_col + 1] = acc[n][1];
+            es[warp * 16 + lr + 8][tok_col] = acc[n][2];
+            es[warp * 16 + lr + 8][tok_col + 1] = acc[n][3];
+            (void)col0;
+        }
+        __syncthreads();
+        // write: thread handles (token, 16-row chunk)
+        {
+            int token = tid >> 3;           // 32 tokens / 8 lanes
+            int rl = tid & 7;               // 16-row chunk id
+            int t = t0 + s * 32 + token;
+            if (token < toks - s * 32 && t < T) {
+                float* dst = y + (size_t)t * out_f + r0 + rl * 16;
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    float4 v;
+                    v.x = es[rl * 16 + 4 * q + 0][token];
+                    v.y = es[rl * 16 + 4 * q + 1][token];
+                    v.z = es[rl * 16 + 4 * q + 2][token];
+                    v.w = es[rl * 16 + 4 * q + 3][token];
+                    if (r0 + rl * 16 + 4 * q + 3 < out_f)
+                        *reinterpret_cast<float4*>(dst + 4 * q) = v;
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+torch::Tensor mma_gemm_test(torch::Tensor x, torch::Tensor idx,
+                            torch::Tensor sign, torch::Tensor scale,
+                            torch::Tensor cb, int64_t T, int64_t of,
+                            int64_t inf) {
+    auto st = at::cuda::getCurrentCUDAStream();
+    auto y = torch::zeros({T, of}, torch::TensorOptions()
+        .dtype(torch::kFloat32).device(x.device()));
+    static bool attr_done = false;
+    size_t sm = (size_t)(MG_TT + MG_BT) * MG_KC * 2
+                + (size_t)MG_BT * (MG_TT / 4 + 1) * 4;
+    if (!attr_done) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        int max_sm = 0;
+        cudaDeviceGetAttribute(&max_sm,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        if ((int)sm > 48 * 1024 && max_sm > 0) {
+            cudaFuncSetAttribute(udcq_mma_gemm_kernel<false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, max_sm);
+            cudaFuncSetAttribute(udcq_mma_gemm_kernel<true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, max_sm);
+        }
+        attr_done = true;
+    }
+    dim3 grid((unsigned)((of + MG_BT - 1) / MG_BT),
+              (unsigned)((T + MG_TT - 1) / MG_TT));
+    if (g_uls)
+        udcq_mma_gemm_kernel<true><<<grid, 256, sm, st>>>(
+            x.data_ptr<float>(), y.data_ptr<float>(),
+            idx.data_ptr<uint8_t>(),
+            reinterpret_cast<const uint32_t*>(sign.data_ptr()),
+            reinterpret_cast<const __half*>(scale.data_ptr()),
+            cb.data_ptr<float>(), (int)T, (int)inf, (int)of);
+    else
+        udcq_mma_gemm_kernel<false><<<grid, 256, sm, st>>>(
+            x.data_ptr<float>(), y.data_ptr<float>(),
+            idx.data_ptr<uint8_t>(),
+            reinterpret_cast<const uint32_t*>(sign.data_ptr()),
+            reinterpret_cast<const __half*>(scale.data_ptr()),
+            cb.data_ptr<float>(), (int)T, (int)inf, (int)of);
+    return y;
+}
+
+// minimal mma unit test: D[16,8] = A[16,16] @ B[16,8] (bf16 inputs, fp32 out)
+__device__ __forceinline__ uint32_t mg_pack(float lo, float hi) {
+    __nv_bfloat162 p = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<uint32_t*>(&p);
+}
+
+__global__ void dyn_smem_probe_kernel(float* __restrict__ d) {
+    extern __shared__ char sm[];
+    float* s = reinterpret_cast<float*>(sm);
+    s[threadIdx.x] = 1.0f + threadIdx.x;
+    __syncthreads();
+    d[blockIdx.x * 256 + threadIdx.x] = s[threadIdx.x];
+}
+
+torch::Tensor dyn_smem_probe() {
+    auto d = torch::zeros({256}, torch::TensorOptions()
+        .dtype(torch::kFloat32).device(torch::kCUDA));
+    static bool attr = false;
+    if (!attr) {
+        int dev = 0; cudaGetDevice(&dev);
+        int mx = 0;
+        cudaDeviceGetAttribute(&mx,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        cudaFuncSetAttribute(dyn_smem_probe_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, mx);
+        attr = true;
+    }
+    dyn_smem_probe_kernel<<<1, 256, 49664,
+        at::cuda::getCurrentCUDAStream()>>>(d.data_ptr<float>());
+    return d;
+}
+
+__global__ void mma_unit_kernel(const float* __restrict__ a,
+                                const float* __restrict__ b,
+                                float* __restrict__ d) {
+    int lane = threadIdx.x & 31;
+    int lr = lane >> 2, lk = lane & 3;
+    uint32_t a0 = mg_pack(a[lr * 16 + lk * 2], a[lr * 16 + lk * 2 + 1]);
+    uint32_t a1 = mg_pack(a[(lr + 8) * 16 + lk * 2],
+                          a[(lr + 8) * 16 + lk * 2 + 1]);
+    uint32_t a2 = mg_pack(a[lr * 16 + lk * 2 + 8],
+                          a[lr * 16 + lk * 2 + 9]);
+    uint32_t a3 = mg_pack(a[(lr + 8) * 16 + lk * 2 + 8],
+                          a[(lr + 8) * 16 + lk * 2 + 9]);
+    uint32_t b0 = mg_pack(b[(lk * 2) * 8 + lr], b[(lk * 2 + 1) * 8 + lr]);
+    uint32_t b1 = mg_pack(b[(lk * 2 + 8) * 8 + lr],
+                          b[(lk * 2 + 9) * 8 + lr]);
+    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    d[lr * 8 + lk * 2] = c0;
+    d[lr * 8 + lk * 2 + 1] = c1;
+    d[(lr + 8) * 8 + lk * 2] = c2;
+    d[(lr + 8) * 8 + lk * 2 + 1] = c3;
+}
+
+torch::Tensor mma_unit_test(torch::Tensor a, torch::Tensor b) {
+    auto d = torch::zeros({16, 8}, torch::TensorOptions()
+        .dtype(torch::kFloat32).device(a.device()));
+    mma_unit_kernel<<<1, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+        a.data_ptr<float>(), b.data_ptr<float>(), d.data_ptr<float>());
+    return d;
+}
+
+// debug variant: dump chunk-0 smem + acc of block (0,0)
+template <bool ULS>
+__global__ void __launch_bounds__(256)
+udcq_mma_gemm_dbg_kernel(
+    const float* __restrict__ x, float* __restrict__ y,
+    const uint8_t* __restrict__ idx, const uint32_t* __restrict__ sign,
+    const __half* __restrict__ scale, const float* __restrict__ cb,
+    int T, int in_f, int out_f, float* __restrict__ dbg)
+{
+    __shared__ float cb_sm[16];
+    extern __shared__ char mg_smem[];
+    __nv_bfloat16 (*xs)[MG_KC] =
+        reinterpret_cast<__nv_bfloat16(*)[MG_KC]>(mg_smem);
+    __nv_bfloat16 (*ws)[MG_KC] =
+        reinterpret_cast<__nv_bfloat16(*)[MG_KC]>(
+            mg_smem + MG_TT * MG_KC * 2);
+    float (*es)[MG_TT / 4 + 1] =
+        reinterpret_cast<float(*)[MG_TT / 4 + 1]>(
+            mg_smem + (MG_TT + MG_BT) * MG_KC * 2);
+    if (threadIdx.x < 16) cb_sm[threadIdx.x] = cb[threadIdx.x];
+    __syncthreads();
+    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) dbg[127] = 42.f;
+    int tid = threadIdx.x;
+    int r0 = blockIdx.x * MG_BT;
+    int t0 = blockIdx.y * MG_TT;
+    int rows = min(MG_BT, out_f - r0);
+    int toks = min(MG_TT, T - t0);
+    int warp = tid >> 5, lane = tid & 31;
+    int lr = lane >> 2;
+    int lk = lane & 3;
+    float acc[MG_TT / 8][4];
+    #pragma unroll
+    for (int i = 0; i < MG_TT / 8; ++i)
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
+    int nchunk = (in_f + MG_KC - 1) / MG_KC;
+    for (int c = 0; c < nchunk; ++c) {
+        int k0 = c * MG_KC;
+        int klen = min(MG_KC, in_f - k0);
+        for (int i = tid; i < toks * (klen >> 2); i += blockDim.x) {
+            int t = i / (klen >> 2);
+            int j = i - t * (klen >> 2);
+            float4 v = *reinterpret_cast<const float4*>(
+                x + (size_t)(t0 + t) * in_f + k0 + 4 * j);
+            __nv_bfloat162 ab = __floats2bfloat162_rn(v.x, v.y);
+            __nv_bfloat162 cd = __floats2bfloat162_rn(v.z, v.w);
+            *reinterpret_cast<__nv_bfloat162*>(&xs[t][4 * j]) = ab;
+            *reinterpret_cast<__nv_bfloat162*>(&xs[t][4 * j + 2]) = cd;
+        }
+        for (int i = tid; i < rows * (klen >> 4); i += blockDim.x) {
+            int r = i / (klen >> 4);
+            int gp = i - r * (klen >> 4);
+            int g = (k0 >> 4) + gp;
+            const uint8_t* irow = idx + (size_t)(r0 + r) * (in_f / 2);
+            const uint32_t* wrow = sign + (size_t)(r0 + r) * (in_f / 32);
+            uint32_t sw = wrow[g >> 1] >> (16 * (g & 1));
+            float sc;
+            if (ULS) {
+                const uint8_t* urow = reinterpret_cast<const uint8_t*>(scale)
+                    + (size_t)(r0 + r) * (size_t)(in_f / 16 + 8);
+                sc = exp2f(*reinterpret_cast<const float*>(urow)
+                           + *reinterpret_cast<const float*>(urow + 4)
+                             * (float)urow[8 + g]);
+            } else {
+                sc = __half2float(scale[(size_t)(r0 + r) * (in_f / 16) + g]);
+            }
+            const uint8_t* gsrc = irow + (size_t)g * 8;
+            #pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                uint32_t b = *reinterpret_cast<const uint32_t*>(gsrc + 4 * q);
+                __nv_bfloat162 pk[4];
+                #pragma unroll
+                for (int j2 = 0; j2 < 4; ++j2) {
+                    int nb0 = (int)((b >> (8 * j2)) & 0xF);
+                    int nb1 = (int)((b >> (8 * j2 + 4)) & 0xF);
+                    int s0 = (int)((sw >> (8 * q + 2 * j2)) & 1u);
+                    int s1 = (int)((sw >> (8 * q + 2 * j2 + 1)) & 1u);
+                    float w0 = (s0 ? cb_sm[nb0] : -cb_sm[nb0]) * sc;
+                    float w1 = (s1 ? cb_sm[nb1] : -cb_sm[nb1]) * sc;
+                    pk[j2] = __floats2bfloat162_rn(w0, w1);
+                }
+                int base16 = gp * 16 + 8 * q;
+                *reinterpret_cast<__nv_bfloat162*>(&ws[r][base16]) =
+                    pk[0];
+                *reinterpret_cast<__nv_bfloat162*>(&ws[r][base16 + 2]) =
+                    pk[1];
+                *reinterpret_cast<__nv_bfloat162*>(&ws[r][base16 + 4]) =
+                    pk[2];
+                *reinterpret_cast<__nv_bfloat162*>(&ws[r][base16 + 6]) =
+                    pk[3];
+            }
+        }
+        __syncthreads();
+        if (blockIdx.x == 0 && blockIdx.y == 0 && c == 0) {
+            if (tid < 16) {
+                dbg[tid] = __bfloat162float(ws[0][tid]);
+                dbg[16 + tid] = __bfloat162float(ws[1][tid]);
+                dbg[32 + tid] = __bfloat162float(xs[0][tid]);
+                dbg[48 + tid] = __bfloat162float(ws[8][tid]);
+            }
+        }
+        int ra = warp * 16 + lr;
+        int ra8 = ra + 8;
+        #pragma unroll
+        for (int kk = 0; kk < MG_KC / 16; ++kk) {
+            if (16 * kk + 15 >= klen) break;
+            int ka = 16 * kk + lk * 2;
+            uint32_t a0 = *reinterpret_cast<const uint32_t*>(&ws[ra][ka]);
+            uint32_t a1 = *reinterpret_cast<const uint32_t*>(&ws[ra8][ka]);
+            uint32_t a2 =
+                *reinterpret_cast<const uint32_t*>(&ws[ra][ka + 8]);
+            uint32_t a3 =
+                *reinterpret_cast<const uint32_t*>(&ws[ra8][ka + 8]);
+            #pragma unroll
+            for (int n = 0; n < MG_TT / 8; ++n) {
+                int ncol = n * 8 + lr;
+                if (ncol >= toks) continue;
+                uint32_t b0 = *reinterpret_cast<const uint32_t*>(
+                    &xs[ncol][16 * kk + lk * 2]);
+                uint32_t b1 = *reinterpret_cast<const uint32_t*>(
+                    &xs[ncol][16 * kk + lk * 2 + 8]);
+                float c0 = acc[n][0], c1 = acc[n][1],
+                      c2 = acc[n][2], c3 = acc[n][3];
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                acc[n][0] = c0; acc[n][1] = c1; acc[n][2] = c2; acc[n][3] = c3;
+            }
+        }
+        if (blockIdx.x == 0 && blockIdx.y == 0 && c == 0 && tid == 0)
+            dbg[64] = acc[0][0];
+        __syncthreads();
+        if (c > 0) break;                   // debug: one chunk is enough
+    }
+    if (blockIdx.x == 0 && blockIdx.y == 0) {
+        // dump acc fragment c0 of lane 0 for every n
+        if (tid == 0)
+            for (int n = 0; n < MG_TT / 8; ++n) dbg[65 + n] = acc[n][0];
+        if (tid == 32) dbg[81] = acc[0][0];
+    }
+    (void)es; (void)y;
+}
+
+torch::Tensor mma_gemm_dbg(torch::Tensor x, torch::Tensor idx,
+                           torch::Tensor sign, torch::Tensor scale,
+                           torch::Tensor cb, int64_t T, int64_t of,
+                           int64_t inf) {
+    auto st = at::cuda::getCurrentCUDAStream();
+    auto dbg = torch::zeros({128}, torch::TensorOptions()
+        .dtype(torch::kFloat32).device(x.device()));
+    auto y = torch::zeros({T, of}, torch::TensorOptions()
+        .dtype(torch::kFloat32).device(x.device()));
+    static bool attr_done = false;
+    size_t sm = (size_t)(MG_TT + MG_BT) * MG_KC * 2
+                + (size_t)MG_BT * (MG_TT / 4 + 1) * 4;
+    if (!attr_done) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        int max_sm = 0;
+        cudaDeviceGetAttribute(&max_sm,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        if ((int)sm > 48 * 1024 && max_sm > 0) {
+            cudaFuncSetAttribute(udcq_mma_gemm_dbg_kernel<false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, max_sm);
+            cudaFuncSetAttribute(udcq_mma_gemm_dbg_kernel<true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, max_sm);
+        }
+        attr_done = true;
+    }
+    dim3 grid((unsigned)((of + MG_BT - 1) / MG_BT),
+              (unsigned)((T + MG_TT - 1) / MG_TT));
+    udcq_mma_gemm_dbg_kernel<true><<<grid, 256, sm, st>>>(
+        x.data_ptr<float>(), y.data_ptr<float>(), idx.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(sign.data_ptr()),
+        reinterpret_cast<const __half*>(scale.data_ptr()),
+        cb.data_ptr<float>(), (int)T, (int)inf, (int)of,
+        dbg.data_ptr<float>());
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("mma_gemm_dbg launch: ")
+                                 + cudaGetErrorString(err));
+    return dbg;
+}
+
 static void gdn_core_batch(
     const float* qkvT, const float* zT, const float* boT, const float* aoT,
     torch::Tensor conv_w, torch::Tensor conv_b,

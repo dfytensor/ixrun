@@ -55,6 +55,14 @@ void step27_g(torch::Tensor h, torch::Tensor dpos, double theta);
 void step27_prefill(torch::Tensor h8, torch::Tensor dpos8, double theta,
                     int64_t final_block);
 void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta);
+torch::Tensor mma_unit_test(torch::Tensor a, torch::Tensor b);
+torch::Tensor dyn_smem_probe();
+torch::Tensor mma_gemm_dbg(torch::Tensor x, torch::Tensor idx,
+    torch::Tensor sign, torch::Tensor scale, torch::Tensor cb,
+    int64_t T, int64_t of, int64_t inf);
+torch::Tensor mma_gemm_test(torch::Tensor x, torch::Tensor idx,
+    torch::Tensor sign, torch::Tensor scale, torch::Tensor cb,
+    int64_t T, int64_t of, int64_t inf);
 std::vector<torch::Tensor> i8_dequant_test(torch::Tensor idx,
     torch::Tensor sign, torch::Tensor scale, torch::Tensor cb,
     int64_t of, int64_t inf);
@@ -72,7 +80,7 @@ torch::Tensor s27d_get_h1();
                        cuda_sources=[src, src27],
                        functions=['init27', 'step27', 'step27_g',
                                   'step27_prefill', 'step27_prefill_gemm', 'gdn_cmp_test',
-                                  'i8_dequant_test',
+                                  'i8_dequant_test', 'mma_gemm_test', 'mma_unit_test', 'mma_gemm_dbg', 'dyn_smem_probe',
                                   's27_reset', 's27_get_tok',
                                   's27_set_probe', 's27d_get_h1',
                                   'udcq_set_uls', 'udcq_gemv_out',
