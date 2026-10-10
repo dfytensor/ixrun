@@ -447,3 +447,54 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
 - CRITICAL CORRECTION to the A/B mismatch note above: test_27b_decisive.py used input_ids=[760] (SINGLE TOKEN) for the HF forward — so HF h(L0)=20.606 IS at pos 0 with zero states, SAME as C++ 5.915! The position mismatch theory is WRONG. The REAL finding: my torch ref formulas (used in every gate) produce h1 ~ 1.1-5.9-norm while the REAL HF module forward produces h1 ~ 20.6-norm on the same input — a ~3.5x core contribution difference. THE BUG IS IN MY TORCH REF FORMULAS (which the C++ kernels correctly implement): the formulas I wrote from reading the code differ from what HF actually computes. NEXT: (1) run the real HF module at(xn_bf16, None) on CUDA and compare its output vs my torch ref chain output element-wise, (2) the first divergent stage identifies the formula error (prime suspects: gated norm silu(z) application, conv1d state handling, or the l2norm+scaling interaction).
 
 - 27B SMOKING GUN: rmsnorm_fw in-situ output 60.4-norm vs expected 6-16 (|post_w|=15.77). Standalone gate with randn w (71-norm) masked this. ALL 27B kernel gates MUST use real weight scales.
+
+## 27B C++ engine — ULS format + perf marathon (2026/10/10-11) — 33.0 -> 37.5 decode / 37 -> 603 prefill
+- **ULS (log2-scale UDCQ)**: scale stream fp16/16 -> uint8 log2/16 with the
+  per-row (base,step) header INSIDE the stream (kernel signatures unchanged;
+  base/step read from the passed pointer) => 6.0 -> 5.5 bpw, -8% weight
+  bytes, -1.3GB VRAM. Worst row scale error 1.29% vs the 3.4% format tier.
+  Repack = pure stream transform (tests/repack_uls.py, 497 mats/209s) ->
+  F:\models\qwen38_uls_blob.pt. 5 scale-reading kernels templated <bool ULS>;
+  udcq_set_uls(1) per process. PY track: UdcqLinear AUTO-DETECTS uint8
+  scale (dtype == the flag; zero plumbing); ext v4; ULS non-{4,8} M must
+  chunk through mt8/mt4/single GEMVs (the torch-dequant fallback = 75s/prompt!).
+- **cudafe++ 0xC0000005 (recurring build AV)**: AVs ONLY when nvcc is spawned
+  from the python process tree (ninja-from-cmd and manual nvcc succeed
+  deterministically; ~50% flaky per attempt). WORKAROUND = tests/build_27b_ext.cmd
+  (stage1 python regenerates cuda.cu, may AV harmlessly; stage2 ninja from cmd)
+  + IXRUN_PREBUILT=1 makes _build_ext import the prebuilt .pyd directly.
+  Ext q27k->q27l->q27m across the format/fusion changes.
+- **Decode fusions**: add_norm_f32 (residual add + next norm in ONE launch,
+  1024 threads; 161->33 norm calls/token; TOTAL 28.52->27.75ms);
+  udcq_gemv_multi_kernel (qkv+z+b+a / q+k+v / gate+up each ONE launch; per-layer
+  288B device tables with SYNC table-build memcpy - async would read a dead
+  stack frame); v2 calls 369->129/token. 27->28ms wall.
+- **attn_b_v3 split-K (long ctx)**: old attn_b_kernel swept t serially per
+  thread (554us/call at pos 3800!). v3 = ATTN_V3_C=8 chunk-blocks/head +
+  merge. BUG FOUND: den block-reduced across 256 threads that EACH walked
+  all chunk entries (256x; the 0.996 = 1-1/256 signature).
+- **Prefill (blocked, S=8 -> GEMM)**: mt8b (bf16-x, warp-per-row, L1-cached,
+  the PY ext design) 149 tok/s -> dequant-to-bf16 + cuBLAS + segment
+  (T<=256, layer-major) 307 -> batched T-row cores (conv1d_batch rl2n_t
+  sigmoid_b ggate_b chunk_qgate_t rope27_t attn_batch_proj) 400 ->
+  gdn_recurrent_v2t (state slice in SMEM across all T tokens; the per-token
+  kernel RMW'd 6.3MB state/token = 77GB/segment!) 427 -> attn_b_v3t+merge_t
+  (batched; 8192 per-token graph nodes had ~5us node overhead each) = 603.
+  Gates: gdn_cmp_test A/B per-token-vs-batch (0.0 / 2.6e-7); gemm TEXT MATCH
+  first-tok 561; 26-tok A/B TOKEN/TEXT EXACT. FOUND along the way: conv
+  use_act=1 needs siLU; FLA l2norm is rsqrt(sum+eps) with NO /dk (I added
+  a division); cudaMemcpy2DAsync for the vr slice.
+- **GEMM segment budget (T=256, 252.6ms)**: dequant 83 (bf16 round-trip:
+  packed 17.6GB read + 51GB bf16 write), cublas 99 (13.1 TFLOP @ ~132
+  TFLOPS = near tensor peak), recurrent 36, attn 17, misc ~17. Dual-stream
+  dequant overlap = NEUTRAL (segment is DRAM-saturated; overlap can't hide
+  bandwidth behind bandwidth - reverted with data). int8 route (probe 2.06x
+  on _int_mm) KILLED on quality: per-row int8 = 4.0% rel vs bf16 0.64%
+  (6-octave within-row scale spread; IG32 lesson again) - code stays
+  default-off (IXRUN_GEMM_I8). Remaining un-attempted lever: fused mma
+  decode-GEMM (decode W into smem bf16 fragments per tile, skip the
+  102GB/segment round trip; ~1.5-2x prefill, multi-hour).
+- Handy hooks: IXRUN_NO_PREFILL=1 (legacy per-token prefill for A/B),
+  IXRUN_GEMM_I8, IXRUN_BATCH_GDN=0, IXRUN_PREBUILT. Profiling the 27B decode
+  graph with torch.profiler works (per-kernel attribution in graph replays).
+
