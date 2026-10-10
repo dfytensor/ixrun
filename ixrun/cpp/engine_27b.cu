@@ -196,9 +196,15 @@ void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta) {
     static torch::Tensor xnb, xn2b, onb, actb, attb, q2b, k2b, v2b, ob,
         qkvb, zb, bob, aob, mgb, mub, mdb;
     static torch::Tensor wq, wk, wv, wo, wg, wu, wd, wqkv, wz, wb, wa, lg;
+    static torch::Tensor sxq;
+    static const bool i8m =
+        (getenv("IXRUN_GEMM_I8") != nullptr &&
+         std::string(getenv("IXRUN_GEMM_I8")) != "0") ? true : false;
     static bool init = false;
     if (!init) {
         int M = GEMM_TMAX;
+        auto c8 = torch::TensorOptions()
+            .dtype(torch::kChar).device(hT.device());
         hA = torch::empty({M, hidden}, f32);
         hB = torch::empty({M, hidden}, f32);
         xnA = torch::empty({M, hidden}, f32);
@@ -219,33 +225,38 @@ void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta) {
         muT = torch::empty({M, inter}, f32);
         actT = torch::empty({M, inter}, f32);
         mdT = torch::empty({M, hidden}, f32);
-        xnb = torch::empty({M, hidden}, bf);
-        xn2b = torch::empty({M, hidden}, bf);
-        onb = torch::empty({M, value_dim}, bf);
-        actb = torch::empty({M, inter}, bf);
-        attb = torch::empty({M, NH * HD}, bf);
-        q2b = torch::empty({M, NH * HD * 2}, bf);
-        k2b = torch::empty({M, NKV * HD}, bf);
-        v2b = torch::empty({M, NKV * HD}, bf);
-        ob = torch::empty({M, hidden}, bf);
-        qkvb = torch::empty({M, conv_dim}, bf);
-        zb = torch::empty({M, value_dim}, bf);
-        bob = torch::empty({M, NV}, bf);
-        aob = torch::empty({M, NV}, bf);
-        mgb = torch::empty({M, inter}, bf);
-        mub = torch::empty({M, inter}, bf);
-        mdb = torch::empty({M, hidden}, bf);
-        wq = torch::empty({NH * HD * 2, hidden}, bf);
-        wk = torch::empty({NKV * HD, hidden}, bf);
-        wv = torch::empty({NKV * HD, hidden}, bf);
-        wo = torch::empty({hidden, NH * HD}, bf);
-        wg = torch::empty({inter, hidden}, bf);
-        wu = torch::empty({inter, hidden}, bf);
-        wd = torch::empty({hidden, inter}, bf);
-        wqkv = torch::empty({conv_dim, hidden}, bf);
-        wz = torch::empty({value_dim, hidden}, bf);
-        wb = torch::empty({NV, hidden}, bf);
-        wa = torch::empty({NV, hidden}, bf);
+        xnb = torch::empty({M, hidden}, i8m ? c8 : bf);
+        xn2b = torch::empty({M, hidden}, i8m ? c8 : bf);
+        onb = torch::empty({M, value_dim}, i8m ? c8 : bf);
+        actb = torch::empty({M, inter}, i8m ? c8 : bf);
+        attb = torch::empty({M, NH * HD}, i8m ? c8 : bf);
+        q2b = torch::empty({M, NH * HD * 2}, i8m ? c8 : bf);
+        k2b = torch::empty({M, NKV * HD}, i8m ? c8 : bf);
+        v2b = torch::empty({M, NKV * HD}, i8m ? c8 : bf);
+        ob = torch::empty({M, hidden}, i8m ? c8 : bf);
+        qkvb = torch::empty({M, conv_dim}, i8m ? c8 : bf);
+        zb = torch::empty({M, value_dim}, i8m ? c8 : bf);
+        bob = torch::empty({M, NV}, i8m ? c8 : bf);
+        aob = torch::empty({M, NV}, i8m ? c8 : bf);
+        mgb = torch::empty({M, inter}, i8m ? c8 : bf);
+        mub = torch::empty({M, inter}, i8m ? c8 : bf);
+        mdb = torch::empty({M, hidden}, i8m ? c8 : bf);
+        auto walloc = [&](long long of, long long inf) {
+            return i8m ? torch::empty({of * inf + 4 * of}, c8)
+                       : torch::empty({of, inf}, bf);
+        };
+        wq = walloc(NH * HD * 2, hidden);
+        wk = walloc(NKV * HD, hidden);
+        wv = walloc(NKV * HD, hidden);
+        wo = walloc(hidden, NH * HD);
+        wg = walloc(inter, hidden);
+        wu = walloc(inter, hidden);
+        wd = walloc(hidden, inter);
+        wqkv = walloc(conv_dim, hidden);
+        wz = walloc(value_dim, hidden);
+        wb = walloc(NV, hidden);
+        wa = walloc(NV, hidden);
+        sxq = torch::empty({M}, f32);
         int64_t vocab = s27_lh_i.numel() * 2 / hidden;
         lg = torch::empty({vocab}, f32);
         init = true;
@@ -260,6 +271,17 @@ void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta) {
     };
     auto deq = [&](torch::Tensor& w, const std::vector<torch::Tensor>& P,
                    int of, int inf) {
+        if (i8m) {
+            ucdq_i8_dequant_launch(
+                P[0].data_ptr<uint8_t>(),
+                reinterpret_cast<const uint32_t*>(P[1].data_ptr()),
+                reinterpret_cast<const __half*>(P[2].data_ptr()),
+                s27_cb.data_ptr<float>(), w.data_ptr<int8_t>(),
+                reinterpret_cast<float*>(w.data_ptr<int8_t>()
+                                         + (long long)of * inf),
+                of, inf, 16, st);
+            return;
+        }
         udcq_dequant_bf16_launch(
             P[0].data_ptr<uint8_t>(),
             reinterpret_cast<const uint32_t*>(P[1].data_ptr()),
@@ -269,18 +291,37 @@ void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta) {
             of, inf, 16, st);
     };
     auto castb = [&](const float* src, torch::Tensor& dst, int n) {
+        if (i8m) {
+            x_quant_i8_kernel<<<(unsigned)T, 256, 0, st>>>(
+                src, dst.data_ptr<int8_t>(), sxq.data_ptr<float>(), T, n);
+            return;
+        }
         int total = T * n;
         f32_to_bf16_kernel<<<(unsigned)((total + 255) / 256), 256, 0, st>>>(
             src, reinterpret_cast<__nv_bfloat16*>(dst.data_ptr()), total);
     };
     auto castf = [&](const torch::Tensor& src, float* dst, int n) {
+        if (i8m) return;                 // epilogue already wrote fp32
         int total = T * n;
         bf16_to_f32_kernel<<<(unsigned)((total + 255) / 256), 256, 0, st>>>(
             reinterpret_cast<const __nv_bfloat16*>(src.data_ptr()), dst,
             total);
     };
     auto mm = [&](torch::Tensor& outb, torch::Tensor& xb,
-                  const torch::Tensor& w) {
+                  const torch::Tensor& w, float* dst) {
+        if (i8m) {
+            int of = (int)outb.size(1);
+            int nf = (int)xb.size(1);
+            torch::Tensor wv = w.narrow(0, 0, (long long)of * nf)
+                                .view({of, nf});
+            auto acc = at::_int_mm(xb.narrow(0, 0, T), wv.t());
+            const float* rs = reinterpret_cast<const float*>(
+                w.data_ptr<int8_t>() + (long long)of * nf);
+            size_t tot = (size_t)T * of;
+            i8_epilogue_kernel<<<(unsigned)((tot + 255) / 256), 256, 0, st>>>(
+                acc.data_ptr<int>(), sxq.data_ptr<float>(), rs, dst, T, of);
+            return;
+        }
         torch::Tensor o = outb.narrow(0, 0, T);
         torch::Tensor x = xb.narrow(0, 0, T);
         at::matmul_out(o, x, w.t());
@@ -316,13 +357,13 @@ void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta) {
         deq(wd, T3(l, is_attn ? 6 : 7), hidden, inter);
         castb(xn_cur.data_ptr<float>(), xnb, hidden);
         if (!is_attn) {
-            mm(qkvb, xnb, wqkv);
+            mm(qkvb, xnb, wqkv, qkvT.data_ptr<float>());
             castf(qkvb, qkvT.data_ptr<float>(), conv_dim);
-            mm(zb, xnb, wz);
+            mm(zb, xnb, wz, zT.data_ptr<float>());
             castf(zb, zT.data_ptr<float>(), value_dim);
-            mm(bob, xnb, wb);
+            mm(bob, xnb, wb, boT.data_ptr<float>());
             castf(bob, boT.data_ptr<float>(), NV);
-            mm(aob, xnb, wa);
+            mm(aob, xnb, wa, aoT.data_ptr<float>());
             castf(aob, aoT.data_ptr<float>(), NV);
             if (getenv("IXRUN_BATCH_GDN") == nullptr ||
                 std::string(getenv("IXRUN_BATCH_GDN")) != "0") {
@@ -346,21 +387,21 @@ void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta) {
                     NV, NK, DK, DV, l);
             }
             castb(onT.data_ptr<float>(), onb, value_dim);
-            mm(ob, onb, wo);
+            mm(ob, onb, wo, oT.data_ptr<float>());
             castf(ob, oT.data_ptr<float>(), hidden);
             ig++;
         } else {
-            mm(q2b, xnb, wq);
+            mm(q2b, xnb, wq, q2T.data_ptr<float>());
             castf(q2b, q2T.data_ptr<float>(), NH * HD * 2);
-            mm(k2b, xnb, wk);
+            mm(k2b, xnb, wk, k2T.data_ptr<float>());
             castf(k2b, k2T.data_ptr<float>(), NKV * HD);
-            mm(v2b, xnb, wv);
+            mm(v2b, xnb, wv, v2T.data_ptr<float>());
             castf(v2b, v2T.data_ptr<float>(), NKV * HD);
             attn_batch_proj(q2T, k2T, v2T, attT, dpos,
                             s27_aex[ia * 2], s27_aex[ia * 2 + 1], s27_kv[ia],
                             theta, T, NH, NKV, HD, (int)s27_ctx);
             castb(attT.data_ptr<float>(), attb, NH * HD);
-            mm(ob, attb, wo);
+            mm(ob, attb, wo, oT.data_ptr<float>());
             castf(ob, oT.data_ptr<float>(), hidden);
             ia++;
         }
@@ -369,15 +410,15 @@ void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta) {
             s27_nw2[l].data_ptr<float>(), h1T.data_ptr<float>(),
             xn2T.data_ptr<float>(), hidden, 1e-6f);
         castb(xn2T.data_ptr<float>(), xn2b, hidden);
-        mm(mgb, xn2b, wg);
+        mm(mgb, xn2b, wg, mgT.data_ptr<float>());
         castf(mgb, mgT.data_ptr<float>(), inter);
-        mm(mub, xn2b, wu);
+        mm(mub, xn2b, wu, muT.data_ptr<float>());
         castf(mub, muT.data_ptr<float>(), inter);
         silu_kernel<<<(unsigned)((T * inter + 255) / 256), 256, 0, st>>>(
             mgT.data_ptr<float>(), muT.data_ptr<float>(),
             actT.data_ptr<float>(), T * inter);
         castb(actT.data_ptr<float>(), actb, inter);
-        mm(mdb, actb, wd);
+        mm(mdb, actb, wd, mdT.data_ptr<float>());
         castf(mdb, mdT.data_ptr<float>(), hidden);
         add_norm_f32<<<(unsigned)T, 1024, 0, st>>>(
             h1T.data_ptr<float>(), mdT.data_ptr<float>(),

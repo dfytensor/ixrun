@@ -2172,7 +2172,211 @@ __global__ void gdn_recurrent_v2t_kernel(
         Sh[(long long)i * dv + j] = s_sm[i * 32 + jl];
 }
 
-// batched GDN core (same math as T per-token gdn_core_from_proj calls)
+// ---------------- int8 prefill GEMM path (halves dequant IO and ------- //
+// doubles the tensor-core rate): pass says + int8 dequant, int8 x-quant,
+// int8 epilogue. Weight rows: q = round(cb[nib]*sign*scale*127/rowscale),
+// rowscale = 2^(base+step*max_i8)*cbmax (upper bound of the row max).
+
+// pass 1: per-weight-row max of the log-scale stream -> rowscale array
+template <bool ULS>
+__global__ void ucdq_i8_rowscale_kernel(
+    const __half* __restrict__ scale, const float* __restrict__ cb,
+    float* __restrict__ rowscale, int out_f, int in_f, int GROUP)
+{
+    int r = blockIdx.x;
+    int ngr = in_f / GROUP;
+    int t = threadIdx.x;
+    __shared__ float red[8];
+    float m = -1e30f;
+    float cbmax = 0.f;
+    for (int i = 0; i < 16; ++i) cbmax = fmaxf(cbmax, fabsf(cb[i]));
+    if (ULS) {
+        const uint8_t* urow = reinterpret_cast<const uint8_t*>(scale)
+                              + (size_t)r * (size_t)(ngr + 8);
+        for (int g = t; g < ngr; g += blockDim.x)
+            m = fmaxf(m, (float)urow[8 + g]);
+        for (int o = 16; o > 0; o >>= 1)
+            m = fmaxf(m, __shfl_down_sync(0xffffffff, m, o));
+        if ((t & 31) == 0) red[t >> 5] = m;
+        __syncthreads();
+        if (t == 0) {
+            float mm = -1e30f;
+            for (int k = 0; k < (int)(blockDim.x >> 5); ++k)
+                mm = fmaxf(mm, red[k]);
+            float base = *reinterpret_cast<const float*>(urow);
+            float step = *reinterpret_cast<const float*>(urow + 4);
+            rowscale[r] = exp2f(base + step * mm) * cbmax / 127.f;
+        }
+    } else {
+        const __half* srow = scale + (size_t)r * ngr;
+        for (int g = t; g < ngr; g += blockDim.x)
+            m = fmaxf(m, __half2float(srow[g]));
+        for (int o = 16; o > 0; o >>= 1)
+            m = fmaxf(m, __shfl_down_sync(0xffffffff, m, o));
+        if ((t & 31) == 0) red[t >> 5] = m;
+        __syncthreads();
+        if (t == 0) {
+            float mm = -1e30f;
+            for (int k = 0; k < (int)(blockDim.x >> 5); ++k)
+                mm = fmaxf(mm, red[k]);
+            rowscale[r] = mm * cbmax / 127.f;
+        }
+    }
+}
+
+// int8 dequant [out_f, in_f]; same group/thread mapping as the bf16 version
+template <bool ULS>
+__global__ void udcq_dequant_i8_kernel(
+    const uint8_t* __restrict__ idx,
+    const uint32_t* __restrict__ sign,
+    const __half* __restrict__ scale,
+    const float* __restrict__ cb,
+    const float* __restrict__ rowscale,
+    int8_t* __restrict__ y,
+    int out_f, int in_f, int GROUP)
+{
+    __shared__ float cb_sm[16];
+    if (threadIdx.x < 16) cb_sm[threadIdx.x] = cb[threadIdx.x];
+    __syncthreads();
+    int r = blockIdx.x;
+    int ngr = in_f / GROUP;
+    int g0 = threadIdx.x * 4;
+    if (g0 >= ngr) return;
+    float rs = rowscale[r];               // stores (row max)/127: the
+    float inv = (rs > 0.f) ? 1.f / rs     // epilogue还原 factor directly
+               : 0.f;
+    float sbase = 0.f, sstep = 0.f;
+    const uint8_t* urow = nullptr;
+    const __half* srow = nullptr;
+    if (ULS) {
+        urow = reinterpret_cast<const uint8_t*>(scale)
+               + (size_t)r * (size_t)(ngr + 8);
+        sbase = *reinterpret_cast<const float*>(urow);
+        sstep = *reinterpret_cast<const float*>(urow + 4);
+    } else {
+        srow = scale + (size_t)r * ngr;
+    }
+    const uint8_t* irow = idx + (size_t)r * (in_f / 2);
+    const uint32_t* wrow = sign + (size_t)r * (in_f / 32);
+    int8_t* yrow = y + (size_t)r * in_f;
+    #pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        int gg = g0 + q;
+        if (gg >= ngr) break;
+        const uint32_t sw = wrow[gg >> 1] >> (16 * (gg & 1));
+        float sc = ULS
+            ? exp2f(sbase + sstep * (float)urow[8 + gg])
+            : __half2float(srow[gg]);
+        float fac = sc * inv;
+        uint32_t b[2];
+        b[0] = *reinterpret_cast<const uint32_t*>(irow + (size_t)gg * 8);
+        b[1] = *reinterpret_cast<const uint32_t*>(irow + (size_t)gg * 8 + 4);
+        int8_t qv[16];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int nib0 = (int)((b[i >> 2] >> (8 * (i & 3))) & 0xF);
+            int nib1 = (int)((b[i >> 2] >> (8 * (i & 3) + 4)) & 0xF);
+            int s0 = (int)((sw >> (2 * i)) & 1u);
+            int s1 = (int)((sw >> (2 * i + 1)) & 1u);
+            float w0 = (s0 ? cb_sm[nib0] : -cb_sm[nib0]) * fac;
+            float w1 = (s1 ? cb_sm[nib1] : -cb_sm[nib1]) * fac;
+            int v0 = __float2int_rn(w0);
+            int v1 = __float2int_rn(w1);
+            qv[2 * i] = (int8_t)max(-127, min(127, v0));
+            qv[2 * i + 1] = (int8_t)max(-127, min(127, v1));
+        }
+        *reinterpret_cast<uint4*>(yrow + (size_t)gg * GROUP) =
+            *reinterpret_cast<uint4*>(&qv[0]);
+        *reinterpret_cast<uint4*>(yrow + (size_t)gg * GROUP + 8) =
+            *reinterpret_cast<uint4*>(&qv[8]);
+    }
+}
+
+static void ucdq_i8_dequant_launch(
+    const uint8_t* idx, const uint32_t* sign, const __half* scale,
+    const float* cb, int8_t* y, float* rowscale,
+    int out_f, int in_f, int group, cudaStream_t st)
+{
+    int nt = ((in_f / group / 4 + 31) / 32) * 32;
+    if (g_uls) {
+        ucdq_i8_rowscale_kernel<true><<<(unsigned)out_f, 256, 0, st>>>(
+            scale, cb, rowscale, out_f, in_f, group);
+        udcq_dequant_i8_kernel<true><<<(unsigned)out_f, (unsigned)nt, 0, st>>>(
+            idx, sign, scale, cb, rowscale, y, out_f, in_f, group);
+    } else {
+        ucdq_i8_rowscale_kernel<false><<<(unsigned)out_f, 256, 0, st>>>(
+            scale, cb, rowscale, out_f, in_f, group);
+        udcq_dequant_i8_kernel<false><<<(unsigned)out_f, (unsigned)nt, 0, st>>>(
+            idx, sign, scale, cb, rowscale, y, out_f, in_f, group);
+    }
+}
+
+// per-token-row int8 activation quant: xi8 = round(x/max_abs*127), sx =
+// max_abs/127 (one block per row)
+__global__ void x_quant_i8_kernel(const float* __restrict__ x,
+                                  int8_t* __restrict__ xi8,
+                                  float* __restrict__ sx, int rows, int d) {
+    __shared__ float red[32];
+    int r = blockIdx.x;
+    const float* xr = x + (size_t)r * d;
+    int8_t* yr = xi8 + (size_t)r * d;
+    float m = 0.f;
+    for (int i = threadIdx.x; i < d; i += blockDim.x)
+        m = fmaxf(m, fabsf(xr[i]));
+    if (threadIdx.x < 32) red[threadIdx.x] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        m = fmaxf(m, __shfl_down_sync(0xffffffff, m, o));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float mm = 0.f;
+        for (int k = 0; k < (int)(blockDim.x >> 5); ++k)
+            mm = fmaxf(mm, red[k]);
+        red[0] = (mm > 0.f) ? mm / 127.f : 1.f;
+    }
+    __syncthreads();
+    float s = red[0];
+    float inv = 1.f / s;
+    if (threadIdx.x == 0) sx[r] = s;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        int v = __float2int_rn(xr[i] * inv);
+        yr[i] = (int8_t)max(-127, min(127, v));
+    }
+}
+
+// int32 accumulate -> fp32 out scaled by per-token and per-row factors
+__global__ void i8_epilogue_kernel(const int* __restrict__ acc,
+                                   const float* __restrict__ sx,
+                                   const float* __restrict__ sw,
+                                   float* __restrict__ out,
+                                   int T, int out_f) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t n = (size_t)T * out_f;
+    if (i >= n) return;
+    int t = (int)(i / out_f);
+    int r = (int)(i - (size_t)t * out_f);
+    out[i] = (float)acc[i] * sx[t] * sw[r];
+}
+
+std::vector<torch::Tensor> i8_dequant_test(
+    torch::Tensor idx, torch::Tensor sign, torch::Tensor scale,
+    torch::Tensor cb, int64_t of, int64_t inf) {
+    auto st = at::cuda::getCurrentCUDAStream();
+    auto q = torch::empty({of, inf}, torch::TensorOptions()
+        .dtype(torch::kChar).device(idx.device()));
+    auto rs = torch::empty({of}, torch::TensorOptions()
+        .dtype(torch::kFloat32).device(idx.device()));
+    ucdq_i8_dequant_launch(
+        idx.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(sign.data_ptr()),
+        reinterpret_cast<const __half*>(scale.data_ptr()),
+        cb.data_ptr<float>(), q.data_ptr<int8_t>(), rs.data_ptr<float>(),
+        (int)of, (int)inf, 16, st);
+    return {q, rs};
+}
+
 static void gdn_core_batch(
     const float* qkvT, const float* zT, const float* boT, const float* aoT,
     torch::Tensor conv_w, torch::Tensor conv_b,
