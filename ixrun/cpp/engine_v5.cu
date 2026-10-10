@@ -695,7 +695,93 @@ __global__ void udcq_gemv_v2_kernel(
     if (lane == 0) y[r] = acc;
 }
 
-// dispatcher: v2 for the supported format, v1 fallback otherwise
+// v2c: v2 with the x staged in KCHUNK pieces so the smem stays small.
+// For in_f=17408 (down_proj) v2's 69.6KB smem allows only 1 block/SM;
+// this variant uses 32.9KB => 3 blocks/SM. Chunks start at 32-group
+// boundaries and each lane walks its groups chunk-major, so the per-lane
+// accumulation order is IDENTICAL to v2 => bit-exact outputs.
+#define V2C_KCHUNK 8192
+
+template <bool ULS>
+__global__ void udcq_gemv_v2c_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ idx,
+    const uint32_t* __restrict__ sign,
+    const __half* __restrict__ scale,
+    const float* __restrict__ cb,
+    float* __restrict__ y,
+    int in_f, int out_f, int GROUP)
+{
+    extern __shared__ float smem[];
+    float* x_sm = smem;              // V2C_KCHUNK floats
+    float* cb_sm = smem + V2C_KCHUNK;
+    for (int i = threadIdx.x; i < 16; i += blockDim.x) {
+        cb_sm[i] = -cb[i];
+        cb_sm[i + 16] = cb[i];
+    }
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (r >= out_f) return;
+    int n_gr = in_f / GROUP;
+    const uint8_t* irow = idx + (size_t)r * (in_f / 2);
+    const uint32_t* wrow = sign + (size_t)r * (in_f / 32);
+    const __half* srow = scale + (size_t)r * n_gr;
+    const uint8_t* urow = reinterpret_cast<const uint8_t*>(scale)
+                          + (size_t)r * (size_t)(n_gr + 8);
+    float sbase = 0.f, sstep = 0.f;
+    if (ULS) {
+        sbase = *reinterpret_cast<const float*>(urow);
+        sstep = *reinterpret_cast<const float*>(urow + 4);
+    }
+    float acc = 0.f;
+    for (int c0 = 0; c0 < in_f; c0 += V2C_KCHUNK) {
+        int klen = min(V2C_KCHUNK, in_f - c0);
+        __syncthreads();                    // x_sm reuse across chunks
+        for (int i = threadIdx.x; i < klen; i += blockDim.x)
+            x_sm[i] = x[c0 + i];
+        __syncthreads();
+        int g0 = c0 / GROUP;
+        int gn = klen / GROUP;
+        for (int g = lane; g < gn; g += 32) {
+            int gg = g0 + g;
+            uint2 b2 = *reinterpret_cast<const uint2*>(irow + (size_t)gg * 8);
+            uint32_t sw = wrow[gg >> 1] >> (16 * (gg & 1));
+            float sc = ULS ? exp2f(sbase + sstep * (float)urow[8 + gg])
+                           : __half2float(srow[gg]);
+            const float* xs = x_sm + (size_t)g * GROUP;
+            float xr[16];
+            #pragma unroll
+            for (int q = 0; q < 4; ++q)
+                *reinterpret_cast<float4*>(&xr[q * 4]) =
+                    *reinterpret_cast<const float4*>(xs + q * 4);
+            float inner = 0.f;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int b = (int)((b2.x >> (8 * i)) & 0xFF);
+                int s0 = (int)((sw >> (2 * i)) & 1u) << 4;
+                int s1 = (int)((sw >> (2 * i + 1)) & 1u) << 4;
+                inner = fmaf(cb_sm[(b & 0xF) | s0], xr[2 * i], inner);
+                inner = fmaf(cb_sm[(b >> 4) | s1], xr[2 * i + 1], inner);
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int b = (int)((b2.y >> (8 * i)) & 0xFF);
+                int s0 = (int)((sw >> (8 + 2 * i)) & 1u) << 4;
+                int s1 = (int)((sw >> (8 + 2 * i + 1)) & 1u) << 4;
+                inner = fmaf(cb_sm[(b & 0xF) | s0], xr[8 + 2 * i], inner);
+                inner = fmaf(cb_sm[(b >> 4) | s1], xr[8 + 2 * i + 1], inner);
+            }
+            acc += inner * sc;
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) y[r] = acc;
+}
+
+
 static void udcq_gemv_launch(
     const float* x, const uint8_t* idx, const uint32_t* sign,
     const __half* scale, const float* cb, float* y,
@@ -720,7 +806,19 @@ static void udcq_gemv_launch(
         }
         size_t sm = (size_t)in_f * sizeof(float) + 16 * sizeof(float);
         if ((int)sm <= max_sm) {
-            int wpb = (in_f > 12288) ? 16 : 8;   // big smem -> 1 blk/SM: use all warps
+            if (in_f > 12288) {
+                // v2c: chunked x staging keeps smem at 32.9KB => 3 blocks/SM
+                size_t smc = (size_t)V2C_KCHUNK * sizeof(float)
+                             + 32 * sizeof(float);
+                if (g_uls)
+                    udcq_gemv_v2c_kernel<true><<<(out_f + 7) / 8, 256, smc, st>>>(
+                        x, idx, sign, scale, cb, y, in_f, out_f, group);
+                else
+                    udcq_gemv_v2c_kernel<false><<<(out_f + 7) / 8, 256, smc, st>>>(
+                        x, idx, sign, scale, cb, y, in_f, out_f, group);
+                return;
+            }
+            int wpb = 8;
             if (g_uls)
                 udcq_gemv_v2_kernel<true><<<(out_f + wpb - 1) / wpb, wpb * 32, sm, st>>>(
                     x, idx, sign, scale, cb, y, in_f, out_f, group);
