@@ -943,7 +943,137 @@ __global__ void udcq_gemv_mt8_kernel(
 // (mt8 launcher moved below the staged mt8q kernel; the plain mt8 kernel
 // above is kept for reference only)
 
-// staged mt8 ("mt8q"): the plain mt8 above re-reads ALL 8 x planes per ROW
+// fp32 -> bf16 cast (prefill GEMV inputs; the model's native activation
+// precision -- decode stays fp32/bit-exact, prefill trades exactness for
+// the halved x traffic that makes mt8b ~1.1-1.5x a single call for 8 tokens)
+__global__ void f32_to_bf16_kernel(const float* __restrict__ in,
+                                   __nv_bfloat16* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2bfloat16_rn(in[i]);
+}
+
+// mt8b: T=8 prefill GEMV ported from the proven PY ext design (bf16 x,
+// warp-per-row, NO smem staging: the whole x row-set stays L1-hot across
+// rows, which made the PY mt kernels 1.06-1.54x a single call for 8 tokens
+// vs 2.6-3.4x for the smem-staged fp32 C++ mt8q). Writes fp32 y.
+#define MT8B_WARPS 8
+template <bool ULS>
+__global__ void __launch_bounds__(MT8B_WARPS * 32)
+udcq_gemv_mt8b_kernel(
+    const __nv_bfloat16* __restrict__ x,     // [8, in_f]
+    float* __restrict__ y,                   // [8, out_f] fp32
+    const uint8_t* __restrict__ idx,
+    const int* __restrict__ sign,
+    const __half* __restrict__ scale,
+    const float* __restrict__ cb,
+    int in_f, int out_f, int GROUP)
+{
+    __shared__ float cb_sm[32];
+    for (int i = threadIdx.x; i < 16; i += blockDim.x) {
+        cb_sm[i] = -cb[i];
+        cb_sm[i + 16] = cb[i];
+    }
+    __syncthreads();
+    const int row = blockIdx.x * MT8B_WARPS + threadIdx.x / 32;
+    const int t = threadIdx.x & 31;
+    if (row >= out_f) return;
+    const int NSTEP = in_f / 256;
+    const uint8_t* irow = idx + (size_t)row * (in_f / 2);
+    const int* srow = sign + (size_t)row * (in_f / 32);
+    const __half* crow = scale + (size_t)row * (in_f / 16);
+    const uint8_t* urow = reinterpret_cast<const uint8_t*>(scale)
+                          + (size_t)row * (size_t)(in_f / 16 + 8);
+    float sbase = 0.f, sstep = 0.f;
+    if (ULS) {
+        sbase = *reinterpret_cast<const float*>(urow);
+        sstep = *reinterpret_cast<const float*>(urow + 4);
+    }
+    float a[8][4];
+    #pragma unroll
+    for (int tk = 0; tk < 8; ++tk)
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) a[tk][u] = 0.f;
+    const int sb = (t & 3) * 8;
+    int j = 0;
+    for (; j + 3 < NSTEP; j += 4) {
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int k0 = (j + u) * 256;
+            const uint32_t b = *(const uint32_t*)(irow + k0 / 2 + (size_t)t * 4);
+            const uint32_t sw = (uint32_t)*(const int*)(srow + (k0 >> 5) + (t >> 2));
+            const float sc = ULS
+                ? exp2f(sbase + sstep * (float)urow[8 + (k0 >> 4) + (t >> 1)])
+                : __half2float(crow[(k0 >> 4) + (t >> 1)]);
+            float wv[8];
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                wv[i] = cb_sm[((b >> (4 * i)) & 0xF)
+                              | (int)((sw >> (sb + i)) & 1u) << 4] * sc;
+            #pragma unroll
+            for (int tk = 0; tk < 8; ++tk) {
+                const uint4 xv = *(const uint4*)(x + (size_t)tk * in_f +
+                                                 k0 + (size_t)t * 8);
+                float acc = 0.f;
+                #pragma unroll
+                for (int i = 0; i < 8; i++)
+                    acc = fmaf(wv[i], __bfloat162float(
+                        ((const __nv_bfloat16*)&xv)[i]), acc);
+                a[tk][u] += acc;
+            }
+        }
+    }
+    for (; j < NSTEP; j++) {
+        const int k0 = j * 256;
+        const uint32_t b = *(const uint32_t*)(irow + k0 / 2 + (size_t)t * 4);
+        const uint32_t sw = (uint32_t)*(const int*)(srow + (k0 >> 5) + (t >> 2));
+        const float sc = ULS
+            ? exp2f(sbase + sstep * (float)urow[8 + (k0 >> 4) + (t >> 1)])
+            : __half2float(crow[(k0 >> 4) + (t >> 1)]);
+        float wv[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            wv[i] = cb_sm[((b >> (4 * i)) & 0xF)
+                          | (int)((sw >> (sb + i)) & 1u) << 4] * sc;
+        #pragma unroll
+        for (int tk = 0; tk < 8; ++tk) {
+            float acc = 0.f;
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                acc = fmaf(wv[i], __bfloat162float(
+                    x[(size_t)tk * in_f + k0 + (size_t)t * 8 + i]), acc);
+            a[tk][0] += acc;
+        }
+    }
+    float s[8];
+    #pragma unroll
+    for (int tk = 0; tk < 8; ++tk) {
+        s[tk] = (a[tk][0] + a[tk][1]) + (a[tk][2] + a[tk][3]);
+        #pragma unroll
+        for (int o = 16; o; o >>= 1)
+            s[tk] += __shfl_xor_sync(0xffffffffu, s[tk], o);
+    }
+    if (t == 0) {
+        #pragma unroll
+        for (int tk = 0; tk < 8; ++tk)
+            y[(size_t)tk * out_f + row] = s[tk];
+    }
+}
+
+static void udcq_gemv_mt8b_launch(
+    const __nv_bfloat16* x, const uint8_t* idx, const uint32_t* sign,
+    const __half* scale, const float* cb, float* y,
+    int out_f, int in_f, int group, cudaStream_t st)
+{
+    if (g_uls)
+        udcq_gemv_mt8b_kernel<true><<<(unsigned)((out_f + 7) / 8), 256, 0, st>>>(
+            x, y, idx, reinterpret_cast<const int*>(sign), scale, cb,
+            in_f, out_f, group);
+    else
+        udcq_gemv_mt8b_kernel<false><<<(unsigned)((out_f + 7) / 8), 256, 0, st>>>(
+            x, y, idx, reinterpret_cast<const int*>(sign), scale, cb,
+            in_f, out_f, group);
+}
+
 // from L2 (each warp's walk needs the full x; measured 182GB/s effective,
 // 96.75ms per prefill block vs the 19.5ms DRAM floor). mt8q stages the x in
 // smem in K-chunks (fp32) once per 8-row block; per-lane group order and the

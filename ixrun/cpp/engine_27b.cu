@@ -187,6 +187,7 @@ void step27_prefill(torch::Tensor h8, torch::Tensor dpos8, double theta,
     static torch::Tensor xn8, h1_8, xn2_8, out8, xn_next8,
         qkv8, z8, bo8, ao8, on8, o8, mg8, mu8, act8, md8,
         q2_8, k2_8, v2_8, att8, lg;
+    static torch::Tensor xnb, xn2b, onb, actb, attb;
     static bool init = false;
     if (!init) {
         xn8   = torch::empty({8, hidden}, f32);
@@ -210,6 +211,13 @@ void step27_prefill(torch::Tensor h8, torch::Tensor dpos8, double theta,
         att8  = torch::empty({8, NH * HD}, f32);
         int64_t vocab = s27_lh_i.numel() * 2 / hidden;
         lg    = torch::empty({vocab}, f32);
+        auto bf = torch::TensorOptions()
+            .dtype(torch::kBFloat16).device(h8.device());
+        xnb   = torch::empty({8, hidden}, bf);
+        xn2b  = torch::empty({8, hidden}, bf);
+        onb   = torch::empty({8, value_dim}, bf);
+        actb  = torch::empty({8, inter}, bf);
+        attb  = torch::empty({8, NH * HD}, bf);
         init = true;
     }
     if (!s27_tok.defined())
@@ -223,9 +231,15 @@ void step27_prefill(torch::Tensor h8, torch::Tensor dpos8, double theta,
         int k = (l * 8 + s) * 3;
         return {s27_packs[k], s27_packs[k + 1], s27_packs[k + 2]};
     };
-    auto mt8 = [&](const float* xp, const std::vector<torch::Tensor>& P,
+    auto castb = [&](const float* src, torch::Tensor& dst, int n) {
+        int total = 8 * n;
+        f32_to_bf16_kernel<<<(unsigned)((total + 255) / 256), 256, 0, st>>>(
+            src, reinterpret_cast<__nv_bfloat16*>(dst.data_ptr()), total);
+    };
+    auto mt8 = [&](const __nv_bfloat16* xp,
+                   const std::vector<torch::Tensor>& P,
                    float* y, int of, int inf) {
-        udcq_gemv_mt8_launch(
+        udcq_gemv_mt8b_launch(
             xp, P[0].data_ptr<uint8_t>(),
             reinterpret_cast<const uint32_t*>(P[1].data_ptr()),
             reinterpret_cast<const __half*>(P[2].data_ptr()),
@@ -242,10 +256,13 @@ void step27_prefill(torch::Tensor h8, torch::Tensor dpos8, double theta,
             if (a == l) { is_attn = true; break; }
         torch::Tensor next_w = (l + 1 < nl) ? s27_nw1[l + 1] : s27_fnw;
         if (!is_attn) {
-            mt8(xn_p, T3(l, 0), qkv8.data_ptr<float>(), conv_dim, hidden);
-            mt8(xn_p, T3(l, 1), z8.data_ptr<float>(), value_dim, hidden);
-            mt8(xn_p, T3(l, 2), bo8.data_ptr<float>(), NV, hidden);
-            mt8(xn_p, T3(l, 3), ao8.data_ptr<float>(), NV, hidden);
+            castb(xn_p, xnb, hidden);
+            const __nv_bfloat16* xb =
+                reinterpret_cast<const __nv_bfloat16*>(xnb.data_ptr());
+            mt8(xb, T3(l, 0), qkv8.data_ptr<float>(), conv_dim, hidden);
+            mt8(xb, T3(l, 1), z8.data_ptr<float>(), value_dim, hidden);
+            mt8(xb, T3(l, 2), bo8.data_ptr<float>(), NV, hidden);
+            mt8(xb, T3(l, 3), ao8.data_ptr<float>(), NV, hidden);
             for (int i = 0; i < 8; ++i)
                 gdn_core_from_proj(
                     qkv8.data_ptr<float>() + (size_t)i * conv_dim,
@@ -257,13 +274,17 @@ void step27_prefill(torch::Tensor h8, torch::Tensor dpos8, double theta,
                     s27_gnorm[ig], s27_convst[ig], s27_S[ig],
                     on8.data_ptr<float>() + (size_t)i * value_dim,
                     NV, NK, DK, DV, l);
-            mt8(on8.data_ptr<float>(), T3(l, 4),
-                o8.data_ptr<float>(), hidden, value_dim);
+            castb(on8.data_ptr<float>(), onb, value_dim);
+            mt8(reinterpret_cast<const __nv_bfloat16*>(onb.data_ptr()),
+                T3(l, 4), o8.data_ptr<float>(), hidden, value_dim);
             ig++;
         } else {
-            mt8(xn_p, T3(l, 0), q2_8.data_ptr<float>(), NH * HD * 2, hidden);
-            mt8(xn_p, T3(l, 1), k2_8.data_ptr<float>(), NKV * HD, hidden);
-            mt8(xn_p, T3(l, 2), v2_8.data_ptr<float>(), NKV * HD, hidden);
+            castb(xn_p, xnb, hidden);
+            const __nv_bfloat16* xb =
+                reinterpret_cast<const __nv_bfloat16*>(xnb.data_ptr());
+            mt8(xb, T3(l, 0), q2_8.data_ptr<float>(), NH * HD * 2, hidden);
+            mt8(xb, T3(l, 1), k2_8.data_ptr<float>(), NKV * HD, hidden);
+            mt8(xb, T3(l, 2), v2_8.data_ptr<float>(), NKV * HD, hidden);
             for (int i = 0; i < 8; ++i)
                 attn_from_proj(
                     q2_8.data_ptr<float>() + (size_t)i * NH * HD * 2,
@@ -273,21 +294,27 @@ void step27_prefill(torch::Tensor h8, torch::Tensor dpos8, double theta,
                     theta, dpos8.data_ptr<int>() + i,
                     att8.data_ptr<float>() + (size_t)i * NH * HD,
                     NH, NKV, HD, (int)s27_ctx);
-            mt8(att8.data_ptr<float>(), T3(l, 3),
-                o8.data_ptr<float>(), hidden, NH * HD);
+            castb(att8.data_ptr<float>(), attb, NH * HD);
+            mt8(reinterpret_cast<const __nv_bfloat16*>(attb.data_ptr()),
+                T3(l, 3), o8.data_ptr<float>(), hidden, NH * HD);
             ia++;
         }
         add_norm_f32<<<8, 1024, 0, st>>>(
             h_p, o8.data_ptr<float>(), s27_nw2[l].data_ptr<float>(),
             h1_8.data_ptr<float>(), xn2_8.data_ptr<float>(), hidden, 1e-6f);
-        mt8(xn2_8.data_ptr<float>(), T3(l, is_attn ? 4 : 5),
+        castb(xn2_8.data_ptr<float>(), xn2b, hidden);
+        const __nv_bfloat16* x2b =
+            reinterpret_cast<const __nv_bfloat16*>(xn2b.data_ptr());
+        mt8(x2b, T3(l, is_attn ? 4 : 5),
             mg8.data_ptr<float>(), inter, hidden);
-        mt8(xn2_8.data_ptr<float>(), T3(l, is_attn ? 5 : 6),
+        mt8(x2b, T3(l, is_attn ? 5 : 6),
             mu8.data_ptr<float>(), inter, hidden);
         silu_kernel<<<(unsigned)((8 * inter + 255) / 256), 256, 0, st>>>(
             mg8.data_ptr<float>(), mu8.data_ptr<float>(),
             act8.data_ptr<float>(), 8 * inter);
-        mt8(act8.data_ptr<float>(), T3(l, is_attn ? 6 : 7),
+        castb(act8.data_ptr<float>(), actb, inter);
+        mt8(reinterpret_cast<const __nv_bfloat16*>(actb.data_ptr()),
+            T3(l, is_attn ? 6 : 7),
             md8.data_ptr<float>(), hidden, inter);
         add_norm_f32<<<8, 1024, 0, st>>>(
             h1_8.data_ptr<float>(), md8.data_ptr<float>(),
