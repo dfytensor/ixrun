@@ -1079,8 +1079,12 @@ __global__ void udcq_dequant_bf16_kernel(
     __nv_bfloat16* __restrict__ y,
     int out_f, int in_f, int GROUP)
 {
-    __shared__ float cb_sm[16];
-    if (threadIdx.x < 16) cb_sm[threadIdx.x] = cb[threadIdx.x];
+    __shared__ float cb_fold[32];
+    if (threadIdx.x < 16) {
+        cb_fold[threadIdx.x] = -cb[threadIdx.x];
+        cb_fold[threadIdx.x + 16] = cb[threadIdx.x];
+    }
+    __syncthreads();
     __syncthreads();
     int r = blockIdx.x;
     int ngr = in_f / GROUP;
@@ -1116,10 +1120,10 @@ __global__ void udcq_dequant_bf16_kernel(
         for (int i = 0; i < 8; ++i) {
             int nib0 = (int)((b[i >> 2] >> (8 * (i & 3))) & 0xF);
             int nib1 = (int)((b[i >> 2] >> (8 * (i & 3) + 4)) & 0xF);
-            int s0 = (int)((sw >> (2 * i)) & 1u);
-            int s1 = (int)((sw >> (2 * i + 1)) & 1u);
-            float w0 = (s0 ? cb_sm[nib0] : -cb_sm[nib0]) * sc;
-            float w1 = (s1 ? cb_sm[nib1] : -cb_sm[nib1]) * sc;
+            int s0 = (int)((sw >> (2 * i)) & 1u) << 4;
+            int s1 = (int)((sw >> (2 * i + 1)) & 1u) << 4;
+            float w0 = cb_fold[nib0 | s0] * sc;
+            float w1 = cb_fold[nib1 | s1] * sc;
             pk[i] = __floats2bfloat162_rn(w0, w1);
         }
         *reinterpret_cast<uint4*>(yrow + (size_t)gg * GROUP) =
@@ -2235,8 +2239,12 @@ __global__ void udcq_dequant_i8_kernel(
     int8_t* __restrict__ y,
     int out_f, int in_f, int GROUP)
 {
-    __shared__ float cb_sm[16];
-    if (threadIdx.x < 16) cb_sm[threadIdx.x] = cb[threadIdx.x];
+    __shared__ float cb_fold[32];
+    if (threadIdx.x < 16) {
+        cb_fold[threadIdx.x] = -cb[threadIdx.x];
+        cb_fold[threadIdx.x + 16] = cb[threadIdx.x];
+    }
+    __syncthreads();
     __syncthreads();
     int r = blockIdx.x;
     int ngr = in_f / GROUP;
@@ -2276,10 +2284,10 @@ __global__ void udcq_dequant_i8_kernel(
         for (int i = 0; i < 8; ++i) {
             int nib0 = (int)((b[i >> 2] >> (8 * (i & 3))) & 0xF);
             int nib1 = (int)((b[i >> 2] >> (8 * (i & 3) + 4)) & 0xF);
-            int s0 = (int)((sw >> (2 * i)) & 1u);
-            int s1 = (int)((sw >> (2 * i + 1)) & 1u);
-            float w0 = (s0 ? cb_sm[nib0] : -cb_sm[nib0]) * fac;
-            float w1 = (s1 ? cb_sm[nib1] : -cb_sm[nib1]) * fac;
+            int s0 = (int)((sw >> (2 * i)) & 1u) << 4;
+            int s1 = (int)((sw >> (2 * i + 1)) & 1u) << 4;
+            float w0 = cb_fold[nib0 | s0] * fac;
+            float w1 = cb_fold[nib1 | s1] * fac;
             int v0 = __float2int_rn(w0);
             int v1 = __float2int_rn(w1);
             qv[2 * i] = (int8_t)max(-127, min(127, v0));
@@ -2405,6 +2413,14 @@ __device__ __forceinline__ void mg_ldmatrix_x2_trans(uint32_t (&r)[2],
         : "=r"(r[0]), "=r"(r[1]) : "r"(a));
 }
 
+__device__ __forceinline__ void mg_ldmatrix_x2(uint32_t (&r)[2],
+                                               const void* p) {
+    uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+        : "=r"(r[0]), "=r"(r[1]) : "r"(a));
+}
+
 #define MG_BT 128
 #define MG_TT 128
 #define MG_KC 32
@@ -2424,7 +2440,7 @@ udcq_mma_gemm_kernel(
     const float* __restrict__ cb,
     int T, int in_f, int out_f)
 {
-    __shared__ float cb_sm[16];
+    __shared__ float cb_fold[32];
     extern __shared__ char mg_smem[];
     __nv_bfloat16 (*xs)[MG_TT][MG_KC] =
         reinterpret_cast<__nv_bfloat16(*)[MG_TT][MG_KC]>(mg_smem);
@@ -2434,7 +2450,11 @@ udcq_mma_gemm_kernel(
     float (*es)[MG_TT / 8 + 1] =
         reinterpret_cast<float(*)[MG_TT / 8 + 1]>(
             mg_smem + 2 * (MG_TT + MG_BT) * MG_KC * 2);
-    if (threadIdx.x < 16) cb_sm[threadIdx.x] = cb[threadIdx.x];
+    if (threadIdx.x < 16) {
+        cb_fold[threadIdx.x] = -cb[threadIdx.x];
+        cb_fold[threadIdx.x + 16] = cb[threadIdx.x];
+    }
+    __syncthreads();
     int tid = threadIdx.x;
     int r0 = blockIdx.x * MG_BT;
     int t0 = blockIdx.y * MG_TT;
@@ -2493,10 +2513,10 @@ udcq_mma_gemm_kernel(
                 for (int j2 = 0; j2 < 4; ++j2) {
                     int nb0 = (int)((b >> (8 * j2)) & 0xF);
                     int nb1 = (int)((b >> (8 * j2 + 4)) & 0xF);
-                    int s0 = (int)((sw >> (8 * q + 2 * j2)) & 1u);
-                    int s1 = (int)((sw >> (8 * q + 2 * j2 + 1)) & 1u);
-                    float w0 = (s0 ? cb_sm[nb0] : -cb_sm[nb0]) * sc;
-                    float w1 = (s1 ? cb_sm[nb1] : -cb_sm[nb1]) * sc;
+                    int s0 = (int)((sw >> (8 * q + 2 * j2)) & 1u) << 4;
+                    int s1 = (int)((sw >> (8 * q + 2 * j2 + 1)) & 1u) << 4;
+                    float w0 = cb_fold[nb0 | s0] * sc;
+                    float w1 = cb_fold[nb1 | s1] * sc;
                     pk[j2] = __floats2bfloat162_rn(w0, w1);
                 }
                 int base16 = gp * 16 + 8 * q;
@@ -2526,23 +2546,16 @@ udcq_mma_gemm_kernel(
         #pragma unroll
         for (int kk = 0; kk < MG_KC / 16; ++kk) {
             if (kk >= kkm) break;
-            int ra = warp * 16 + lr;        // scalar fallback (bisect)
-            int ra8 = ra + 8;
-            int ka = 16 * kk + lk * 2;
             uint32_t af[4];
-            af[0] = *reinterpret_cast<const uint32_t*>(&ws[buf][ra][ka]);
-            af[1] = *reinterpret_cast<const uint32_t*>(&ws[buf][ra8][ka]);
-            af[2] = *reinterpret_cast<const uint32_t*>(&ws[buf][ra][ka + 8]);
-            af[3] = *reinterpret_cast<const uint32_t*>(&ws[buf][ra8][ka + 8]);
+            mg_ldmatrix_x4(
+                af, &ws[buf][ra0 + (lane & 15)][16 * kk + a_off]);
             (void)k0;
             #pragma unroll
             for (int n = 0; n < MG_TT / 8; ++n) {
                 if (n >= ntm) break;
                 uint32_t bf[2];
-                bf[0] = *reinterpret_cast<const uint32_t*>(
-                    &xs[buf][n * 8 + lr][16 * kk + lk * 2]);
-                bf[1] = *reinterpret_cast<const uint32_t*>(
-                    &xs[buf][n * 8 + lr][16 * kk + lk * 2 + 8]);
+                mg_ldmatrix_x2(
+                    bf, &xs[buf][n * 8 + (lane & 7)][16 * kk + b_koff]);
                 float c0 = acc[n][0], c1 = acc[n][1],
                       c2 = acc[n][2], c3 = acc[n][3];
                 asm volatile(
@@ -2705,7 +2718,7 @@ udcq_mma_gemm_dbg_kernel(
     const __half* __restrict__ scale, const float* __restrict__ cb,
     int T, int in_f, int out_f, float* __restrict__ dbg)
 {
-    __shared__ float cb_sm[16];
+    __shared__ float cb_fold[32];
     extern __shared__ char mg_smem[];
     __nv_bfloat16 (*xs)[MG_KC] =
         reinterpret_cast<__nv_bfloat16(*)[MG_KC]>(mg_smem);
@@ -2715,7 +2728,11 @@ udcq_mma_gemm_dbg_kernel(
     float (*es)[MG_TT / 4 + 1] =
         reinterpret_cast<float(*)[MG_TT / 4 + 1]>(
             mg_smem + (MG_TT + MG_BT) * MG_KC * 2);
-    if (threadIdx.x < 16) cb_sm[threadIdx.x] = cb[threadIdx.x];
+    if (threadIdx.x < 16) {
+        cb_fold[threadIdx.x] = -cb[threadIdx.x];
+        cb_fold[threadIdx.x + 16] = cb[threadIdx.x];
+    }
+    __syncthreads();
     __syncthreads();
     if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) dbg[127] = 42.f;
     int tid = threadIdx.x;
@@ -2771,10 +2788,10 @@ udcq_mma_gemm_dbg_kernel(
                 for (int j2 = 0; j2 < 4; ++j2) {
                     int nb0 = (int)((b >> (8 * j2)) & 0xF);
                     int nb1 = (int)((b >> (8 * j2 + 4)) & 0xF);
-                    int s0 = (int)((sw >> (8 * q + 2 * j2)) & 1u);
-                    int s1 = (int)((sw >> (8 * q + 2 * j2 + 1)) & 1u);
-                    float w0 = (s0 ? cb_sm[nb0] : -cb_sm[nb0]) * sc;
-                    float w1 = (s1 ? cb_sm[nb1] : -cb_sm[nb1]) * sc;
+                    int s0 = (int)((sw >> (8 * q + 2 * j2)) & 1u) << 4;
+                    int s1 = (int)((sw >> (8 * q + 2 * j2 + 1)) & 1u) << 4;
+                    float w0 = cb_fold[nb0 | s0] * sc;
+                    float w1 = cb_fold[nb1 | s1] * sc;
                     pk[j2] = __floats2bfloat162_rn(w0, w1);
                 }
                 int base16 = gp * 16 + 8 * q;
