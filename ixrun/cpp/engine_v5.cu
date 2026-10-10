@@ -543,6 +543,21 @@ torch::Tensor gemv_v2_out(torch::Tensor x,
 // ---------------- UDCQ GEMV (27B format port, stage 1) ---------------- //
 // w = sign * scale_g * CB[idx]; byte-aligned nibbles, pure LUT walk.
 // Gate: rel-err vs fp64 decode reference (fp32 reorder noise tier).
+//
+// ULS variant (log2 scale): scale stream = uint8[out, 8+n_gr] where each row
+// head is (float base, float step) and scale(g) = exp2(base + step*i8[g]).
+// 5.5bpw vs 6.0; toggled process-wide via udcq_set_uls(1).
+static int g_uls = 0;
+
+void udcq_set_uls(int64_t on) { g_uls = (on != 0) ? 1 : 0; }
+
+__device__ __forceinline__ float uls_scale_row(const uint8_t* srow, int g) {
+    float base = *reinterpret_cast<const float*>(srow);
+    float step = *reinterpret_cast<const float*>(srow + 4);
+    return exp2f(base + step * (float)srow[8 + g]);
+}
+
+template <bool ULS>
 __global__ void udcq_gemv_kernel(
     const float* __restrict__ x,
     const uint8_t* __restrict__ idx,
@@ -555,12 +570,15 @@ __global__ void udcq_gemv_kernel(
     __shared__ float red[32];
     int r = blockIdx.x;
     long long base = (long long)r * in_f;
+    const uint8_t* urow = reinterpret_cast<const uint8_t*>(scale)
+                          + (size_t)r * (size_t)(in_f / GROUP + 8);
     float acc = 0.f;
     for (int j = threadIdx.x; j < in_f; j += blockDim.x) {
         long long o = base + j;
         uint8_t b = idx[o >> 1];
         int nib = (o & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
-        float sc = __half2float(scale[o / GROUP]);
+        float sc = ULS ? uls_scale_row(urow, j / GROUP)
+                       : __half2float(scale[o / GROUP]);
         uint32_t sw = sign[o >> 5];
         float sgn = ((sw >> (o & 31)) & 1u) ? 1.f : -1.f;
         acc += cb[nib] * sc * sgn * x[j];
@@ -606,6 +624,7 @@ torch::Tensor udcq_gemv_out(torch::Tensor x,
 // weight bytes. Per 16-elem group: 8B idx (uint2) + 2B scale + 4B sign
 // word (shared by 2 groups) + x from smem. Not bit-identical to v1
 // (different reduction order); gate vs fp64 at the 1e-7 tier.
+template <bool ULS>
 __global__ void udcq_gemv_v2_kernel(
     const float* __restrict__ x,
     const uint8_t* __restrict__ idx,
@@ -631,12 +650,20 @@ __global__ void udcq_gemv_v2_kernel(
     int n_gr = in_f / GROUP;
     const uint8_t* irow = idx + (size_t)r * (in_f / 2);
     const __half* srow = scale + (size_t)r * n_gr;
+    const uint8_t* urow = reinterpret_cast<const uint8_t*>(scale)
+                          + (size_t)r * (size_t)(n_gr + 8);
+    float sbase = 0.f, sstep = 0.f;
+    if (ULS) {
+        sbase = *reinterpret_cast<const float*>(urow);
+        sstep = *reinterpret_cast<const float*>(urow + 4);
+    }
     const uint32_t* wrow = sign + (size_t)r * (in_f / 32);
     float acc = 0.f;
     for (int g = lane; g < n_gr; g += 32) {
         uint2 b2 = *reinterpret_cast<const uint2*>(irow + (size_t)g * 8);
         uint32_t sw = wrow[g >> 1] >> (16 * (g & 1));
-        float sc = __half2float(srow[g]);
+        float sc = ULS ? exp2f(sbase + sstep * (float)urow[8 + g])
+                       : __half2float(srow[g]);
         const float* xs = x_sm + (size_t)g * GROUP;
         float xr[16];
         #pragma unroll
@@ -682,21 +709,33 @@ static void udcq_gemv_launch(
             cudaGetDevice(&dev);
             cudaDeviceGetAttribute(&max_sm,
                 cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-            if (max_sm > 0)
-                cudaFuncSetAttribute(udcq_gemv_v2_kernel,
+            if (max_sm > 0) {
+                cudaFuncSetAttribute(udcq_gemv_v2_kernel<false>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                     max_sm);
+                cudaFuncSetAttribute(udcq_gemv_v2_kernel<true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    max_sm);
+            }
         }
         size_t sm = (size_t)in_f * sizeof(float) + 16 * sizeof(float);
         if ((int)sm <= max_sm) {
             int wpb = (in_f > 12288) ? 16 : 8;   // big smem -> 1 blk/SM: use all warps
-            udcq_gemv_v2_kernel<<<(out_f + wpb - 1) / wpb, wpb * 32, sm, st>>>(
-                x, idx, sign, scale, cb, y, in_f, out_f, group);
+            if (g_uls)
+                udcq_gemv_v2_kernel<true><<<(out_f + wpb - 1) / wpb, wpb * 32, sm, st>>>(
+                    x, idx, sign, scale, cb, y, in_f, out_f, group);
+            else
+                udcq_gemv_v2_kernel<false><<<(out_f + wpb - 1) / wpb, wpb * 32, sm, st>>>(
+                    x, idx, sign, scale, cb, y, in_f, out_f, group);
             return;
         }
     }
-    udcq_gemv_kernel<<<(unsigned)out_f, 256, 0, st>>>(
-        x, idx, sign, scale, cb, y, in_f, group);
+    if (g_uls)
+        udcq_gemv_kernel<true><<<(unsigned)out_f, 256, 0, st>>>(
+            x, idx, sign, scale, cb, y, in_f, group);
+    else
+        udcq_gemv_kernel<false><<<(unsigned)out_f, 256, 0, st>>>(
+            x, idx, sign, scale, cb, y, in_f, group);
 }
 
 // UDCQ GEMV multi-token T=4: weights decoded ONCE per 4 tokens.
@@ -705,6 +744,7 @@ static void udcq_gemv_launch(
 // from global (L1/L2-hot). Measured 1.65x vs 4xT=1 (smem-chunked variant
 // is SLOWER: 1 blk/SM occupancy loss > L2 savings). Keep for any future
 // speculative path; NOT deployed (T=1 kernel is already near-BW).
+template <bool ULS>
 __global__ void udcq_gemv_mt4_kernel(
     const float* __restrict__ x,      // [4, in_f]
     const uint8_t* __restrict__ idx,
@@ -726,6 +766,13 @@ __global__ void udcq_gemv_mt4_kernel(
     int n_gr = in_f / GROUP;
     const uint8_t* irow = idx + (size_t)r * (in_f / 2);
     const __half* srow = scale + (size_t)r * n_gr;
+    const uint8_t* urow = reinterpret_cast<const uint8_t*>(scale)
+                          + (size_t)r * (size_t)(n_gr + 8);
+    float sbase = 0.f, sstep = 0.f;
+    if (ULS) {
+        sbase = *reinterpret_cast<const float*>(urow);
+        sstep = *reinterpret_cast<const float*>(urow + 4);
+    }
     const uint32_t* wrow = sign + (size_t)r * (in_f / 32);
     const float* xp0 = x;
     const float* xp1 = x + in_f;
@@ -735,7 +782,8 @@ __global__ void udcq_gemv_mt4_kernel(
     for (int g = lane; g < n_gr; g += 32) {
         uint2 b2 = *reinterpret_cast<const uint2*>(irow + (size_t)g * 8);
         uint32_t sw = wrow[g >> 1] >> (16 * (g & 1));
-        float sc = __half2float(srow[g]);
+        float sc = ULS ? exp2f(sbase + sstep * (float)urow[8 + g])
+                       : __half2float(srow[g]);
         const size_t xo = (size_t)g * GROUP;
         float in0 = 0.f, in1 = 0.f, in2 = 0.f, in3 = 0.f;
         #pragma unroll
@@ -787,8 +835,12 @@ static void udcq_gemv_mt4_launch(
     const __half* scale, const float* cb, float* y,
     int out_f, int in_f, int group, cudaStream_t st)
 {
-    udcq_gemv_mt4_kernel<<<(unsigned)((out_f + 7) / 8), 256, 0, st>>>(
-        x, idx, sign, scale, cb, y, in_f, out_f, group);
+    if (g_uls)
+        udcq_gemv_mt4_kernel<true><<<(unsigned)((out_f + 7) / 8), 256, 0, st>>>(
+            x, idx, sign, scale, cb, y, in_f, out_f, group);
+    else
+        udcq_gemv_mt4_kernel<false><<<(unsigned)((out_f + 7) / 8), 256, 0, st>>>(
+            x, idx, sign, scale, cb, y, in_f, out_f, group);
 }
 
 torch::Tensor udcq_gemv_mt4_out(torch::Tensor x, torch::Tensor idx,
@@ -811,6 +863,7 @@ torch::Tensor udcq_gemv_mt4_out(torch::Tensor x, torch::Tensor idx,
 // dual small-shape GEMV: two packs sharing one x, one launch.
 // grid = 2 * ceil(out_f/8); first half -> pack0/y0, second -> pack1/y1.
 // Same warp-per-row walk as v2 (x staged in smem).
+template <bool ULS>
 __global__ void udcq_gemv_dual_kernel(
     const float* __restrict__ x,
     const uint8_t* __restrict__ i0,
@@ -846,12 +899,20 @@ __global__ void udcq_gemv_dual_kernel(
     int n_gr = in_f / GROUP;
     const uint8_t* irow = idx + (size_t)r * (in_f / 2);
     const __half* srow = scale + (size_t)r * n_gr;
+    const uint8_t* urow = reinterpret_cast<const uint8_t*>(scale)
+                          + (size_t)r * (size_t)(n_gr + 8);
+    float sbase = 0.f, sstep = 0.f;
+    if (ULS) {
+        sbase = *reinterpret_cast<const float*>(urow);
+        sstep = *reinterpret_cast<const float*>(urow + 4);
+    }
     const uint32_t* wrow = sign + (size_t)r * (in_f / 32);
     float acc = 0.f;
     for (int g = lane; g < n_gr; g += 32) {
         uint2 b2 = *reinterpret_cast<const uint2*>(irow + (size_t)g * 8);
         uint32_t sw = wrow[g >> 1] >> (16 * (g & 1));
-        float sc = __half2float(srow[g]);
+        float sc = ULS ? exp2f(sbase + sstep * (float)urow[8 + g])
+                       : __half2float(srow[g]);
         const float* xs = x_sm + (size_t)g * GROUP;
         float xr[16];
         #pragma unroll
@@ -891,12 +952,17 @@ static void udcq_gemv_dual_launch(
 {
     size_t sm = (size_t)in_f * sizeof(float) + 32 * sizeof(float);
     unsigned nb = (unsigned)((out_f + 7) / 8);
-    udcq_gemv_dual_kernel<<<2 * nb, 256, sm, st>>>(
-        x, i0, s0, sc0, i1, s1, sc1, cb, y0, y1, in_f, out_f, group);
+    if (g_uls)
+        udcq_gemv_dual_kernel<true><<<2 * nb, 256, sm, st>>>(
+            x, i0, s0, sc0, i1, s1, sc1, cb, y0, y1, in_f, out_f, group);
+    else
+        udcq_gemv_dual_kernel<false><<<2 * nb, 256, sm, st>>>(
+            x, i0, s0, sc0, i1, s1, sc1, cb, y0, y1, in_f, out_f, group);
 }
 
 // UDCQ batched GEMM: [T,in_f] @ W^T -> [T,out_f], same walk as
 // udcq_gemv_kernel per row (bit-exact by construction), grid.y = t.
+template <bool ULS>
 __global__ void udcq_gemm_kernel(
     const float* __restrict__ x,
     const uint8_t* __restrict__ idx,
@@ -911,12 +977,15 @@ __global__ void udcq_gemm_kernel(
     int t = blockIdx.y;
     long long base = (long long)r * in_f;
     const float* xt = x + (long long)t * in_f;
+    const uint8_t* urow = reinterpret_cast<const uint8_t*>(scale)
+                          + (size_t)r * (size_t)(in_f / GROUP + 8);
     float acc = 0.f;
     for (int j = threadIdx.x; j < in_f; j += blockDim.x) {
         long long o = base + j;
         uint8_t b = idx[o >> 1];
         int nib = (o & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
-        float sc = __half2float(scale[o / GROUP]);
+        float sc = ULS ? uls_scale_row(urow, j / GROUP)
+                       : __half2float(scale[o / GROUP]);
         uint32_t sw = sign[o >> 5];
         float sgn = ((sw >> (o & 31)) & 1u) ? 1.f : -1.f;
         acc += cb[nib] * sc * sgn * xt[j];
@@ -944,12 +1013,20 @@ torch::Tensor udcq_gemm_out(torch::Tensor x2d,
     auto y = torch::zeros({T, out_f},
         torch::dtype(torch::kFloat32).device(x2d.device()));
     dim3 grid((unsigned)out_f, (unsigned)T);
-    udcq_gemm_kernel<<<grid, 256, 0,
-                       at::cuda::getCurrentCUDAStream()>>>(
-        x2d.data_ptr<float>(), idx.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint32_t*>(sign.data_ptr()),
-        reinterpret_cast<const __half*>(scale.data_ptr()), cb.data_ptr<float>(),
-        y.data_ptr<float>(), (int)in_f, (int)out_f, (int)group);
+    if (g_uls)
+        udcq_gemm_kernel<true><<<grid, 256, 0,
+                           at::cuda::getCurrentCUDAStream()>>>(
+            x2d.data_ptr<float>(), idx.data_ptr<uint8_t>(),
+            reinterpret_cast<const uint32_t*>(sign.data_ptr()),
+            reinterpret_cast<const __half*>(scale.data_ptr()), cb.data_ptr<float>(),
+            y.data_ptr<float>(), (int)in_f, (int)out_f, (int)group);
+    else
+        udcq_gemm_kernel<false><<<grid, 256, 0,
+                           at::cuda::getCurrentCUDAStream()>>>(
+            x2d.data_ptr<float>(), idx.data_ptr<uint8_t>(),
+            reinterpret_cast<const uint32_t*>(sign.data_ptr()),
+            reinterpret_cast<const __half*>(scale.data_ptr()), cb.data_ptr<float>(),
+            y.data_ptr<float>(), (int)in_f, (int)out_f, (int)group);
     return y;
 }
 

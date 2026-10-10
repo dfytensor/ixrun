@@ -10,6 +10,11 @@ def _build_ext():
     src = open(os.path.join(_DIR, 'cpp', 'engine_v5.cu'), encoding='utf-8').read()
     src27 = open(os.path.join(_DIR, 'cpp', 'engine_27b.cu'), encoding='utf-8').read()
     proto = '''
+void udcq_set_uls(int64_t on);
+torch::Tensor udcq_gemv_out(torch::Tensor x,
+    torch::Tensor idx, torch::Tensor sign,
+    torch::Tensor scale, torch::Tensor cb,
+    int64_t out_f, int64_t in_f, int64_t group);
 void init27(torch::Tensor cb,
     std::vector<torch::Tensor> packs,
     std::vector<torch::Tensor> nw1,
@@ -28,11 +33,12 @@ torch::Tensor s27_get_tok();
 void s27_set_probe(int64_t l);
 torch::Tensor s27d_get_h1();
 '''
-    return load_inline(name='ixrun_cpp_q27k', cpp_sources=[proto],
+    return load_inline(name='ixrun_cpp_q27l', cpp_sources=[proto],
                        cuda_sources=[src, src27],
                        functions=['init27', 'step27', 'step27_g',
                                   's27_reset', 's27_get_tok',
-                                  's27_set_probe', 's27d_get_h1'],
+                                  's27_set_probe', 's27d_get_h1',
+                                  'udcq_set_uls', 'udcq_gemv_out'],
                        extra_cuda_cflags=['-O3', '--use_fast_math',
                                           '-allow-unsupported-compiler'],
                        verbose=False)
@@ -59,6 +65,10 @@ class CppQwen27bEngine:
         vdim, kdim = cfg.linear_value_head_dim, cfg.linear_key_head_dim
         conv_dim = 2 * nk * kdim + nv * vdim
         ext = _build_ext()
+        if blob.get('uls'):
+            ext.udcq_set_uls(1)
+            if verbose:
+                print('[cpp-27b] ULS log-scale blob (5.5bpw)', flush=True)
 
         packs, nw1, nw2, gex, gnorm, aex = [], [], [], [], [], []
         ig, ia = 0, 0

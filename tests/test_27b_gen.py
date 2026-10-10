@@ -5,7 +5,8 @@ sys.path.insert(0, r'E:\IXRUN')
 from ixrun.cpp_engine_27b import CppQwen27bEngine
 
 eng = CppQwen27bEngine.from_blob(
-    r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt',
+    sys.argv[1] if len(sys.argv) > 1
+    else r'E:\IXRUN\experiments\qwen38_udcq\q38_blob.pt',
     r'E:\models\Qwen3.8-27B', ctx=256, verbose=True)
 
 P = "The capital of France is"
