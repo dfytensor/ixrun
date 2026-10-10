@@ -3232,6 +3232,102 @@ torch::Tensor attn_v3_test(torch::Tensor q, torch::Tensor kv,
     return out;
 }
 
+// batched split-K decode attention over T tokens (one node per layer):
+// grid (T*nh, ATTN_V3_C); partials indexed per (t,h). Same math as
+// attn_b_v3_kernel.
+__global__ void attn_b_v3t_kernel(const float* __restrict__ q,
+                                  const __nv_bfloat16* __restrict__ kv,
+                                  float* __restrict__ part,
+                                  float* __restrict__ psum,
+                                  int T, int nh, int nkv, int hd,
+                                  int ctx, const int* dpos) {
+    int row = blockIdx.x;              // t*nh + h
+    int c = blockIdx.y;
+    int t = row / nh;
+    int h = row - t * nh;
+    int pos = dpos[t];
+    int chunk = (ctx + ATTN_V3_C - 1) / ATTN_V3_C;
+    int t0 = c * chunk;
+    int t1 = min(t0 + chunk - 1, pos);
+    int kvh = h / (nh / nkv);
+    const __nv_bfloat16* ks = kv + (size_t)kvh * ctx * hd;
+    const __nv_bfloat16* vs = kv + (size_t)nkv * ctx * hd
+                              + (size_t)kvh * ctx * hd;
+    extern __shared__ float smem[];
+    __shared__ float red[32];
+    float* mD = part + ((size_t)row * ATTN_V3_C + c) * 2;
+    float* ps = psum + (((size_t)row * ATTN_V3_C + c)) * hd;
+    if (t0 > pos) {
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) ps[d] = 0.f;
+        if (threadIdx.x == 0) { mD[0] = -1e30f; mD[1] = 0.f; }
+        return;
+    }
+    const float* qt = q + (size_t)row * hd;
+    float inv_hd = rsqrtf((float)hd);
+    float maxs = -1e30f;
+    for (int tt = t0 + threadIdx.x; tt <= t1; tt += blockDim.x) {
+        float sc = 0.f;
+        const __nv_bfloat16* kr = ks + (size_t)tt * hd;
+        #pragma unroll 8
+        for (int j = 0; j < hd; ++j)
+            sc = fmaf(qt[j], __bfloat162float(kr[j]), sc);
+        sc *= inv_hd;
+        smem[tt - t0] = sc;
+        maxs = fmaxf(maxs, sc);
+    }
+    if (threadIdx.x < 32) red[threadIdx.x] = -1e30f;
+    __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        maxs = fmaxf(maxs, __shfl_down_sync(0xffffffff, maxs, off));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = maxs;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = -1e30f;
+        for (int k2 = 0; k2 < (int)(blockDim.x >> 5); ++k2)
+            m = fmaxf(m, red[k2]);
+        red[0] = m;
+    }
+    __syncthreads();
+    maxs = red[0];
+    int nchunk = t1 - t0 + 1;
+    for (int i = threadIdx.x; i < nchunk; i += blockDim.x)
+        smem[i] = expf(smem[i] - maxs);
+    __syncthreads();
+    int d = threadIdx.x;
+    float den_i = 0.f, sum_i = 0.f;
+    #pragma unroll 4
+    for (int i = 0; i < nchunk; ++i) {
+        float e = smem[i];
+        den_i += e;
+        sum_i = fmaf(e, __bfloat162float(vs[(size_t)(t0 + i) * hd + d]),
+                     sum_i);
+    }
+    if (threadIdx.x == 0) {
+        mD[0] = maxs;
+        mD[1] = den_i;
+    }
+    if (d < hd) ps[d] = sum_i;
+}
+
+__global__ void attn_merge_t_kernel(const float* __restrict__ part,
+                                    const float* __restrict__ psum,
+                                    float* __restrict__ out,
+                                    int T, int nh, int hd) {
+    int row = blockIdx.x;
+    int d = threadIdx.x;
+    const float* mD = part + (size_t)row * ATTN_V3_C * 2;
+    float M = -1e30f;
+    for (int c = 0; c < ATTN_V3_C; ++c) M = fmaxf(M, mD[c * 2]);
+    float den = 0.f, num = 0.f;
+    for (int c = 0; c < ATTN_V3_C; ++c) {
+        float w = expf(mD[c * 2] - M);
+        den += w * mD[c * 2 + 1];
+        num += w * psum[((size_t)row * ATTN_V3_C + c) * hd + d];
+    }
+    out[(size_t)row * hd + d] = num / den;
+}
+
 __global__ void embed_rows_kernel(const __nv_bfloat16* table,
                                   const int64_t* toks,
                                   __nv_bfloat16* out,
@@ -4143,8 +4239,10 @@ static void attn_batch_proj(
         qhT = torch::empty({GT_MAXT, nh, hd}, f32);
         gtT = torch::empty({GT_MAXT, nh, hd}, f32);
         khT = torch::empty({GT_MAXT, nkv, hd}, f32);
-        attn_part = torch::zeros({nh * ATTN_V3_C * 2}, f32);
-        attn_psum = torch::zeros({nh * ATTN_V3_C * hd}, f32);
+        attn_part = torch::zeros(
+            {(long long)((size_t)GT_MAXT * nh * ATTN_V3_C * 2)}, f32);
+        attn_psum = torch::zeros(
+            {(long long)((size_t)GT_MAXT * nh * ATTN_V3_C * hd)}, f32);
         init = true;
     }
     chunk_qgate_t_kernel<<<(unsigned)(T * nh), (unsigned)hd, 0, st>>>(
@@ -4165,16 +4263,14 @@ static void attn_batch_proj(
         hd, ctx, nkv, dpos);
     size_t asm3 = (size_t)((ctx + ATTN_V3_C - 1) / ATTN_V3_C)
                   * sizeof(float);
-    for (int t = 0; t < T; ++t) {
-        attn_b_v3_kernel<<<dim3((unsigned)nh, ATTN_V3_C), 256, asm3, st>>>(
-            qhT.data_ptr<float>() + (size_t)t * nh * hd,
-            reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr()),
-            attn_part.data_ptr<float>(), attn_psum.data_ptr<float>(),
-            nh, nkv, hd, ctx, dpos + t);
-        attn_merge_kernel<<<(unsigned)nh, (unsigned)hd, 0, st>>>(
-            attn_part.data_ptr<float>(), attn_psum.data_ptr<float>(),
-            attT.data_ptr<float>() + (size_t)t * nh * hd, nh, hd);
-    }
+    attn_b_v3t_kernel<<<dim3((unsigned)(T * nh), ATTN_V3_C), 256, asm3, st>>>(
+        qhT.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr()),
+        attn_part.data_ptr<float>(), attn_psum.data_ptr<float>(),
+        T, nh, nkv, hd, ctx, dpos);
+    attn_merge_t_kernel<<<(unsigned)(T * nh), (unsigned)hd, 0, st>>>(
+        attn_part.data_ptr<float>(), attn_psum.data_ptr<float>(),
+        attT.data_ptr<float>(), T, nh, hd);
     sigmoid_mul_kernel<<<(unsigned)((T * nh * hd + 255) / 256), 256, 0, st>>>(
         attT.data_ptr<float>(), gtT.data_ptr<float>(), T * nh * hd);
 }
