@@ -166,6 +166,148 @@ void step27_g(torch::Tensor h, torch::Tensor dpos, double theta) {
     step27_impl(h, dpos.data_ptr<int>(), theta);
 }
 
+// ---------------- blocked prefill (S=8, mt8 projections) ---------------- //
+// Processes 8 tokens (rows of h8) at the positions in dpos8 (device int32[8],
+// written by the caller between replays -- capture-safe: no host syncs inside).
+// final_block=1 runs row 7 -> lm_head -> argmax (s27_tok).
+void step27_prefill(torch::Tensor h8, torch::Tensor dpos8, double theta,
+                    int64_t final_block) {
+    if (!s27_init) throw std::runtime_error("init27 not called");
+    auto st = at::cuda::getCurrentCUDAStream();
+    int hidden = (int)s27_hidden;
+    int inter = (int)s27_inter;
+    int nl = (int)s27_nw1.size();
+    int GROUP = 16;
+    const int NV = 48, NK = 16, DK = 128, DV = 128;
+    const int NH = 24, NKV = 4, HD = 256;
+    int value_dim = NV * DV;
+    int conv_dim = 2 * NK * DK + value_dim;
+    auto f32 = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(h8.device());
+    static torch::Tensor xn8, h1_8, xn2_8, out8, xn_next8,
+        qkv8, z8, bo8, ao8, on8, o8, mg8, mu8, act8, md8,
+        q2_8, k2_8, v2_8, att8, lg;
+    static bool init = false;
+    if (!init) {
+        xn8   = torch::empty({8, hidden}, f32);
+        h1_8  = torch::empty({8, hidden}, f32);
+        xn2_8 = torch::empty({8, hidden}, f32);
+        out8  = torch::empty({8, hidden}, f32);
+        xn_next8 = torch::empty({8, hidden}, f32);
+        qkv8  = torch::empty({8, conv_dim}, f32);
+        z8    = torch::empty({8, value_dim}, f32);
+        bo8   = torch::empty({8, NV}, f32);
+        ao8   = torch::empty({8, NV}, f32);
+        on8   = torch::empty({8, value_dim}, f32);
+        o8    = torch::empty({8, hidden}, f32);
+        mg8   = torch::empty({8, inter}, f32);
+        mu8   = torch::empty({8, inter}, f32);
+        act8  = torch::empty({8, inter}, f32);
+        md8   = torch::empty({8, hidden}, f32);
+        q2_8  = torch::empty({8, NH * HD * 2}, f32);
+        k2_8  = torch::empty({8, NKV * HD}, f32);
+        v2_8  = torch::empty({8, NKV * HD}, f32);
+        att8  = torch::empty({8, NH * HD}, f32);
+        int64_t vocab = s27_lh_i.numel() * 2 / hidden;
+        lg    = torch::empty({vocab}, f32);
+        init = true;
+    }
+    if (!s27_tok.defined())
+        s27_tok = torch::zeros({1}, torch::TensorOptions()
+            .dtype(torch::kInt64).device(h8.device()));
+    const int* dpos = dpos8.data_ptr<int>();
+    rmsnorm_fw_kernel<<<8, 1024, 0, st>>>(
+        h8.data_ptr<float>(), s27_nw1[0].data_ptr<float>(),
+        xn8.data_ptr<float>(), hidden, 1e-6f);
+    auto T3 = [&](int l, int s) -> std::vector<torch::Tensor> {
+        int k = (l * 8 + s) * 3;
+        return {s27_packs[k], s27_packs[k + 1], s27_packs[k + 2]};
+    };
+    auto mt8 = [&](const float* xp, const std::vector<torch::Tensor>& P,
+                   float* y, int of, int inf) {
+        udcq_gemv_mt8_launch(
+            xp, P[0].data_ptr<uint8_t>(),
+            reinterpret_cast<const uint32_t*>(P[1].data_ptr()),
+            reinterpret_cast<const __half*>(P[2].data_ptr()),
+            s27_cb.data_ptr<float>(), y, of, inf, GROUP, st);
+    };
+    const float* h_p = h8.data_ptr<float>();
+    float* h_out_p = out8.data_ptr<float>();
+    const float* xn_p = xn8.data_ptr<float>();
+    float* xn_out_p = xn_next8.data_ptr<float>();
+    int ig = 0, ia = 0;
+    for (int l = 0; l < nl; ++l) {
+        bool is_attn = false;
+        for (int64_t a : s27_attn_layers)
+            if (a == l) { is_attn = true; break; }
+        torch::Tensor next_w = (l + 1 < nl) ? s27_nw1[l + 1] : s27_fnw;
+        if (!is_attn) {
+            mt8(xn_p, T3(l, 0), qkv8.data_ptr<float>(), conv_dim, hidden);
+            mt8(xn_p, T3(l, 1), z8.data_ptr<float>(), value_dim, hidden);
+            mt8(xn_p, T3(l, 2), bo8.data_ptr<float>(), NV, hidden);
+            mt8(xn_p, T3(l, 3), ao8.data_ptr<float>(), NV, hidden);
+            for (int i = 0; i < 8; ++i)
+                gdn_core_from_proj(
+                    qkv8.data_ptr<float>() + (size_t)i * conv_dim,
+                    z8.data_ptr<float>() + (size_t)i * value_dim,
+                    bo8.data_ptr<float>() + (size_t)i * NV,
+                    ao8.data_ptr<float>() + (size_t)i * NV,
+                    s27_gex[ig * 4], s27_gex[ig * 4 + 1],
+                    s27_gex[ig * 4 + 2], s27_gex[ig * 4 + 3],
+                    s27_gnorm[ig], s27_convst[ig], s27_S[ig],
+                    on8.data_ptr<float>() + (size_t)i * value_dim,
+                    NV, NK, DK, DV, l);
+            mt8(on8.data_ptr<float>(), T3(l, 4),
+                o8.data_ptr<float>(), hidden, value_dim);
+            ig++;
+        } else {
+            mt8(xn_p, T3(l, 0), q2_8.data_ptr<float>(), NH * HD * 2, hidden);
+            mt8(xn_p, T3(l, 1), k2_8.data_ptr<float>(), NKV * HD, hidden);
+            mt8(xn_p, T3(l, 2), v2_8.data_ptr<float>(), NKV * HD, hidden);
+            for (int i = 0; i < 8; ++i)
+                attn_from_proj(
+                    q2_8.data_ptr<float>() + (size_t)i * NH * HD * 2,
+                    k2_8.data_ptr<float>() + (size_t)i * NKV * HD,
+                    v2_8.data_ptr<float>() + (size_t)i * NKV * HD,
+                    s27_aex[ia * 2], s27_aex[ia * 2 + 1], s27_kv[ia],
+                    theta, dpos8.data_ptr<int>() + i,
+                    att8.data_ptr<float>() + (size_t)i * NH * HD,
+                    NH, NKV, HD, (int)s27_ctx);
+            mt8(att8.data_ptr<float>(), T3(l, 3),
+                o8.data_ptr<float>(), hidden, NH * HD);
+            ia++;
+        }
+        add_norm_f32<<<8, 1024, 0, st>>>(
+            h_p, o8.data_ptr<float>(), s27_nw2[l].data_ptr<float>(),
+            h1_8.data_ptr<float>(), xn2_8.data_ptr<float>(), hidden, 1e-6f);
+        mt8(xn2_8.data_ptr<float>(), T3(l, is_attn ? 4 : 5),
+            mg8.data_ptr<float>(), inter, hidden);
+        mt8(xn2_8.data_ptr<float>(), T3(l, is_attn ? 5 : 6),
+            mu8.data_ptr<float>(), inter, hidden);
+        silu_kernel<<<(unsigned)((8 * inter + 255) / 256), 256, 0, st>>>(
+            mg8.data_ptr<float>(), mu8.data_ptr<float>(),
+            act8.data_ptr<float>(), 8 * inter);
+        mt8(act8.data_ptr<float>(), T3(l, is_attn ? 6 : 7),
+            md8.data_ptr<float>(), hidden, inter);
+        add_norm_f32<<<8, 1024, 0, st>>>(
+            h1_8.data_ptr<float>(), md8.data_ptr<float>(),
+            next_w.data_ptr<float>(), h_out_p, xn_out_p, hidden, 1e-6f);
+        const float* ht = h_p; h_p = h_out_p; h_out_p = (float*)ht;
+        const float* xt = xn_p; xn_p = xn_out_p; xn_out_p = (float*)xt;
+    }
+    if (final_block) {
+        int64_t vocab = s27_lh_i.numel() * 2 / hidden;
+        udcq_gemv_launch(
+            xn_p + (size_t)7 * hidden, s27_lh_i.data_ptr<uint8_t>(),
+            reinterpret_cast<const uint32_t*>(s27_lh_s.data_ptr()),
+            reinterpret_cast<const __half*>(s27_lh_sc.data_ptr()),
+            s27_cb.data_ptr<float>(),
+            lg.data_ptr<float>(), (int)vocab, hidden, GROUP, st);
+        argmax_f32<<<1, 256, 0, st>>>(
+            lg.data_ptr<float>(), (int)vocab, s27_tok.data_ptr<int64_t>());
+    }
+}
+
 void s27_reset() {
     auto st = at::cuda::getCurrentCUDAStream();
     for (auto& t : s27_convst)

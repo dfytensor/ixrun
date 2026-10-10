@@ -860,6 +860,294 @@ torch::Tensor udcq_gemv_mt4_out(torch::Tensor x, torch::Tensor idx,
     return y;
 }
 
+// UDCQ multi-token T=8 (prefill): weights decoded once per 8 tokens, same
+// per-token fmaf sequence and group order as udcq_gemv_v2_kernel =>
+// bit-exact vs 8x T=1 calls (like mt4). x = [8, in_f] fp32.
+template <bool ULS>
+__global__ void udcq_gemv_mt8_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ idx,
+    const uint32_t* __restrict__ sign,
+    const __half* __restrict__ scale,
+    const float* __restrict__ cb,
+    float* __restrict__ y,
+    int in_f, int out_f, int GROUP)
+{
+    __shared__ float cb_sm[32];
+    for (int i = threadIdx.x; i < 16; i += blockDim.x) {
+        cb_sm[i] = -cb[i];
+        cb_sm[i + 16] = cb[i];
+    }
+    __syncthreads();
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (r >= out_f) return;
+    int n_gr = in_f / GROUP;
+    const uint8_t* irow = idx + (size_t)r * (in_f / 2);
+    const __half* srow = scale + (size_t)r * n_gr;
+    const uint8_t* urow = reinterpret_cast<const uint8_t*>(scale)
+                          + (size_t)r * (size_t)(n_gr + 8);
+    float sbase = 0.f, sstep = 0.f;
+    if (ULS) {
+        sbase = *reinterpret_cast<const float*>(urow);
+        sstep = *reinterpret_cast<const float*>(urow + 4);
+    }
+    const uint32_t* wrow = sign + (size_t)r * (in_f / 32);
+    const float* xp[8];
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) xp[t] = x + (size_t)t * in_f;
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int g = lane; g < n_gr; g += 32) {
+        uint2 b2 = *reinterpret_cast<const uint2*>(irow + (size_t)g * 8);
+        uint32_t sw = wrow[g >> 1] >> (16 * (g & 1));
+        float sc = ULS ? exp2f(sbase + sstep * (float)urow[8 + g])
+                       : __half2float(srow[g]);
+        const size_t xo = (size_t)g * GROUP;
+        float in[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            uint32_t w = (q < 2) ? b2.x : b2.y;
+            int bo = (q & 1) * 16;
+            int so = q * 4;
+            int b0 = (int)((w >> bo) & 0xFF);
+            int b1 = (int)((w >> (bo + 8)) & 0xFF);
+            float c00 = cb_sm[(b0 & 0xF) | ((int)((sw >> so) & 1u) << 4)];
+            float c01 = cb_sm[(b0 >> 4) | ((int)((sw >> (so + 1)) & 1u) << 4)];
+            float c10 = cb_sm[(b1 & 0xF) | ((int)((sw >> (so + 2)) & 1u) << 4)];
+            float c11 = cb_sm[(b1 >> 4) | ((int)((sw >> (so + 3)) & 1u) << 4)];
+            #pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                float4 v = *reinterpret_cast<const float4*>(xp[t] + xo + 4 * q);
+                in[t] = fmaf(c00, v.x, in[t]);
+                in[t] = fmaf(c01, v.y, in[t]);
+                in[t] = fmaf(c10, v.z, in[t]);
+                in[t] = fmaf(c11, v.w, in[t]);
+            }
+        }
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) acc[t] += in[t] * sc;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        #pragma unroll
+        for (int t = 0; t < 8; ++t)
+            acc[t] += __shfl_down_sync(0xffffffff, acc[t], off);
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) y[(size_t)t * out_f + r] = acc[t];
+    }
+}
+
+// (mt8 launcher moved below the staged mt8q kernel; the plain mt8 kernel
+// above is kept for reference only)
+
+// staged mt8 ("mt8q"): the plain mt8 above re-reads ALL 8 x planes per ROW
+// from L2 (each warp's walk needs the full x; measured 182GB/s effective,
+// 96.75ms per prefill block vs the 19.5ms DRAM floor). mt8q stages the x in
+// smem in K-chunks (fp32) once per 8-row block; per-lane group order and the
+// 16-step inner chain are unchanged => still bit-exact vs 8x v2 calls.
+#define MT8Q_KCHUNK 1024
+#define MT8Q_ROWS 4
+
+template <bool ULS>
+__global__ void udcq_gemv_mt8q_kernel(
+    const float* __restrict__ x,      // [8, in_f]
+    const uint8_t* __restrict__ idx,
+    const uint32_t* __restrict__ sign,
+    const __half* __restrict__ scale,
+    const float* __restrict__ cb,
+    float* __restrict__ y,            // [8, out_f]
+    int in_f, int out_f, int GROUP)
+{
+    extern __shared__ float smem[];
+    float* xs_sm = smem;                       // 8 * MT8Q_KCHUNK floats
+    float* cb_sm = smem + 8 * MT8Q_KCHUNK;     // 32 floats
+    for (int i = threadIdx.x; i < 16; i += blockDim.x) {
+        cb_sm[i] = -cb[i];
+        cb_sm[i + 16] = cb[i];
+    }
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r0 = (blockIdx.x * 8 + warp) * MT8Q_ROWS;
+    int n_gr = in_f / GROUP;
+    const uint8_t* irow[MT8Q_ROWS];
+    const uint32_t* wrow[MT8Q_ROWS];
+    const __half* srow[MT8Q_ROWS];
+    const uint8_t* urow[MT8Q_ROWS];
+    float sbase[MT8Q_ROWS], sstep[MT8Q_ROWS];
+    bool ok[MT8Q_ROWS];
+    #pragma unroll
+    for (int q = 0; q < MT8Q_ROWS; ++q) {
+        int r = r0 + q;
+        ok[q] = r < out_f;
+        int rr = ok[q] ? r : 0;
+        irow[q] = idx + (size_t)rr * (in_f / 2);
+        wrow[q] = sign + (size_t)rr * (in_f / 32);
+        srow[q] = scale + (size_t)rr * n_gr;
+        urow[q] = reinterpret_cast<const uint8_t*>(scale)
+                  + (size_t)rr * (size_t)(n_gr + 8);
+        sbase[q] = 0.f; sstep[q] = 0.f;
+        if (ULS) {
+            sbase[q] = *reinterpret_cast<const float*>(urow[q]);
+            sstep[q] = *reinterpret_cast<const float*>(urow[q] + 4);
+        }
+    }
+    float acc[MT8Q_ROWS][8];
+    #pragma unroll
+    for (int q = 0; q < MT8Q_ROWS; ++q)
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) acc[q][t] = 0.f;
+    int nchunk = (in_f + MT8Q_KCHUNK - 1) / MT8Q_KCHUNK;
+    for (int c = 0; c < nchunk; ++c) {
+        int k0 = c * MT8Q_KCHUNK;
+        int klen = min(MT8Q_KCHUNK, in_f - k0);
+        __syncthreads();               // smem reuse protection
+        int k4 = klen >> 2;
+        for (int i = threadIdx.x; i < 8 * k4; i += blockDim.x) {
+            int t = i / k4;
+            int j = i - t * k4;
+            reinterpret_cast<float4*>(xs_sm + (size_t)t * klen)[j] =
+                *reinterpret_cast<const float4*>(
+                    x + (size_t)t * in_f + k0 + 4 * j);
+        }
+        __syncthreads();
+        int lg0 = k0 / GROUP;
+        int lgn = klen / GROUP;
+        for (int g = lane; g < lgn; g += 32) {
+            int gg = lg0 + g;
+            const float* xs_g = xs_sm + (size_t)g * GROUP;
+            #pragma unroll
+            for (int pair = 0; pair < 2; ++pair) {
+                float cvals[2][16];
+                float scs[2];
+                #pragma unroll
+                for (int qq = 0; qq < 2; ++qq) {
+                    int q = pair * 2 + qq;
+                    uint2 b2 = *reinterpret_cast<const uint2*>(
+                        irow[q] + (size_t)gg * 8);
+                    uint32_t sw = wrow[q][gg >> 1] >> (16 * (gg & 1));
+                    scs[qq] = ULS
+                        ? exp2f(sbase[q] + sstep[q] * (float)urow[q][8 + gg])
+                        : __half2float(srow[q][gg]);
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        int b = (int)((b2.x >> (8 * i)) & 0xFF);
+                        int s0 = (int)((sw >> (2 * i)) & 1u) << 4;
+                        int s1 = (int)((sw >> (2 * i + 1)) & 1u) << 4;
+                        cvals[qq][2 * i] = cb_sm[(b & 0xF) | s0];
+                        cvals[qq][2 * i + 1] = cb_sm[(b >> 4) | s1];
+                    }
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        int b = (int)((b2.y >> (8 * i)) & 0xFF);
+                        int s0 = (int)((sw >> (8 + 2 * i)) & 1u) << 4;
+                        int s1 = (int)((sw >> (8 + 2 * i + 1)) & 1u) << 4;
+                        cvals[qq][8 + 2 * i] = cb_sm[(b & 0xF) | s0];
+                        cvals[qq][8 + 2 * i + 1] = cb_sm[(b >> 4) | s1];
+                    }
+                }
+                const float* xw = xs_g;
+                #pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    float4 v0 = *reinterpret_cast<const float4*>(xw);
+                    float4 v1 = *reinterpret_cast<const float4*>(xw + 4);
+                    float4 v2 = *reinterpret_cast<const float4*>(xw + 8);
+                    float4 v3 = *reinterpret_cast<const float4*>(xw + 12);
+                    #pragma unroll
+                    for (int qq = 0; qq < 2; ++qq) {
+                        const float* cv = cvals[qq];
+                        float inner = 0.f;
+                        inner = fmaf(cv[0],  v0.x, inner);
+                        inner = fmaf(cv[1],  v0.y, inner);
+                        inner = fmaf(cv[2],  v0.z, inner);
+                        inner = fmaf(cv[3],  v0.w, inner);
+                        inner = fmaf(cv[4],  v1.x, inner);
+                        inner = fmaf(cv[5],  v1.y, inner);
+                        inner = fmaf(cv[6],  v1.z, inner);
+                        inner = fmaf(cv[7],  v1.w, inner);
+                        inner = fmaf(cv[8],  v2.x, inner);
+                        inner = fmaf(cv[9],  v2.y, inner);
+                        inner = fmaf(cv[10], v2.z, inner);
+                        inner = fmaf(cv[11], v2.w, inner);
+                        inner = fmaf(cv[12], v3.x, inner);
+                        inner = fmaf(cv[13], v3.y, inner);
+                        inner = fmaf(cv[14], v3.z, inner);
+                        inner = fmaf(cv[15], v3.w, inner);
+                        acc[pair * 2 + qq][t] += inner * scs[qq];
+                    }
+                    xw += klen;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int q = 0; q < MT8Q_ROWS; ++q) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            #pragma unroll
+            for (int t = 0; t < 8; ++t)
+                acc[q][t] += __shfl_down_sync(0xffffffff, acc[q][t], off);
+        }
+        if (lane == 0 && ok[q]) {
+            #pragma unroll
+            for (int t = 0; t < 8; ++t)
+                y[(size_t)t * out_f + r0 + q] = acc[q][t];
+        }
+    }
+}
+
+static void udcq_gemv_mt8_launch(
+    const float* x, const uint8_t* idx, const uint32_t* sign,
+    const __half* scale, const float* cb, float* y,
+    int out_f, int in_f, int group, cudaStream_t st)
+{
+    static int max_sm = -1;
+    if (max_sm < 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&max_sm,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        if (max_sm > 0) {
+            cudaFuncSetAttribute(udcq_gemv_mt8q_kernel<false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, max_sm);
+            cudaFuncSetAttribute(udcq_gemv_mt8q_kernel<true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, max_sm);
+        }
+    }
+    size_t sm = (size_t)8 * (MT8Q_KCHUNK < in_f ? MT8Q_KCHUNK : in_f)
+                * sizeof(float) + 32 * sizeof(float);
+    int rows_per_block = 8 * MT8Q_ROWS;
+    if (g_uls)
+        udcq_gemv_mt8q_kernel<true><<<(unsigned)((out_f + rows_per_block - 1)
+                                                 / rows_per_block),
+                                       256, sm, st>>>(
+            x, idx, sign, scale, cb, y, in_f, out_f, group);
+    else
+        udcq_gemv_mt8q_kernel<false><<<(unsigned)((out_f + rows_per_block - 1)
+                                                  / rows_per_block),
+                                        256, sm, st>>>(
+            x, idx, sign, scale, cb, y, in_f, out_f, group);
+}
+
+torch::Tensor udcq_gemv_mt8_out(torch::Tensor x, torch::Tensor idx,
+                                torch::Tensor sign, torch::Tensor scale,
+                                torch::Tensor cb,
+                                int64_t out_f, int64_t in_f,
+                                int64_t group) {
+    auto y = torch::empty({8, out_f}, torch::dtype(torch::kFloat32)
+                                          .device(x.device()));
+    udcq_gemv_mt8_launch(
+        x.data_ptr<float>(), idx.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(sign.data_ptr()),
+        reinterpret_cast<const __half*>(scale.data_ptr()),
+        cb.data_ptr<float>(), y.data_ptr<float>(),
+        (int)out_f, (int)in_f, (int)group,
+        at::cuda::getCurrentCUDAStream());
+    return y;
+}
+
 // dual small-shape GEMV: two packs sharing one x, one launch.
 // grid = 2 * ceil(out_f/8); first half -> pack0/y0, second -> pack1/y1.
 // Same warp-per-row walk as v2 (x staged in smem).
@@ -1380,10 +1668,9 @@ torch::Tensor rmsnorm_fw_out(torch::Tensor x2d, torch::Tensor w,
 
 // fused residual add + rms-norm in ONE launch:
 //   y_add = a + b;  y_norm = w * y_add * rsqrt(mean(y_add^2) + eps)
-// Same per-thread accumulation order as add_f32 + rmsnorm_fw_kernel (thread i
-// walks i, i+256, ...), so the pair is bit-identical to the two-kernel
-// sequence. Replaces 2 launches/layer x 2 with 1 (norm calls were 4.2% of
-// step time at 7.4us/call, pure launch overhead for d=5120).
+// Row-based: blockIdx.x selects the row (grid R; R=1 matches the original
+// single-row behavior bit-for-bit). Same per-thread accumulation order as
+// add_f32 + rmsnorm_fw_kernel.
 __global__ void add_norm_f32(const float* __restrict__ a,
                              const float* __restrict__ b,
                              const float* __restrict__ w,
@@ -1391,10 +1678,14 @@ __global__ void add_norm_f32(const float* __restrict__ a,
                              float* __restrict__ y_norm,
                              int d, float eps) {
     __shared__ float red[32];
+    const float* ar = a + (size_t)blockIdx.x * d;
+    const float* br = b + (size_t)blockIdx.x * d;
+    float* yar = y_add + (size_t)blockIdx.x * d;
+    float* ynr = y_norm + (size_t)blockIdx.x * d;
     float sq = 0.f;
     for (int i = threadIdx.x; i < d; i += blockDim.x) {
-        float v = a[i] + b[i];
-        y_add[i] = v;
+        float v = ar[i] + br[i];
+        yar[i] = v;
         sq += v * v;
     }
     if (threadIdx.x < 32) red[threadIdx.x] = 0.f;
@@ -1411,7 +1702,7 @@ __global__ void add_norm_f32(const float* __restrict__ a,
     }
     __syncthreads();
     for (int i = threadIdx.x; i < d; i += blockDim.x)
-        y_norm[i] = w[i] * y_add[i] * red[0];
+        ynr[i] = w[i] * yar[i] * red[0];
 }
 
 // ---------------- Stage 4 step 3a: GDN layer step --------------------- //
@@ -1452,6 +1743,77 @@ __global__ void ggate_kernel(const float* a, const float* A_log,
 __global__ void scale_kernel(float* x, float c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= c;
+}
+
+// GDN core given precomputed projections (qkv/z/bo/ao fp32 vectors).
+// The decode path calls it once with the single-token projection statics;
+// the blocked prefill calls it 8x with rows of the stacked mt8 outputs.
+// Writes on_out [nv*dv]; conv_state/S advance in place (sequential).
+static void gdn_core_from_proj(
+    const float* qkv_p, const float* z_p, const float* bo_p, const float* ao_p,
+    torch::Tensor conv_w, torch::Tensor conv_b,
+    torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor norm_w,
+    torch::Tensor conv_state, torch::Tensor S,
+    float* on_out, int nv, int nk, int dk, int dv, int l)
+{
+    auto st = at::cuda::getCurrentCUDAStream();
+    int key_dim = nk * dk;
+    int value_dim = nv * dv;
+    int conv_dim = key_dim * 2 + value_dim;
+    auto f32 = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(A_log.device());
+    static torch::Tensor mq, qi, ki, vr, qh, kh, beta, gvec, o, zr;
+    static bool init = false;
+    if (!init) {
+        mq   = torch::empty({conv_dim}, f32);
+        qi   = torch::empty({nv, dk}, f32);
+        ki   = torch::empty({nv, dk}, f32);
+        vr   = torch::empty({nv, dv}, f32);
+        qh   = torch::empty({nv, dk}, f32);
+        kh   = torch::empty({nv, dk}, f32);
+        beta = torch::empty({nv}, f32);
+        gvec = torch::empty({nv}, f32);
+        o    = torch::empty({nv, dv}, f32);
+        zr   = torch::empty({nv, dv}, f32);
+        init = true;
+    }
+    conv1d_update_kernel<<<(conv_dim + 255) / 256, 256, 0, st>>>(
+        qkv_p, conv_state.data_ptr<float>(),
+        conv_w.data_ptr<float>(), conv_b.data_ptr<float>(),
+        mq.data_ptr<float>(), 3, 4, 1);
+    cudaMemcpyAsync(zr.data_ptr<float>(), z_p,
+                    value_dim * sizeof(float),
+                    cudaMemcpyDeviceToDevice, st);
+    repeat_heads_kernel<<<(unsigned)nv, dk, 0, st>>>(
+        mq.data_ptr<float>(), qi.data_ptr<float>(), dk, (int)(nv / nk));
+    repeat_heads_kernel<<<(unsigned)nv, dk, 0, st>>>(
+        mq.data_ptr<float>() + key_dim, ki.data_ptr<float>(), dk,
+        (int)(nv / nk));
+    cudaMemcpyAsync(vr.data_ptr<float>(), mq.data_ptr<float>() + 2 * key_dim,
+                    value_dim * sizeof(float), cudaMemcpyDeviceToDevice, st);
+    l2norm_kernel<<<nv, 256, 0, st>>>(
+        qi.data_ptr<float>(), qh.data_ptr<float>(), dk);
+    l2norm_kernel<<<nv, 256, 0, st>>>(
+        ki.data_ptr<float>(), kh.data_ptr<float>(), dk);
+    scale_kernel<<<(nv * dk + 255) / 256, 256, 0, st>>>(
+        qh.data_ptr<float>(), 1.0f / std::sqrt((float)dk), nv * dk);
+    sigmoid_kernel<<<1, 256, 0, st>>>(bo_p, beta.data_ptr<float>(), nv);
+    ggate_kernel<<<1, 256, 0, st>>>(
+        ao_p, A_log.data_ptr<float>(),
+        dt_bias.data_ptr<float>(), gvec.data_ptr<float>(), nv);
+    gdn_recurrent_v2_kernel<<<dim3((unsigned)nv, (unsigned)(dv / 32)), 128,
+                              0, st>>>(
+        qh.data_ptr<float>(), kh.data_ptr<float>(),
+        vr.data_ptr<float>(), gvec.data_ptr<float>(),
+        beta.data_ptr<float>(), S.data_ptr<float>(),
+        o.data_ptr<float>(), dk, dv);
+    gated_rmsnorm_kernel<<<nv, 256, 0, st>>>(
+        o.data_ptr<float>(), zr.data_ptr<float>(),
+        norm_w.data_ptr<float>(), on_out, dv, 1e-6f);
+    if ((int)l == s27_probe_l) {
+        s27d_o = o.clone();
+        s27d_gated = torch::from_blob(on_out, {nv, dv}, f32).clone();
+    }
 }
 
 torch::Tensor gdn_layer_step(
@@ -1515,53 +1877,13 @@ torch::Tensor gdn_layer_step(
     mt_gemv_launch(h.data_ptr<float>(), cb.data_ptr<float>(), mslot,
                    conv_dim + value_dim + 2 * (int)nv, 4, hidden, GROUP, st);
 
-    conv1d_update_kernel<<<(conv_dim + 255) / 256, 256, 0, st>>>(
-        qkv.data_ptr<float>(), conv_state.data_ptr<float>(),
-        conv_w.data_ptr<float>(), conv_b.data_ptr<float>(),
-        mq.data_ptr<float>(), 3, 4, 1);
-
-    // z -> [nv,dv] rows BEFORE gated norm (pitfall 1)
-    cudaMemcpyAsync(zr.data_ptr<float>(), z.data_ptr<float>(),
-                    value_dim * sizeof(float),
-                    cudaMemcpyDeviceToDevice, st);
-    repeat_heads_kernel<<<(unsigned)nv, dk, 0, st>>>(
-        mq.data_ptr<float>(), qi.data_ptr<float>(), dk,
-        (int)(nv / nk));
-    repeat_heads_kernel<<<(unsigned)nv, dk, 0, st>>>(
-        mq.data_ptr<float>() + key_dim, ki.data_ptr<float>(), dk,
-        (int)(nv / nk));
-    cudaMemcpyAsync(vr.data_ptr<float>(),
-        mq.data_ptr<float>() + 2 * key_dim,
-        value_dim * sizeof(float), cudaMemcpyDeviceToDevice, st);
-    l2norm_kernel<<<nv, 256, 0, st>>>(
-        qi.data_ptr<float>(), qh.data_ptr<float>(), dk);
-    l2norm_kernel<<<nv, 256, 0, st>>>(
-        ki.data_ptr<float>(), kh.data_ptr<float>(), dk);
-    scale_kernel<<<(nv * dk + 255) / 256, 256, 0, st>>>(
-        qh.data_ptr<float>(), 1.0f / std::sqrt((float)dk), nv * dk);
-    sigmoid_kernel<<<1, 256, 0, st>>>(
-        bo.data_ptr<float>(), beta.data_ptr<float>(), nv);
-    ggate_kernel<<<1, 256, 0, st>>>(
-        ao.data_ptr<float>(), A_log.data_ptr<float>(),
-        dt_bias.data_ptr<float>(), gvec.data_ptr<float>(), nv);
-
-    gdn_recurrent_v2_kernel<<<dim3((unsigned)nv, (unsigned)(dv / 32)), 128,
-                              0, st>>>(
-        qh.data_ptr<float>(), kh.data_ptr<float>(),
-        vr.data_ptr<float>(), gvec.data_ptr<float>(),
-        beta.data_ptr<float>(), S.data_ptr<float>(),
-        o.data_ptr<float>(), dk, dv);
-    // separate out buffer 鈥?gated norm must NOT alias (pitfall 2)
     static torch::Tensor on;
-    if (!init) {}
     if (!on.defined()) on = torch::empty({nv, dv}, f32);
-    gated_rmsnorm_kernel<<<nv, 256, 0, st>>>(
-        o.data_ptr<float>(), zr.data_ptr<float>(),
-        norm_w.data_ptr<float>(), on.data_ptr<float>(), dv, 1e-6f);
-    if ((int)l == s27_probe_l) {
-        s27d_o = o.clone();
-        s27d_gated = on.clone();
-    }
+    gdn_core_from_proj(qkv.data_ptr<float>(), z.data_ptr<float>(),
+                       bo.data_ptr<float>(), ao.data_ptr<float>(),
+                       conv_w, conv_b, A_log, dt_bias, norm_w,
+                       conv_state, S, on.data_ptr<float>(),
+                       (int)nv, (int)nk, (int)dk, (int)dv, (int)l);
     udcq_gemv_launch(
         on.view(-1).data_ptr<float>(), o_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(o_s.data_ptr()),
@@ -3123,6 +3445,58 @@ __global__ void sigmoid_mul_kernel(float* y, const float* g,
 // ---------------- Stage 4 step 3b: full-attn layer step ---------------- //
 // Fused add+norm decoder semantics (xn input pre-normed by the previous
 // layer's final add_norm; this layer's final add_norm emits xn_next).
+// attention block from precomputed q/k/v projections (one token):
+// chunk_qgate -> q_norm -> k_norm -> rope -> cache_write -> attn v3+merge
+// -> per-head sigmoid gate. Pointer flow identical to the decode path's
+// inline form (att_out = gated result). kv_cache written at *dpos.
+static void attn_from_proj(
+    const float* q2_p, const float* k2_p, const float* v2_p,
+    torch::Tensor q_norm_w, torch::Tensor k_norm_w,
+    torch::Tensor kv_cache, double theta, const int* dpos,
+    float* att_out, int nh, int nkv, int hd, int ctx)
+{
+    auto st = at::cuda::getCurrentCUDAStream();
+    auto f32 = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(kv_cache.device());
+    static torch::Tensor qh, kh, gt, attn_part, attn_psum;
+    static bool init = false;
+    if (!init) {
+        qh  = torch::empty({nh, hd}, f32);
+        kh  = torch::empty({nkv, hd}, f32);
+        gt  = torch::empty({nh * hd}, f32);
+        attn_part = torch::zeros({nh * ATTN_V3_C * 2}, f32);
+        attn_psum = torch::zeros({nh * ATTN_V3_C * hd}, f32);
+        init = true;
+    }
+    chunk_qgate_kernel<<<(unsigned)nh, (unsigned)hd, 0, st>>>(
+        q2_p, qh.data_ptr<float>(), gt.data_ptr<float>(), (int)hd);
+    rmsnorm_fw_kernel<<<nh, 256, 0, st>>>(
+        qh.data_ptr<float>(), q_norm_w.data_ptr<float>(),
+        qh.data_ptr<float>(), hd, 1e-6f);
+    rmsnorm_fw_kernel<<<nkv, 256, 0, st>>>(
+        k2_p, k_norm_w.data_ptr<float>(),
+        kh.data_ptr<float>(), hd, 1e-6f);
+    rope27_kernel<<<(unsigned)nh, 32, 0, st>>>(
+        qh.data_ptr<float>(), kh.data_ptr<float>(),
+        nh, nkv, hd, (float)theta, dpos);
+    cache_write_b_kernel<<<(unsigned)(2 * nkv), (unsigned)hd, 0, st>>>(
+        k2_p, v2_p,
+        reinterpret_cast<__nv_bfloat16*>(kv_cache.data_ptr()),
+        hd, ctx, nkv, dpos);
+    size_t asm3 = (size_t)((ctx + ATTN_V3_C - 1) / ATTN_V3_C)
+                  * sizeof(float);
+    attn_b_v3_kernel<<<dim3((unsigned)nh, ATTN_V3_C), 256, asm3, st>>>(
+        qh.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr()),
+        attn_part.data_ptr<float>(), attn_psum.data_ptr<float>(),
+        nh, nkv, hd, ctx, dpos);
+    attn_merge_kernel<<<(unsigned)nh, (unsigned)hd, 0, st>>>(
+        attn_part.data_ptr<float>(), attn_psum.data_ptr<float>(),
+        att_out, nh, hd);
+    sigmoid_mul_kernel<<<(unsigned)((nh * hd + 255) / 256), 256, 0, st>>>(
+        att_out, gt.data_ptr<float>(), nh * hd);
+}
+
 // packs: 21 tensors = q(3),k(3),v(3),o(3),g(3),u(3),d(3) idx/sign/scale
 std::vector<torch::Tensor> attn_layer_step(
     torch::Tensor h,                    // [5120] fp32 residual stream
@@ -3182,44 +3556,10 @@ std::vector<torch::Tensor> attn_layer_step(
     }
     mt_gemv_launch(xn.data_ptr<float>(), cb.data_ptr<float>(), qslot,
                    (int)(nh * hd * 2 + 2 * nkv * hd), 3, hidden, GROUP, st);
-    // fused per-head gate: q2 [nh,512] -> q [nh,256] + gate [nh,256]
-    chunk_qgate_kernel<<<(unsigned)nh, (unsigned)hd, 0, st>>>(
-        q2.data_ptr<float>(), qh.data_ptr<float>(),
-        gt.data_ptr<float>(), (int)hd);
-    rmsnorm_fw_kernel<<<nh, 256, 0, st>>>(
-        qh.data_ptr<float>(), q_norm_w.data_ptr<float>(),
-        qh.data_ptr<float>(), hd, 1e-6f);
-    k2 = k2.view({1, nkv * hd});
-    rmsnorm_fw_kernel<<<nkv, 256, 0, st>>>(
-        k2.data_ptr<float>(), k_norm_w.data_ptr<float>(),
-        kh.data_ptr<float>(), hd, 1e-6f);
-    rope27_kernel<<<(unsigned)nh, 32, 0, st>>>(
-        qh.data_ptr<float>(), kh.data_ptr<float>(),
-        (int)nh, (int)nkv, (int)hd, (float)theta, dpos);
-    cache_write_b_kernel<<<(unsigned)(2 * nkv), (unsigned)hd, 0,
-                           st>>>(
-        k2.data_ptr<float>(), v2.data_ptr<float>(),
-        reinterpret_cast<__nv_bfloat16*>(kv_cache.data_ptr()),
-        (int)hd, (int)ctx, (int)nkv, dpos);
-    static torch::Tensor attn_part, attn_psum;
-    if (!attn_part.defined()) {
-        attn_part = torch::zeros({nh * ATTN_V3_C * 2}, f32);
-        attn_psum = torch::zeros({nh * ATTN_V3_C * (int)hd}, f32);
-    }
-    size_t asm3 = (size_t)(((int)ctx + ATTN_V3_C - 1) / ATTN_V3_C)
-                  * sizeof(float);
-    attn_b_v3_kernel<<<dim3((unsigned)nh, ATTN_V3_C), 256, asm3, st>>>(
-        qh.data_ptr<float>(),
-        reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr()),
-        attn_part.data_ptr<float>(), attn_psum.data_ptr<float>(),
-        (int)nh, (int)nkv, (int)hd, (int)ctx, dpos);
-    attn_merge_kernel<<<(unsigned)nh, (unsigned)hd, 0, st>>>(
-        attn_part.data_ptr<float>(), attn_psum.data_ptr<float>(),
-        att.data_ptr<float>(), (int)nh, (int)hd);
-    // per-head sigmoid gate before o_proj
-    sigmoid_mul_kernel<<<(unsigned)((nh * hd + 255) / 256), 256, 0,
-                         st>>>(
-        att.data_ptr<float>(), gt.data_ptr<float>(), nh * hd);
+    attn_from_proj(q2.data_ptr<float>(), k2.data_ptr<float>(),
+                   v2.data_ptr<float>(), q_norm_w, k_norm_w,
+                   kv_cache, theta, dpos, att.data_ptr<float>(),
+                   (int)nh, (int)nkv, (int)hd, (int)ctx);
     udcq_gemv_launch(
         att.data_ptr<float>(), o_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(o_s.data_ptr()),

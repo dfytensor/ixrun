@@ -29,6 +29,9 @@ def _build_ext():
 void udcq_set_uls(int64_t on);
 torch::Tensor attn_v3_test(torch::Tensor q, torch::Tensor kv,
     int64_t nh, int64_t nkv, int64_t hd, int64_t ctx, int64_t pos);
+torch::Tensor udcq_gemv_mt8_out(torch::Tensor x, torch::Tensor idx,
+    torch::Tensor sign, torch::Tensor scale, torch::Tensor cb,
+    int64_t out_f, int64_t in_f, int64_t group);
 torch::Tensor udcq_gemv_out(torch::Tensor x,
     torch::Tensor idx, torch::Tensor sign,
     torch::Tensor scale, torch::Tensor cb,
@@ -46,6 +49,8 @@ void init27(torch::Tensor cb,
     int64_t hidden, int64_t inter, int64_t ctx);
 int64_t step27(torch::Tensor h, int64_t pos, double theta);
 void step27_g(torch::Tensor h, torch::Tensor dpos, double theta);
+void step27_prefill(torch::Tensor h8, torch::Tensor dpos8, double theta,
+                    int64_t final_block);
 void s27_reset();
 torch::Tensor s27_get_tok();
 void s27_set_probe(int64_t l);
@@ -54,10 +59,11 @@ torch::Tensor s27d_get_h1();
     return load_inline(name='ixrun_cpp_q27m', cpp_sources=[proto],
                        cuda_sources=[src, src27],
                        functions=['init27', 'step27', 'step27_g',
+                                  'step27_prefill',
                                   's27_reset', 's27_get_tok',
                                   's27_set_probe', 's27d_get_h1',
                                   'udcq_set_uls', 'udcq_gemv_out',
-                                  'attn_v3_test'],
+                                  'attn_v3_test', 'udcq_gemv_mt8_out'],
                        extra_cuda_cflags=['-O3', '--use_fast_math',
                                           '-allow-unsupported-compiler'],
                        verbose=False)
@@ -173,16 +179,56 @@ class CppQwen27bEngine:
                 self.ext.step27_g(self._he_buf, self._dpos, self.theta)
             self._graph = g
             print('[cpp-27b] decode graph captured', flush=True)
+            # blocked-prefill graphs: h8 + dpos8 written between replays
+            self._h8 = torch.empty(8, self.hidden, dtype=torch.float32,
+                                   device='cuda')
+            self._dpos8 = torch.zeros(8, dtype=torch.int32, device='cuda')
+            self._pos8 = torch.zeros(8, dtype=torch.int32)
+            for _ in range(2):
+                self.ext.step27_prefill(self._h8, self._dpos8, self.theta, 0)
+                self.ext.step27_prefill(self._h8, self._dpos8, self.theta, 1)
+            torch.cuda.synchronize()
+            self.ext.s27_reset()
+            gp = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(gp):
+                self.ext.step27_prefill(self._h8, self._dpos8, self.theta, 0)
+            gpf = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(gpf):
+                self.ext.step27_prefill(self._h8, self._dpos8, self.theta, 1)
+            self._graph_pf = gp
+            self._graph_pf_final = gpf
+            print('[cpp-27b] prefill graphs captured', flush=True)
         self.ext.s27_reset()
         torch.cuda.synchronize()
         toks = []
-        for pos in range(len(ids) + max_new_tokens):
-            t = ids[pos] if pos < len(ids) else (toks[-1] if toks else ids[0])
+        n = len(ids)
+        # blocked prefill: full 8-token blocks via the captured graphs (mt8q
+        # projections, one weight read per 8 tokens); last block emits the
+        # first new token; a 0-7 token tail and the decode loop use the S=1
+        # graph as before. IXRUN_NO_PREFILL=1 forces the legacy path (gate).
+        M = (n // 8) * 8 if os.environ.get(
+            'IXRUN_NO_PREFILL', '0') in ('', '0') else 0
+        if M > 0:
+            for p0 in range(0, M, 8):
+                self._h8.copy_(self.emb[ids[p0:p0 + 8]].float())
+                self._pos8.copy_(torch.tensor(
+                    [p0 + i for i in range(8)], dtype=torch.int32))
+                self._dpos8.copy_(self._pos8)
+                if p0 + 8 == n:
+                    self._graph_pf_final.replay()
+                else:
+                    self._graph_pf.replay()
+            if M == n:
+                toks.append(int(self.ext.s27_get_tok().item()))
+                print(f'  prefill {n} tok ({M//8} blocks) -> tok {toks[-1]}',
+                      flush=True)
+        for pos in range(M, n + max_new_tokens):
+            t = ids[pos] if pos < n else (toks[-1] if toks else ids[0])
             self._he_buf.copy_(self.emb[t].float())
             self._dpos.fill_(pos)
             self._graph.replay()
             nxt = int(self.ext.s27_get_tok().item())
-            if pos >= len(ids) - 1:
+            if pos >= n - 1:
                 toks.append(nxt)
             if pos < 3 or pos % 8 == 0:
                 print(f'  pos {pos} ok tok {nxt}', flush=True)
