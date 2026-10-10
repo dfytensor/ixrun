@@ -8,7 +8,7 @@ from ixrun.cpp_engine_27b import CppQwen27bEngine
 
 eng = CppQwen27bEngine.from_blob(
     r'F:\models\qwen38_uls_blob.pt', r'E:\models\Qwen3.8-27B',
-    ctx=256, verbose=True)
+    ctx=4096, verbose=True)
 eng.generate("The capital of France is", max_new_tokens=4, graph=True)
 torch.cuda.synchronize()
 
@@ -19,12 +19,29 @@ for _ in range(3):
 torch.cuda.synchronize()
 
 from torch.profiler import profile, ProfilerActivity
-with profile(activities=[ProfilerActivity.CUDA]) as prof:
-    for _ in range(20):
+
+
+def prof_at(pos, n=20):
+    eng._dpos.fill_(pos)
+    eng._he_buf.copy_(eng.emb[123].float())
+    for _ in range(3):
         eng._graph.replay()
     torch.cuda.synchronize()
-tab = prof.key_averages().table(sort_by='cuda_time_total', row_limit=25)
-print(tab, flush=True)
-tot = sum(e.self_device_time_total for e in prof.key_averages())
-print(f'TOTAL GPU per 20 replays: {tot/1000:.1f}ms -> {tot/20/1000:.2f}ms/tok',
-      flush=True)
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(n):
+            eng._graph.replay()
+        torch.cuda.synchronize()
+    tot = sum(e.self_device_time_total for e in prof.key_averages())
+    rows = {e.key[:40]: e for e in prof.key_averages()}
+    import re
+    for k, e in rows.items():
+        if 'attn_b' in k:
+            print(f'pos {pos}: attn_b {e.self_device_time_total/n/1000:.3f}ms/call '
+                  f'x{e.count//n}', flush=True)
+    print(f'pos {pos}: TOTAL {tot/n/1000:.2f} ms/tok', flush=True)
+    return prof
+
+
+prof_at(60)
+prof_at(3800)
+

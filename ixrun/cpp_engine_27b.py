@@ -27,6 +27,8 @@ def _build_ext():
     src27 = open(os.path.join(_DIR, 'cpp', 'engine_27b.cu'), encoding='utf-8').read()
     proto = '''
 void udcq_set_uls(int64_t on);
+torch::Tensor attn_v3_test(torch::Tensor q, torch::Tensor kv,
+    int64_t nh, int64_t nkv, int64_t hd, int64_t ctx, int64_t pos);
 torch::Tensor udcq_gemv_out(torch::Tensor x,
     torch::Tensor idx, torch::Tensor sign,
     torch::Tensor scale, torch::Tensor cb,
@@ -54,7 +56,8 @@ torch::Tensor s27d_get_h1();
                        functions=['init27', 'step27', 'step27_g',
                                   's27_reset', 's27_get_tok',
                                   's27_set_probe', 's27d_get_h1',
-                                  'udcq_set_uls', 'udcq_gemv_out'],
+                                  'udcq_set_uls', 'udcq_gemv_out',
+                                  'attn_v3_test'],
                        extra_cuda_cflags=['-O3', '--use_fast_math',
                                           '-allow-unsupported-compiler'],
                        verbose=False)

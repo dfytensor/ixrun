@@ -2296,6 +2296,128 @@ __global__ void attn_b_kernel(const float* q,
         = sum / denom;
 }
 
+// split-K attention decode (v3): ATTN_V3_C chunk-blocks per head with an
+// online-softmax merge. The old attn_b_kernel sweeps t serially per thread
+// with only nh blocks in flight; it stalls the in-order pipeline on strided
+// V loads for ~pos iterations (measured 554us/call at pos 3800 in-graph vs
+// 15.6us at pos 50). Chunks beyond pos early-exit with m=-inf/D=0.
+#define ATTN_V3_C 8
+
+__global__ void attn_b_v3_kernel(const float* __restrict__ q,
+                                 const __nv_bfloat16* __restrict__ kv,
+                                 float* __restrict__ part,  // [nh*C*2] m,D
+                                 float* __restrict__ psum,  // [nh*C, hd]
+                                 int n_heads, int n_kv_heads, int head_dim,
+                                 int ctx, const int* dpos) {
+    int h = blockIdx.x;
+    int c = blockIdx.y;
+    int pos = *dpos;
+    int chunk = (ctx + ATTN_V3_C - 1) / ATTN_V3_C;
+    int t0 = c * chunk;
+    int t1 = min(t0 + chunk - 1, pos);
+    int kvh = h / (n_heads / n_kv_heads);
+    const __nv_bfloat16* ks = kv + (size_t)kvh * ctx * head_dim;
+    const __nv_bfloat16* vs = kv + (size_t)n_kv_heads * ctx * head_dim
+                              + (size_t)kvh * ctx * head_dim;
+    extern __shared__ float smem[];        // chunk floats: scores -> exps
+    __shared__ float red[32];
+    float* mD = part + (size_t)h * ATTN_V3_C * 2 + c * 2;
+    float* ps = psum + ((size_t)h * ATTN_V3_C + c) * head_dim;
+    if (t0 > pos) {
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) ps[d] = 0.f;
+        if (threadIdx.x == 0) { mD[0] = -1e30f; mD[1] = 0.f; }
+        return;
+    }
+    const float* qt = q + (size_t)h * head_dim;
+    float inv_hd = rsqrtf((float)head_dim);
+    float maxs = -1e30f;
+    for (int tt = t0 + threadIdx.x; tt <= t1; tt += blockDim.x) {
+        float sc = 0.f;
+        const __nv_bfloat16* kr = ks + (size_t)tt * head_dim;
+        #pragma unroll 8
+        for (int j = 0; j < head_dim; ++j)
+            sc = fmaf(qt[j], __bfloat162float(kr[j]), sc);
+        sc *= inv_hd;
+        smem[tt - t0] = sc;
+        maxs = fmaxf(maxs, sc);
+    }
+    if (threadIdx.x < 32) red[threadIdx.x] = -1e30f;
+    __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        maxs = fmaxf(maxs, __shfl_down_sync(0xffffffff, maxs, off));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = maxs;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = -1e30f;
+        for (int k2 = 0; k2 < (int)(blockDim.x >> 5); ++k2)
+            m = fmaxf(m, red[k2]);
+        red[0] = m;
+    }
+    __syncthreads();
+    maxs = red[0];
+    int nchunk = t1 - t0 + 1;
+    for (int i = threadIdx.x; i < nchunk; i += blockDim.x)
+        smem[i] = expf(smem[i] - maxs);
+    __syncthreads();
+    int d = threadIdx.x;
+    float den_i = 0.f, sum_i = 0.f;
+    #pragma unroll 4
+    for (int i = 0; i < nchunk; ++i) {
+        float e = smem[i];
+        den_i += e;
+        sum_i = fmaf(e, __bfloat162float(vs[(size_t)(t0 + i) * head_dim + d]),
+                     sum_i);
+    }
+    // every thread walks ALL i, so den_i is already the full chunk sum
+    // (do NOT block-reduce it: that would count it 256x)
+    if (threadIdx.x == 0) {
+        mD[0] = maxs;
+        mD[1] = den_i;
+    }
+    if (d < head_dim) ps[d] = sum_i;
+}
+
+__global__ void attn_merge_kernel(const float* __restrict__ part,
+                                  const float* __restrict__ psum,
+                                  float* __restrict__ out,
+                                  int n_heads, int head_dim) {
+    int h = blockIdx.x;
+    int d = threadIdx.x;
+    const float* mD = part + (size_t)h * ATTN_V3_C * 2;
+    float M = -1e30f;
+    for (int c = 0; c < ATTN_V3_C; ++c) M = fmaxf(M, mD[c * 2]);
+    float den = 0.f, num = 0.f;
+    for (int c = 0; c < ATTN_V3_C; ++c) {
+        float w = expf(mD[c * 2] - M);
+        den += w * mD[c * 2 + 1];
+        num += w * psum[((size_t)h * ATTN_V3_C + c) * head_dim + d];
+    }
+    out[(size_t)h * head_dim + d] = num / den;
+}
+
+torch::Tensor attn_v3_test(torch::Tensor q, torch::Tensor kv,
+                           int64_t nh, int64_t nkv, int64_t hd,
+                           int64_t ctx, int64_t pos) {
+    auto st = at::cuda::getCurrentCUDAStream();
+    auto f32 = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
+    auto part = torch::zeros({nh * ATTN_V3_C * 2}, f32);
+    auto psum = torch::zeros({nh * ATTN_V3_C * hd}, f32);
+    auto out = torch::zeros({nh * hd}, f32);
+    auto dpos = torch::tensor({(int)pos}, torch::TensorOptions()
+        .dtype(torch::kInt32).device(q.device()));
+    size_t sm = (size_t)((ctx + ATTN_V3_C - 1) / ATTN_V3_C) * sizeof(float);
+    attn_b_v3_kernel<<<dim3((unsigned)nh, ATTN_V3_C), 256, sm, st>>>(
+        q.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(kv.data_ptr()),
+        part.data_ptr<float>(), psum.data_ptr<float>(),
+        (int)nh, (int)nkv, (int)hd, (int)ctx, dpos.data_ptr<int>());
+    attn_merge_kernel<<<(unsigned)nh, 256, 0, st>>>(
+        part.data_ptr<float>(), psum.data_ptr<float>(),
+        out.data_ptr<float>(), (int)nh, (int)hd);
+    return out;
+}
+
 __global__ void embed_rows_kernel(const __nv_bfloat16* table,
                                   const int64_t* toks,
                                   __nv_bfloat16* out,
@@ -3079,12 +3201,21 @@ std::vector<torch::Tensor> attn_layer_step(
         k2.data_ptr<float>(), v2.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(kv_cache.data_ptr()),
         (int)hd, (int)ctx, (int)nkv, dpos);
-    attn_b_kernel<<<(unsigned)nh, (unsigned)hd,
-                    (size_t)ctx * sizeof(float), st>>>(
+    static torch::Tensor attn_part, attn_psum;
+    if (!attn_part.defined()) {
+        attn_part = torch::zeros({nh * ATTN_V3_C * 2}, f32);
+        attn_psum = torch::zeros({nh * ATTN_V3_C * (int)hd}, f32);
+    }
+    size_t asm3 = (size_t)(((int)ctx + ATTN_V3_C - 1) / ATTN_V3_C)
+                  * sizeof(float);
+    attn_b_v3_kernel<<<dim3((unsigned)nh, ATTN_V3_C), 256, asm3, st>>>(
         qh.data_ptr<float>(),
         reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr()),
-        att.data_ptr<float>(), (int)nh, (int)nkv, (int)hd,
-        (int)ctx, dpos);
+        attn_part.data_ptr<float>(), attn_psum.data_ptr<float>(),
+        (int)nh, (int)nkv, (int)hd, (int)ctx, dpos);
+    attn_merge_kernel<<<(unsigned)nh, (unsigned)hd, 0, st>>>(
+        attn_part.data_ptr<float>(), attn_psum.data_ptr<float>(),
+        att.data_ptr<float>(), (int)nh, (int)hd);
     // per-head sigmoid gate before o_proj
     sigmoid_mul_kernel<<<(unsigned)((nh * hd + 255) / 256), 256, 0,
                          st>>>(
