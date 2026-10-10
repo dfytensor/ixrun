@@ -55,6 +55,11 @@ void step27_g(torch::Tensor h, torch::Tensor dpos, double theta);
 void step27_prefill(torch::Tensor h8, torch::Tensor dpos8, double theta,
                     int64_t final_block);
 void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta);
+std::vector<torch::Tensor> gdn_cmp_test(torch::Tensor qkvT, torch::Tensor zT,
+    torch::Tensor boT, torch::Tensor aoT, torch::Tensor conv_w,
+    torch::Tensor conv_b, torch::Tensor A_log, torch::Tensor dt_bias,
+    torch::Tensor norm_w, int64_t T, int64_t nv, int64_t nk,
+    int64_t dk, int64_t dv);
 void s27_reset();
 torch::Tensor s27_get_tok();
 void s27_set_probe(int64_t l);
@@ -63,7 +68,7 @@ torch::Tensor s27d_get_h1();
     return load_inline(name='ixrun_cpp_q27m', cpp_sources=[proto],
                        cuda_sources=[src, src27],
                        functions=['init27', 'step27', 'step27_g',
-                                  'step27_prefill', 'step27_prefill_gemm',
+                                  'step27_prefill', 'step27_prefill_gemm', 'gdn_cmp_test',
                                   's27_reset', 's27_get_tok',
                                   's27_set_probe', 's27d_get_h1',
                                   'udcq_set_uls', 'udcq_gemv_out',

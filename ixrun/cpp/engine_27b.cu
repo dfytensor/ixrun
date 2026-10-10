@@ -324,6 +324,15 @@ void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta) {
             castf(bob, boT.data_ptr<float>(), NV);
             mm(aob, xnb, wa);
             castf(aob, aoT.data_ptr<float>(), NV);
+            if (getenv("IXRUN_BATCH_GDN") == nullptr ||
+                std::string(getenv("IXRUN_BATCH_GDN")) != "0") {
+            gdn_core_batch(qkvT.data_ptr<float>(), zT.data_ptr<float>(),
+                           boT.data_ptr<float>(), aoT.data_ptr<float>(),
+                           s27_gex[ig * 4], s27_gex[ig * 4 + 1],
+                           s27_gex[ig * 4 + 2], s27_gex[ig * 4 + 3],
+                           s27_gnorm[ig], s27_convst[ig], s27_S[ig],
+                           onT.data_ptr<float>(), T, NV, NK, DK, DV, l);
+            } else {
             for (int i = 0; i < T; ++i)
                 gdn_core_from_proj(
                     qkvT.data_ptr<float>() + (size_t)i * conv_dim,
@@ -335,6 +344,7 @@ void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta) {
                     s27_gnorm[ig], s27_convst[ig], s27_S[ig],
                     onT.data_ptr<float>() + (size_t)i * value_dim,
                     NV, NK, DK, DV, l);
+            }
             castb(onT.data_ptr<float>(), onb, value_dim);
             mm(ob, onb, wo);
             castf(ob, oT.data_ptr<float>(), hidden);
@@ -346,15 +356,9 @@ void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta) {
             castf(k2b, k2T.data_ptr<float>(), NKV * HD);
             mm(v2b, xnb, wv);
             castf(v2b, v2T.data_ptr<float>(), NKV * HD);
-            for (int i = 0; i < T; ++i)
-                attn_from_proj(
-                    q2T.data_ptr<float>() + (size_t)i * NH * HD * 2,
-                    k2T.data_ptr<float>() + (size_t)i * NKV * HD,
-                    v2T.data_ptr<float>() + (size_t)i * NKV * HD,
-                    s27_aex[ia * 2], s27_aex[ia * 2 + 1], s27_kv[ia],
-                    theta, dpos + i,
-                    attT.data_ptr<float>() + (size_t)i * NH * HD,
-                    NH, NKV, HD, (int)s27_ctx);
+            attn_batch_proj(q2T, k2T, v2T, attT, dpos,
+                            s27_aex[ia * 2], s27_aex[ia * 2 + 1], s27_kv[ia],
+                            theta, T, NH, NKV, HD, (int)s27_ctx);
             castb(attT.data_ptr<float>(), attb, NH * HD);
             mm(ob, attb, wo);
             castf(ob, oT.data_ptr<float>(), hidden);

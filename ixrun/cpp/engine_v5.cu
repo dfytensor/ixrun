@@ -1978,7 +1978,202 @@ __global__ void scale_kernel(float* x, float c, int n) {
     if (i < n) x[i] *= c;
 }
 
-// GDN core given precomputed projections (qkv/z/bo/ao fp32 vectors).
+// ---------------- batched (T-row) GDN/attn core for GEMM prefill ------ //
+// Same arithmetic order as the per-token kernels => token-exact.
+#define GT_MAXT 256
+
+// sliding-window causal conv over T tokens, one thread per channel.
+// acc order matches conv1d_update_kernel exactly (k=0..2, then last tap,
+// then bias); state ends as the last K-1 inputs.
+__global__ void conv1d_batch_kernel(
+    const float* __restrict__ xT,      // [T, C]
+    float* __restrict__ conv_state,    // [C, K-1] in/out
+    const float* __restrict__ w,       // [C, K]
+    const float* __restrict__ bias,    // [C]
+    float* __restrict__ out,           // [T, C]
+    int T, int C, int K)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    int sl = K - 1;
+    float* st = conv_state + (long long)c * sl;
+    float s0 = st[0], s1 = st[1], s2 = st[2];
+    const float w0 = w[c * K + 0], w1 = w[c * K + 1],
+                w2 = w[c * K + 2], w3 = w[c * K + 3];
+    const float b = bias[c];
+    for (int t = 0; t < T; ++t) {
+        float xt = xT[(size_t)t * C + c];
+        float acc = w0 * s0;
+        acc += w1 * s1;
+        acc += w2 * s2;
+        acc += w3 * xt;
+        acc += b;
+        out[(size_t)t * C + c] = acc / (1.f + expf(-acc));   // use_act=1 siLU
+        s0 = s1; s1 = s2; s2 = xt;
+    }
+    st[0] = s0; st[1] = s1; st[2] = s2;
+}
+
+// repeat_heads + l2norm + scale fused, T-row: row = t*nv + j; source head
+// j/rep of token t. Reduction order matches l2norm_kernel exactly.
+__global__ void rl2n_t_kernel(const float* __restrict__ mq,
+                              float* __restrict__ out,
+                              int off, int rep, int nv, int conv_dim,
+                              int dk, float scale, float eps) {
+    __shared__ float red[32];
+    int row = blockIdx.x;
+    int j = row % nv;
+    const float* src = mq + (size_t)(row / nv) * conv_dim + off
+                       + (size_t)(j / rep) * dk;
+    float* dst = out + (size_t)row * dk;
+    float sq = 0.f;
+    for (int i = threadIdx.x; i < dk; i += blockDim.x)
+        sq += src[i] * src[i];
+    if (threadIdx.x < 32) red[threadIdx.x] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        sq += __shfl_down_sync(0xffffffff, sq, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sq;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int k = 0; k < (int)(blockDim.x >> 5); ++k) t += red[k];
+        red[0] = __frsqrt_rn(t + eps);      // FLA l2norm: NO /dk (sum form)
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < dk; i += blockDim.x)
+        dst[i] = (src[i] * red[0]) * scale;
+}
+
+__global__ void sigmoid_b_kernel(const float* __restrict__ x,
+                                 float* __restrict__ y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = 1.f / (1.f + expf(-x[i]));
+}
+
+__global__ void ggate_b_kernel(const float* __restrict__ a,
+                               const float* __restrict__ A_log,
+                               const float* __restrict__ dt_bias,
+                               float* __restrict__ g, int T, int nv) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * nv) return;
+    int h = i % nv;
+    float x = a[i] + dt_bias[h];
+    float sp = (x > 20.f) ? x : (float)log1p(exp((double)x));
+    g[i] = -expf(A_log[h]) * sp;
+}
+
+// chunk_qgate over T tokens: q2T [T, nh*hd*2] -> qhT/gtT [T, nh, hd]
+__global__ void chunk_qgate_t_kernel(const float* __restrict__ q2T,
+                                     float* __restrict__ qh,
+                                     float* __restrict__ gt,
+                                     int nh, int hd) {
+    int row = blockIdx.x;              // t*nh + h
+    int t = row / nh;
+    int h = row % nh;
+    int i = threadIdx.x;
+    if (i >= hd) return;
+    const float* src = q2T + ((size_t)t * nh + h) * hd * 2;
+    qh[(size_t)row * hd + i] = src[i];
+    gt[(size_t)row * hd + i] = src[hd + i];
+}
+
+// rope27 over T tokens (per-token position from dpos[t])
+__global__ void rope27_t_kernel(float* __restrict__ q, float* __restrict__ k,
+                                int T, int nh, int nkv, int hd, float theta,
+                                const int* dpos) {
+    int row = blockIdx.x;              // t*nh + h
+    int t = row / nh;
+    int h = row % nh;
+    int i = threadIdx.x;
+    if (i >= 32) return;
+    int pos = dpos[t];
+    float th = pos * powf(theta, -2.0f * i / 64.0f);
+    float c = cosf(th), s = sinf(th);
+    float* qr = q + (size_t)t * nh * hd + h * hd;
+    float q0 = qr[i], q1 = qr[i + 32];
+    qr[i] = q0 * c - q1 * s;
+    qr[i + 32] = q0 * s + q1 * c;
+    if (h < nkv) {
+        float* kr = k + ((size_t)t * nkv + h) * hd;
+        float k0 = kr[i], k1 = kr[i + 32];
+        kr[i] = k0 * c - k1 * s;
+        kr[i + 32] = k0 * s + k1 * c;
+    }
+}
+
+// batched GDN core (same math as T per-token gdn_core_from_proj calls)
+static void gdn_core_batch(
+    const float* qkvT, const float* zT, const float* boT, const float* aoT,
+    torch::Tensor conv_w, torch::Tensor conv_b,
+    torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor norm_w,
+    torch::Tensor conv_state, torch::Tensor S,
+    float* onT, int T, int nv, int nk, int dk, int dv, int l)
+{
+    auto st = at::cuda::getCurrentCUDAStream();
+    int key_dim = nk * dk;
+    int value_dim = nv * dv;
+    int conv_dim = key_dim * 2 + value_dim;
+    auto f32 = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(A_log.device());
+    static torch::Tensor mqT, qhT, khT, vrT, betaT, gvecT, oT2, zrT;
+    static bool init = false;
+    if (!init) {
+        int M = GT_MAXT;
+        mqT = torch::empty({M, conv_dim}, f32);
+        qhT = torch::empty({M, nv, dk}, f32);
+        khT = torch::empty({M, nv, dk}, f32);
+        vrT = torch::empty({M, nv, dv}, f32);
+        betaT = torch::empty({M, nv}, f32);
+        gvecT = torch::empty({M, nv}, f32);
+        oT2 = torch::empty({M, nv, dv}, f32);
+        zrT = torch::empty({M, value_dim}, f32);
+        init = true;
+    }
+    int K = 4;
+    conv1d_batch_kernel<<<(unsigned)((conv_dim + 255) / 256), 256, 0, st>>>(
+        qkvT, conv_state.data_ptr<float>(), conv_w.data_ptr<float>(),
+        conv_b.data_ptr<float>(), mqT.data_ptr<float>(), T, conv_dim, K);
+    cudaMemcpyAsync(zrT.data_ptr<float>(), zT,
+                    (size_t)T * value_dim * sizeof(float),
+                    cudaMemcpyDeviceToDevice, st);
+    int rep = nv / nk;
+    rl2n_t_kernel<<<(unsigned)(T * nv), 256, 0, st>>>(
+        mqT.data_ptr<float>(), qhT.data_ptr<float>(), 0, rep, nv, conv_dim,
+        dk, 1.0f / sqrtf((float)dk), 1e-6f);
+    rl2n_t_kernel<<<(unsigned)(T * nv), 256, 0, st>>>(
+        mqT.data_ptr<float>(), khT.data_ptr<float>(), key_dim, rep, nv,
+        conv_dim, dk, 1.0f, 1e-6f);
+    cudaMemcpy2DAsync(vrT.data_ptr<float>(), (size_t)value_dim * sizeof(float),
+                      mqT.data_ptr<float>() + 2 * key_dim,
+                      (size_t)conv_dim * sizeof(float),
+                      (size_t)value_dim * sizeof(float), (size_t)T,
+                      cudaMemcpyDeviceToDevice, st);
+    sigmoid_b_kernel<<<(unsigned)((T * nv + 255) / 256), 256, 0, st>>>(
+        boT, betaT.data_ptr<float>(), T * nv);
+    ggate_b_kernel<<<(unsigned)((T * nv + 255) / 256), 256, 0, st>>>(
+        aoT, A_log.data_ptr<float>(), dt_bias.data_ptr<float>(),
+        gvecT.data_ptr<float>(), T, nv);
+    for (int t = 0; t < T; ++t)
+        gdn_recurrent_v2_kernel<<<dim3((unsigned)nv, (unsigned)(dv / 32)),
+                                  128, 0, st>>>(
+            qhT.data_ptr<float>() + (size_t)t * nv * dk,
+            khT.data_ptr<float>() + (size_t)t * nv * dk,
+            vrT.data_ptr<float>() + (size_t)t * nv * dv,
+            gvecT.data_ptr<float>() + (size_t)t * nv,
+            betaT.data_ptr<float>() + (size_t)t * nv,
+            S.data_ptr<float>(),
+            oT2.data_ptr<float>() + (size_t)t * nv * dv, dk, dv);
+    gated_rmsnorm_kernel<<<(unsigned)(T * nv), 256, 0, st>>>(
+        oT2.data_ptr<float>(), zrT.data_ptr<float>(),
+        norm_w.data_ptr<float>(), onT, dv, 1e-6f);
+}
+
+// (attn_batch_proj moved to EOF - it needs attn_b_v3/merge/cache_write/
+// sigmoid_mul which are defined later in this file)
+
+
 // The decode path calls it once with the single-token projection statics;
 // the blocked prefill calls it 8x with rows of the stacked mt8 outputs.
 // Writes on_out [nv*dv]; conv_state/S advance in place (sequential).
@@ -3826,4 +4021,96 @@ std::vector<torch::Tensor> attn_layer_step(
         in_w_next.data_ptr<float>(), out.data_ptr<float>(),
         xn_out.data_ptr<float>(), hidden, 1e-6f);
     return {out, xn_out};
+}
+
+// test-only: run per-token and batched GDN cores on identical inputs and
+// return both outputs for token-by-token comparison
+std::vector<torch::Tensor> gdn_cmp_test(
+    torch::Tensor qkvT, torch::Tensor zT, torch::Tensor boT,
+    torch::Tensor aoT, torch::Tensor conv_w, torch::Tensor conv_b,
+    torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor norm_w,
+    int64_t T, int64_t nv, int64_t nk, int64_t dk, int64_t dv) {
+    auto st = at::cuda::getCurrentCUDAStream();
+    auto f32 = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(qkvT.device());
+    int key_dim = (int)(nk * dk);
+    int value_dim = (int)(nv * dv);
+    int conv_dim = key_dim * 2 + value_dim;
+    auto cs1 = torch::zeros({conv_dim, 3}, f32);
+    auto S1 = torch::zeros({nv, dk, dv}, f32);
+    auto on_pt = torch::zeros({T, value_dim}, f32);
+    for (int t = 0; t < (int)T; ++t)
+        gdn_core_from_proj(
+            qkvT.data_ptr<float>() + (size_t)t * conv_dim,
+            zT.data_ptr<float>() + (size_t)t * value_dim,
+            boT.data_ptr<float>() + (size_t)t * nv,
+            aoT.data_ptr<float>() + (size_t)t * nv,
+            conv_w, conv_b, A_log, dt_bias, norm_w, cs1, S1,
+            on_pt.data_ptr<float>() + (size_t)t * value_dim,
+            (int)nv, (int)nk, (int)dk, (int)dv, -1);
+    auto cs2 = torch::zeros({conv_dim, 3}, f32);
+    auto S2 = torch::zeros({nv, dk, dv}, f32);
+    auto on_b = torch::zeros({T, value_dim}, f32);
+    gdn_core_batch(qkvT.data_ptr<float>(), zT.data_ptr<float>(),
+                   boT.data_ptr<float>(), aoT.data_ptr<float>(),
+                   conv_w, conv_b, A_log, dt_bias, norm_w, cs2, S2,
+                   on_b.data_ptr<float>(), (int)T, (int)nv, (int)nk,
+                   (int)dk, (int)dv, -1);
+    return {on_pt, on_b};
+}
+
+// batched attention projections (q/k/v chains); the attention itself stays
+// per-token (attn_b_v3 + merge) inside this helper. Positions come from the
+// dpos array (dpos[t]); the KV rows for the segment are contiguous so the
+// cache write batches directly.
+static void attn_batch_proj(
+    torch::Tensor& q2T, torch::Tensor& k2T, torch::Tensor& v2T,
+    torch::Tensor& attT, const int* dpos,
+    torch::Tensor q_norm_w, torch::Tensor k_norm_w,
+    torch::Tensor kv_cache, double theta,
+    int T, int nh, int nkv, int hd, int ctx)
+{
+    auto st = at::cuda::getCurrentCUDAStream();
+    auto f32 = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(kv_cache.device());
+    static torch::Tensor qhT, gtT, khT, attn_part, attn_psum;
+    static bool init = false;
+    if (!init) {
+        qhT = torch::empty({GT_MAXT, nh, hd}, f32);
+        gtT = torch::empty({GT_MAXT, nh, hd}, f32);
+        khT = torch::empty({GT_MAXT, nkv, hd}, f32);
+        attn_part = torch::zeros({nh * ATTN_V3_C * 2}, f32);
+        attn_psum = torch::zeros({nh * ATTN_V3_C * hd}, f32);
+        init = true;
+    }
+    chunk_qgate_t_kernel<<<(unsigned)(T * nh), (unsigned)hd, 0, st>>>(
+        q2T.data_ptr<float>(), qhT.data_ptr<float>(), gtT.data_ptr<float>(),
+        nh, hd);
+    rmsnorm_fw_kernel<<<(unsigned)(T * nh), 256, 0, st>>>(
+        qhT.data_ptr<float>(), q_norm_w.data_ptr<float>(),
+        qhT.data_ptr<float>(), hd, 1e-6f);
+    rmsnorm_fw_kernel<<<(unsigned)(T * nkv), 256, 0, st>>>(
+        k2T.data_ptr<float>(), k_norm_w.data_ptr<float>(),
+        khT.data_ptr<float>(), hd, 1e-6f);
+    rope27_t_kernel<<<(unsigned)(T * nh), 32, 0, st>>>(
+        qhT.data_ptr<float>(), khT.data_ptr<float>(), T, nh, nkv, hd,
+        (float)theta, dpos);
+    cache_write_b_kernel<<<(unsigned)(T * 2 * nkv), (unsigned)hd, 0, st>>>(
+        k2T.data_ptr<float>(), v2T.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(kv_cache.data_ptr()),
+        hd, ctx, nkv, dpos);
+    size_t asm3 = (size_t)((ctx + ATTN_V3_C - 1) / ATTN_V3_C)
+                  * sizeof(float);
+    for (int t = 0; t < T; ++t) {
+        attn_b_v3_kernel<<<dim3((unsigned)nh, ATTN_V3_C), 256, asm3, st>>>(
+            qhT.data_ptr<float>() + (size_t)t * nh * hd,
+            reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr()),
+            attn_part.data_ptr<float>(), attn_psum.data_ptr<float>(),
+            nh, nkv, hd, ctx, dpos + t);
+        attn_merge_kernel<<<(unsigned)nh, (unsigned)hd, 0, st>>>(
+            attn_part.data_ptr<float>(), attn_psum.data_ptr<float>(),
+            attT.data_ptr<float>() + (size_t)t * nh * hd, nh, hd);
+    }
+    sigmoid_mul_kernel<<<(unsigned)((T * nh * hd + 255) / 256), 256, 0, st>>>(
+        attT.data_ptr<float>(), gtT.data_ptr<float>(), T * nh * hd);
 }
