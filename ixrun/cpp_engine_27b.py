@@ -32,6 +32,9 @@ torch::Tensor attn_v3_test(torch::Tensor q, torch::Tensor kv,
 torch::Tensor udcq_gemv_mt8_out(torch::Tensor x, torch::Tensor idx,
     torch::Tensor sign, torch::Tensor scale, torch::Tensor cb,
     int64_t out_f, int64_t in_f, int64_t group);
+torch::Tensor udcq_dequant_test(torch::Tensor idx, torch::Tensor sign,
+    torch::Tensor scale, torch::Tensor cb,
+    int64_t out_f, int64_t in_f, int64_t group);
 torch::Tensor udcq_gemv_out(torch::Tensor x,
     torch::Tensor idx, torch::Tensor sign,
     torch::Tensor scale, torch::Tensor cb,
@@ -51,6 +54,7 @@ int64_t step27(torch::Tensor h, int64_t pos, double theta);
 void step27_g(torch::Tensor h, torch::Tensor dpos, double theta);
 void step27_prefill(torch::Tensor h8, torch::Tensor dpos8, double theta,
                     int64_t final_block);
+void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta);
 void s27_reset();
 torch::Tensor s27_get_tok();
 void s27_set_probe(int64_t l);
@@ -59,11 +63,11 @@ torch::Tensor s27d_get_h1();
     return load_inline(name='ixrun_cpp_q27m', cpp_sources=[proto],
                        cuda_sources=[src, src27],
                        functions=['init27', 'step27', 'step27_g',
-                                  'step27_prefill',
+                                  'step27_prefill', 'step27_prefill_gemm',
                                   's27_reset', 's27_get_tok',
                                   's27_set_probe', 's27d_get_h1',
                                   'udcq_set_uls', 'udcq_gemv_out',
-                                  'attn_v3_test', 'udcq_gemv_mt8_out'],
+                                  'attn_v3_test', 'udcq_gemv_mt8_out', 'udcq_dequant_test'],
                        extra_cuda_cflags=['-O3', '--use_fast_math',
                                           '-allow-unsupported-compiler'],
                        verbose=False)
@@ -198,6 +202,30 @@ class CppQwen27bEngine:
             self._graph_pf = gp
             self._graph_pf_final = gpf
             print('[cpp-27b] prefill graphs captured', flush=True)
+            # gemm-prefill graphs (T=256 / T=64 segments; cuBLAS + cores,
+            # text-identical to the legacy path at 3x+ throughput)
+            self._graph_gemm = {}
+            try:
+                self._hT = torch.empty(256, self.hidden, dtype=torch.float32,
+                                       device='cuda')
+                self._dposT = torch.zeros(256, dtype=torch.int32,
+                                          device='cuda')
+                for tsz in (256, 64):
+                    hv = self._hT.narrow(0, 0, tsz)
+                    dv = self._dposT.narrow(0, 0, tsz)
+                    for _ in range(2):
+                        self.ext.step27_prefill_gemm(hv, dv, self.theta)
+                    torch.cuda.synchronize()
+                    self.ext.s27_reset()
+                    gg = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(gg):
+                        self.ext.step27_prefill_gemm(hv, dv, self.theta)
+                    self._graph_gemm[tsz] = gg
+                print('[cpp-27b] gemm prefill graphs captured', flush=True)
+            except Exception as e:
+                print(f'[cpp-27b] gemm prefill capture failed: {e}',
+                      flush=True)
+                self._graph_gemm = None
         self.ext.s27_reset()
         torch.cuda.synchronize()
         toks = []
@@ -208,21 +236,37 @@ class CppQwen27bEngine:
         # graph as before. IXRUN_NO_PREFILL=1 forces the legacy path (gate).
         M = (n // 8) * 8 if os.environ.get(
             'IXRUN_NO_PREFILL', '0') in ('', '0') else 0
-        if M > 0:
-            for p0 in range(0, M, 8):
-                self._h8.copy_(self.emb[ids[p0:p0 + 8]].float())
-                self._pos8.copy_(torch.tensor(
-                    [p0 + i for i in range(8)], dtype=torch.int32))
-                self._dpos8.copy_(self._pos8)
-                if p0 + 8 == n:
-                    self._graph_pf_final.replay()
-                else:
-                    self._graph_pf.replay()
-            if M == n:
-                toks.append(int(self.ext.s27_get_tok().item()))
-                print(f'  prefill {n} tok ({M//8} blocks) -> tok {toks[-1]}',
-                      flush=True)
-        for pos in range(M, n + max_new_tokens):
+        pos = 0
+        use_gemm = bool(self._graph_gemm) and os.environ.get(
+            'IXRUN_GEMM_PREFILL', '1') not in ('', '0')
+        if M > 0 and use_gemm:
+            # gemm segments first (256, then 64s): weights dequantized once
+            # per layer per segment + cuBLAS matmuls over the segment
+            for tsz in (256, 64):
+                g = self._graph_gemm[tsz]
+                while n - pos >= tsz:
+                    self._hT[:tsz].copy_(
+                        self.emb[ids[pos:pos + tsz]].float())
+                    self._dposT[:tsz].copy_(torch.arange(
+                        pos, pos + tsz, dtype=torch.int32))
+                    g.replay()
+                    pos += tsz
+        while n - pos >= 8:
+            # mt8b 8-blocks for the remainder
+            self._h8.copy_(self.emb[ids[pos:pos + 8]].float())
+            self._pos8.copy_(torch.tensor(
+                [pos + i for i in range(8)], dtype=torch.int32))
+            self._dpos8.copy_(self._pos8)
+            if pos + 8 == n:
+                self._graph_pf_final.replay()
+            else:
+                self._graph_pf.replay()
+            pos += 8
+        if pos > 0 and pos == n:
+            toks.append(int(self.ext.s27_get_tok().item()))
+            print(f'  prefill {n} tok -> first tok {toks[-1]}', flush=True)
+        # remaining 0-7 prompt tokens + decode via the S=1 graph
+        for pos in range(pos, n + max_new_tokens):
             t = ids[pos] if pos < n else (toks[-1] if toks else ids[0])
             self._he_buf.copy_(self.emb[t].float())
             self._dpos.fill_(pos)

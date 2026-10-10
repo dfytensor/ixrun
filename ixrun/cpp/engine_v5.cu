@@ -952,6 +952,12 @@ __global__ void f32_to_bf16_kernel(const float* __restrict__ in,
     if (i < n) out[i] = __float2bfloat16_rn(in[i]);
 }
 
+__global__ void bf16_to_f32_kernel(const __nv_bfloat16* __restrict__ in,
+                                   float* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __bfloat162float(in[i]);
+}
+
 // mt8b: T=8 prefill GEMV ported from the proven PY ext design (bf16 x,
 // warp-per-row, NO smem staging: the whole x row-set stays L1-hot across
 // rows, which made the PY mt kernels 1.06-1.54x a single call for 8 tokens
@@ -1059,6 +1065,70 @@ udcq_gemv_mt8b_kernel(
     }
 }
 
+// UDCQ pack -> bf16 [out_f, in_f] decompress (prefill GEMM path: weights
+// dequantized ONCE per prompt, then cuBLAS matmuls amortize the weight read
+// across ALL prompt tokens instead of the mt-family's 8-token window).
+// One block per row; each thread decodes 4 consecutive 16-elem groups with
+// packed bf162 stores (1 group/thread scalar stores measured 159GB/s).
+template <bool ULS>
+__global__ void udcq_dequant_bf16_kernel(
+    const uint8_t* __restrict__ idx,
+    const uint32_t* __restrict__ sign,
+    const __half* __restrict__ scale,
+    const float* __restrict__ cb,
+    __nv_bfloat16* __restrict__ y,
+    int out_f, int in_f, int GROUP)
+{
+    __shared__ float cb_sm[16];
+    if (threadIdx.x < 16) cb_sm[threadIdx.x] = cb[threadIdx.x];
+    __syncthreads();
+    int r = blockIdx.x;
+    int ngr = in_f / GROUP;
+    int g0 = threadIdx.x * 4;                   // 4 groups per thread
+    if (g0 >= ngr) return;
+    float sbase = 0.f, sstep = 0.f;
+    const uint8_t* urow = nullptr;
+    const __half* srow = nullptr;
+    if (ULS) {
+        urow = reinterpret_cast<const uint8_t*>(scale)
+               + (size_t)r * (size_t)(ngr + 8);
+        sbase = *reinterpret_cast<const float*>(urow);
+        sstep = *reinterpret_cast<const float*>(urow + 4);
+    } else {
+        srow = scale + (size_t)r * ngr;
+    }
+    const uint8_t* irow = idx + (size_t)r * (in_f / 2);
+    const uint32_t* wrow = sign + (size_t)r * (in_f / 32);
+    __nv_bfloat16* yrow = y + (size_t)r * in_f;
+    #pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        int gg = g0 + q;
+        if (gg >= ngr) break;
+        const uint32_t sw = wrow[gg >> 1] >> (16 * (gg & 1));
+        float sc = ULS
+            ? exp2f(sbase + sstep * (float)urow[8 + gg])
+            : __half2float(srow[gg]);
+        uint32_t b[2];
+        b[0] = *reinterpret_cast<const uint32_t*>(irow + (size_t)gg * 8);
+        b[1] = *reinterpret_cast<const uint32_t*>(irow + (size_t)gg * 8 + 4);
+        __nv_bfloat162 pk[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int nib0 = (int)((b[i >> 2] >> (8 * (i & 3))) & 0xF);
+            int nib1 = (int)((b[i >> 2] >> (8 * (i & 3) + 4)) & 0xF);
+            int s0 = (int)((sw >> (2 * i)) & 1u);
+            int s1 = (int)((sw >> (2 * i + 1)) & 1u);
+            float w0 = (s0 ? cb_sm[nib0] : -cb_sm[nib0]) * sc;
+            float w1 = (s1 ? cb_sm[nib1] : -cb_sm[nib1]) * sc;
+            pk[i] = __floats2bfloat162_rn(w0, w1);
+        }
+        *reinterpret_cast<uint4*>(yrow + (size_t)gg * GROUP) =
+            *reinterpret_cast<uint4*>(&pk[0]);
+        *reinterpret_cast<uint4*>(yrow + (size_t)gg * GROUP + 8) =
+            *reinterpret_cast<uint4*>(&pk[4]);
+    }
+}
+
 static void udcq_gemv_mt8b_launch(
     const __nv_bfloat16* x, const uint8_t* idx, const uint32_t* sign,
     const __half* scale, const float* cb, float* y,
@@ -1072,6 +1142,39 @@ static void udcq_gemv_mt8b_launch(
         udcq_gemv_mt8b_kernel<false><<<(unsigned)((out_f + 7) / 8), 256, 0, st>>>(
             x, y, idx, reinterpret_cast<const int*>(sign), scale, cb,
             in_f, out_f, group);
+}
+
+static void udcq_dequant_bf16_launch(
+    const uint8_t* idx, const uint32_t* sign, const __half* scale,
+    const float* cb, __nv_bfloat16* y,
+    int out_f, int in_f, int group, cudaStream_t st)
+{
+    int nthreads = ((in_f / group / 4 + 31) / 32) * 32;
+    if (nthreads > 1024) nthreads = 1024;
+    if (g_uls)
+        udcq_dequant_bf16_kernel<true><<<(unsigned)out_f, (unsigned)nthreads,
+                                         0, st>>>(
+            idx, sign, scale, cb, y, out_f, in_f, group);
+    else
+        udcq_dequant_bf16_kernel<false><<<(unsigned)out_f, (unsigned)nthreads,
+                                          0, st>>>(
+            idx, sign, scale, cb, y, out_f, in_f, group);
+}
+
+torch::Tensor udcq_dequant_test(torch::Tensor idx, torch::Tensor sign,
+                                torch::Tensor scale, torch::Tensor cb,
+                                int64_t out_f, int64_t in_f, int64_t group) {
+    auto y = torch::empty({out_f, in_f}, torch::TensorOptions()
+        .dtype(torch::kBFloat16).device(idx.device()));
+    udcq_dequant_bf16_launch(
+        idx.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(sign.data_ptr()),
+        reinterpret_cast<const __half*>(scale.data_ptr()),
+        cb.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(y.data_ptr()),
+        (int)out_f, (int)in_f, (int)group,
+        at::cuda::getCurrentCUDAStream());
+    return y;
 }
 
 // from L2 (each warp's walk needs the full x; measured 182GB/s effective,

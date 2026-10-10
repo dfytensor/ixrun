@@ -166,7 +166,235 @@ void step27_g(torch::Tensor h, torch::Tensor dpos, double theta) {
     step27_impl(h, dpos.data_ptr<int>(), theta);
 }
 
-// ---------------- blocked prefill (S=8, mt8 projections) ---------------- //
+// ---------------- GEMM prefill (T <= 256, layer-major segment) --------- //
+// Per layer: weights dequantized to bf16 ONCE (udcq_dequant_bf16) and reused
+// across the whole segment via cuBLAS matmuls -> the weight read amortizes
+// over T tokens instead of the mt-family's 8. The per-token cores (GDN
+// conv/recurrent/norms, attention) are unchanged. All shapes are static for
+// a given T => graph-capturable. lm_head runs on the last row every call
+// (cheap; the caller ignores s27_tok for non-final segments).
+#define GEMM_TMAX 256
+
+void step27_prefill_gemm(torch::Tensor hT, torch::Tensor dposT, double theta) {
+    if (!s27_init) throw std::runtime_error("init27 not called");
+    auto st = at::cuda::getCurrentCUDAStream();
+    int hidden = (int)s27_hidden;
+    int inter = (int)s27_inter;
+    int nl = (int)s27_nw1.size();
+    const int NV = 48, NK = 16, DK = 128, DV = 128;
+    const int NH = 24, NKV = 4, HD = 256;
+    int value_dim = NV * DV;
+    int conv_dim = 2 * NK * DK + value_dim;
+    int T = (int)hT.size(0);
+    if (T < 1 || T > GEMM_TMAX) throw std::runtime_error("T out of range");
+    auto f32 = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(hT.device());
+    auto bf = torch::TensorOptions()
+        .dtype(torch::kBFloat16).device(hT.device());
+    static torch::Tensor hA, hB, xnA, xnB, h1T, xn2T, oT, q2T, k2T, v2T,
+        attT, qkvT, zT, boT, aoT, onT, mgT, muT, actT, mdT;
+    static torch::Tensor xnb, xn2b, onb, actb, attb, q2b, k2b, v2b, ob,
+        qkvb, zb, bob, aob, mgb, mub, mdb;
+    static torch::Tensor wq, wk, wv, wo, wg, wu, wd, wqkv, wz, wb, wa, lg;
+    static bool init = false;
+    if (!init) {
+        int M = GEMM_TMAX;
+        hA = torch::empty({M, hidden}, f32);
+        hB = torch::empty({M, hidden}, f32);
+        xnA = torch::empty({M, hidden}, f32);
+        xnB = torch::empty({M, hidden}, f32);
+        h1T = torch::empty({M, hidden}, f32);
+        xn2T = torch::empty({M, hidden}, f32);
+        oT = torch::empty({M, hidden}, f32);
+        q2T = torch::empty({M, NH * HD * 2}, f32);
+        k2T = torch::empty({M, NKV * HD}, f32);
+        v2T = torch::empty({M, NKV * HD}, f32);
+        attT = torch::empty({M, NH * HD}, f32);
+        qkvT = torch::empty({M, conv_dim}, f32);
+        zT = torch::empty({M, value_dim}, f32);
+        boT = torch::empty({M, NV}, f32);
+        aoT = torch::empty({M, NV}, f32);
+        onT = torch::empty({M, value_dim}, f32);
+        mgT = torch::empty({M, inter}, f32);
+        muT = torch::empty({M, inter}, f32);
+        actT = torch::empty({M, inter}, f32);
+        mdT = torch::empty({M, hidden}, f32);
+        xnb = torch::empty({M, hidden}, bf);
+        xn2b = torch::empty({M, hidden}, bf);
+        onb = torch::empty({M, value_dim}, bf);
+        actb = torch::empty({M, inter}, bf);
+        attb = torch::empty({M, NH * HD}, bf);
+        q2b = torch::empty({M, NH * HD * 2}, bf);
+        k2b = torch::empty({M, NKV * HD}, bf);
+        v2b = torch::empty({M, NKV * HD}, bf);
+        ob = torch::empty({M, hidden}, bf);
+        qkvb = torch::empty({M, conv_dim}, bf);
+        zb = torch::empty({M, value_dim}, bf);
+        bob = torch::empty({M, NV}, bf);
+        aob = torch::empty({M, NV}, bf);
+        mgb = torch::empty({M, inter}, bf);
+        mub = torch::empty({M, inter}, bf);
+        mdb = torch::empty({M, hidden}, bf);
+        wq = torch::empty({NH * HD * 2, hidden}, bf);
+        wk = torch::empty({NKV * HD, hidden}, bf);
+        wv = torch::empty({NKV * HD, hidden}, bf);
+        wo = torch::empty({hidden, NH * HD}, bf);
+        wg = torch::empty({inter, hidden}, bf);
+        wu = torch::empty({inter, hidden}, bf);
+        wd = torch::empty({hidden, inter}, bf);
+        wqkv = torch::empty({conv_dim, hidden}, bf);
+        wz = torch::empty({value_dim, hidden}, bf);
+        wb = torch::empty({NV, hidden}, bf);
+        wa = torch::empty({NV, hidden}, bf);
+        int64_t vocab = s27_lh_i.numel() * 2 / hidden;
+        lg = torch::empty({vocab}, f32);
+        init = true;
+    }
+    if (!s27_tok.defined())
+        s27_tok = torch::zeros({1}, torch::TensorOptions()
+            .dtype(torch::kInt64).device(hT.device()));
+    const int* dpos = dposT.data_ptr<int>();
+    auto T3 = [&](int l, int s) -> std::vector<torch::Tensor> {
+        int k = (l * 8 + s) * 3;
+        return {s27_packs[k], s27_packs[k + 1], s27_packs[k + 2]};
+    };
+    auto deq = [&](torch::Tensor& w, const std::vector<torch::Tensor>& P,
+                   int of, int inf) {
+        udcq_dequant_bf16_launch(
+            P[0].data_ptr<uint8_t>(),
+            reinterpret_cast<const uint32_t*>(P[1].data_ptr()),
+            reinterpret_cast<const __half*>(P[2].data_ptr()),
+            s27_cb.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(w.data_ptr()),
+            of, inf, 16, st);
+    };
+    auto castb = [&](const float* src, torch::Tensor& dst, int n) {
+        int total = T * n;
+        f32_to_bf16_kernel<<<(unsigned)((total + 255) / 256), 256, 0, st>>>(
+            src, reinterpret_cast<__nv_bfloat16*>(dst.data_ptr()), total);
+    };
+    auto castf = [&](const torch::Tensor& src, float* dst, int n) {
+        int total = T * n;
+        bf16_to_f32_kernel<<<(unsigned)((total + 255) / 256), 256, 0, st>>>(
+            reinterpret_cast<const __nv_bfloat16*>(src.data_ptr()), dst,
+            total);
+    };
+    auto mm = [&](torch::Tensor& outb, torch::Tensor& xb,
+                  const torch::Tensor& w) {
+        torch::Tensor o = outb.narrow(0, 0, T);
+        torch::Tensor x = xb.narrow(0, 0, T);
+        at::matmul_out(o, x, w.t());
+    };
+    // copy input into hA (ping-pong staging)
+    cudaMemcpyAsync(hA.data_ptr<float>(), hT.data_ptr<float>(),
+                    (size_t)T * hidden * sizeof(float),
+                    cudaMemcpyDeviceToDevice, st);
+    torch::Tensor h_cur = hA, h_nxt = hB;
+    torch::Tensor xn_cur = xnA, xn_nxt = xnB;
+    rmsnorm_fw_kernel<<<(unsigned)T, 1024, 0, st>>>(
+        h_cur.data_ptr<float>(), s27_nw1[0].data_ptr<float>(),
+        xn_cur.data_ptr<float>(), hidden, 1e-6f);
+    int ig = 0, ia = 0;
+    for (int l = 0; l < nl; ++l) {
+        bool is_attn = false;
+        for (int64_t a : s27_attn_layers)
+            if (a == l) { is_attn = true; break; }
+        torch::Tensor next_w = (l + 1 < nl) ? s27_nw1[l + 1] : s27_fnw;
+        if (!is_attn) {
+            deq(wqkv, T3(l, 0), conv_dim, hidden);
+            deq(wz, T3(l, 1), value_dim, hidden);
+            deq(wb, T3(l, 2), NV, hidden);
+            deq(wa, T3(l, 3), NV, hidden);
+        } else {
+            deq(wq, T3(l, 0), NH * HD * 2, hidden);
+            deq(wk, T3(l, 1), NKV * HD, hidden);
+            deq(wv, T3(l, 2), NKV * HD, hidden);
+        }
+        deq(wo, T3(l, is_attn ? 3 : 4), hidden, NH * HD);
+        deq(wg, T3(l, is_attn ? 4 : 5), inter, hidden);
+        deq(wu, T3(l, is_attn ? 5 : 6), inter, hidden);
+        deq(wd, T3(l, is_attn ? 6 : 7), hidden, inter);
+        castb(xn_cur.data_ptr<float>(), xnb, hidden);
+        if (!is_attn) {
+            mm(qkvb, xnb, wqkv);
+            castf(qkvb, qkvT.data_ptr<float>(), conv_dim);
+            mm(zb, xnb, wz);
+            castf(zb, zT.data_ptr<float>(), value_dim);
+            mm(bob, xnb, wb);
+            castf(bob, boT.data_ptr<float>(), NV);
+            mm(aob, xnb, wa);
+            castf(aob, aoT.data_ptr<float>(), NV);
+            for (int i = 0; i < T; ++i)
+                gdn_core_from_proj(
+                    qkvT.data_ptr<float>() + (size_t)i * conv_dim,
+                    zT.data_ptr<float>() + (size_t)i * value_dim,
+                    boT.data_ptr<float>() + (size_t)i * NV,
+                    aoT.data_ptr<float>() + (size_t)i * NV,
+                    s27_gex[ig * 4], s27_gex[ig * 4 + 1],
+                    s27_gex[ig * 4 + 2], s27_gex[ig * 4 + 3],
+                    s27_gnorm[ig], s27_convst[ig], s27_S[ig],
+                    onT.data_ptr<float>() + (size_t)i * value_dim,
+                    NV, NK, DK, DV, l);
+            castb(onT.data_ptr<float>(), onb, value_dim);
+            mm(ob, onb, wo);
+            castf(ob, oT.data_ptr<float>(), hidden);
+            ig++;
+        } else {
+            mm(q2b, xnb, wq);
+            castf(q2b, q2T.data_ptr<float>(), NH * HD * 2);
+            mm(k2b, xnb, wk);
+            castf(k2b, k2T.data_ptr<float>(), NKV * HD);
+            mm(v2b, xnb, wv);
+            castf(v2b, v2T.data_ptr<float>(), NKV * HD);
+            for (int i = 0; i < T; ++i)
+                attn_from_proj(
+                    q2T.data_ptr<float>() + (size_t)i * NH * HD * 2,
+                    k2T.data_ptr<float>() + (size_t)i * NKV * HD,
+                    v2T.data_ptr<float>() + (size_t)i * NKV * HD,
+                    s27_aex[ia * 2], s27_aex[ia * 2 + 1], s27_kv[ia],
+                    theta, dpos + i,
+                    attT.data_ptr<float>() + (size_t)i * NH * HD,
+                    NH, NKV, HD, (int)s27_ctx);
+            castb(attT.data_ptr<float>(), attb, NH * HD);
+            mm(ob, attb, wo);
+            castf(ob, oT.data_ptr<float>(), hidden);
+            ia++;
+        }
+        add_norm_f32<<<(unsigned)T, 1024, 0, st>>>(
+            h_cur.data_ptr<float>(), oT.data_ptr<float>(),
+            s27_nw2[l].data_ptr<float>(), h1T.data_ptr<float>(),
+            xn2T.data_ptr<float>(), hidden, 1e-6f);
+        castb(xn2T.data_ptr<float>(), xn2b, hidden);
+        mm(mgb, xn2b, wg);
+        castf(mgb, mgT.data_ptr<float>(), inter);
+        mm(mub, xn2b, wu);
+        castf(mub, muT.data_ptr<float>(), inter);
+        silu_kernel<<<(unsigned)((T * inter + 255) / 256), 256, 0, st>>>(
+            mgT.data_ptr<float>(), muT.data_ptr<float>(),
+            actT.data_ptr<float>(), T * inter);
+        castb(actT.data_ptr<float>(), actb, inter);
+        mm(mdb, actb, wd);
+        castf(mdb, mdT.data_ptr<float>(), hidden);
+        add_norm_f32<<<(unsigned)T, 1024, 0, st>>>(
+            h1T.data_ptr<float>(), mdT.data_ptr<float>(),
+            next_w.data_ptr<float>(), h_nxt.data_ptr<float>(),
+            xn_nxt.data_ptr<float>(), hidden, 1e-6f);
+        torch::Tensor ht = h_cur; h_cur = h_nxt; h_nxt = ht;
+        torch::Tensor xt = xn_cur; xn_cur = xn_nxt; xn_nxt = xt;
+    }
+    int64_t vocab = s27_lh_i.numel() * 2 / hidden;
+    udcq_gemv_launch(
+        xn_cur.data_ptr<float>() + (size_t)(T - 1) * hidden,
+        s27_lh_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(s27_lh_s.data_ptr()),
+        reinterpret_cast<const __half*>(s27_lh_sc.data_ptr()),
+        s27_cb.data_ptr<float>(),
+        lg.data_ptr<float>(), (int)vocab, hidden, 16, st);
+    argmax_f32<<<1, 256, 0, st>>>(
+        lg.data_ptr<float>(), (int)vocab, s27_tok.data_ptr<int64_t>());
+}
+
+
 // Processes 8 tokens (rows of h8) at the positions in dpos8 (device int32[8],
 // written by the caller between replays -- capture-safe: no host syncs inside).
 // final_block=1 runs row 7 -> lm_head -> argmax (s27_tok).
