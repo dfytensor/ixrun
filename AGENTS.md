@@ -497,4 +497,21 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
 - Handy hooks: IXRUN_NO_PREFILL=1 (legacy per-token prefill for A/B),
   IXRUN_GEMM_I8, IXRUN_BATCH_GDN=0, IXRUN_PREBUILT. Profiling the 27B decode
   graph with torch.profiler works (per-kernel attribution in graph replays).
+- **v2c GEMV** (chunked-x, in_f>12288): smem 32.9KB vs v2's 69.6KB => 3
+  blocks/SM; chunk boundaries at 32-group multiples keep the per-lane
+  order => bit-exact. down 783->793GB/s (already 88% of practical; decode
+  GEMVs are at their bandwidth ceiling - per-shape finals qkv 787 / z 720 /
+  q 832 / gate 825 / down 793 / o 677 / lm_head 869 GB/s).
+- **Fused mma decode-GEMM — CLOSED with measurements**: v1->v3 built and all
+  gated (rel <= 2.2e-4, 5 shapes incl edges): v1 naive 1.12ms, v2
+  double-buffer + 16-token sliver epilogue (smem 41.5KB, no attr), v3
+  ldmatrix (PLAIN .x2/.x4 - our xs is [token][k] = the B^T layout; .trans
+  swaps k/n => rel 1.6; k/n-swap is the .trans-bug signature) + 32-entry
+  sign-fold cb_fold. Perf stuck at ~1.14ms vs the dequant+cublas pair
+  0.68ms: the DECODE ALU (~8 instr/elem = >= the mma issue) + 25%
+  occupancy (a full [128x128] fp32 acc tile = 64K regs = the whole SM
+  register file). The economics close only with a perfect free decode;
+  at T=1024 the pair amortizes (dequant once) while the fused re-decodes
+  per token-tile => the design loses MORE at large T. Do not re-open
+  without a different mma input strategy (e.g. 4-bit tensor ops).
 
