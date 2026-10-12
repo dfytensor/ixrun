@@ -597,3 +597,20 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   deltas UNFALSIFIABLE in-model on this box.  All three attempts
   reverted; v4 stands.  Remaining lever: NCU-grade profiling or a
   different decode strategy - do NOT reopen without one.
+
+## ULS on the 1B + the vacuous-gate lesson (2026/10/13, acbd2d8)
+- udcq-uls codec: deploy_udcq(stream) -> lmhead-q -> udcq_scale_to_uls
+  walk (AFTER lmhead-q so the lm_head converts too).  6.0 -> 5.5bpw,
+  udcq 289 -> 324 tok/s (+12%).  Gates: dequant rel 0.0029, ext
+  single/mt8/mt4 uls=1 all ~0.0024 vs torch dequant, 4-quadrant text
+  (fp16/ULS x lmhead on/off) coherent.
+- VACUOUS GATE: the earlier "lm_head 4/4 BIT-IDENTICAL" gate compared
+  codec=bf16 against itself - bf16 SKIPS lmhead-q on both sides, so
+  nothing was gated.  The real bug it would have caught: lmhead-q
+  fitted a per-module codebook while the ext kernels read the ONE
+  __constant__ codebook installed by the first module (the per-call cb
+  arg is IGNORED) -> the lm_head decoded with the wrong codebook.
+  fp16 masked it (universal fits near-identical); ULS pushed text into
+  '<s>' degeneracy.  Fix: quantize lm_head with stats['codebook'].
+  RULE: a gate must verify the CONFIG IT SHIPS - check the side
+  actually changed (log the lmhead-q/uls deploy lines in BOTH runs).
