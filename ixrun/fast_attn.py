@@ -31,14 +31,17 @@ if _HAS_TRITON:
                              sk_h, sk_l,
                              sv_h, sv_l,
                              sm_h,
-                             scale,
+                             scale, REP: tl.constexpr, POS_MODE: tl.constexpr,
                              HD: tl.constexpr, W: tl.constexpr,
                              CW: tl.constexpr, BLK: tl.constexpr):
-        """Phase 1: grid (H, W//CW) - chunk-local online softmax partials."""
-        h = tl.program_id(0)
+        """Phase 1: grid (H, W//CW) - chunk-local online softmax partials.
+        M is a bool mask [1,1,1,W] (POS_MODE=0) or a device int64 tensor
+        holding the current decode position (POS_MODE=1: keep = offs<=pos)."""
+        hq = tl.program_id(0)
+        h = hq // REP          # GQA: q heads map onto kv heads
         c = tl.program_id(1)
         offs_d = tl.arange(0, HD)
-        q = tl.load(Q + h * sq_h + offs_d).to(tl.float32)
+        q = tl.load(Q + hq * sq_h + offs_d).to(tl.float32)
 
         m_i = tl.zeros([1], dtype=tl.float32) - float('inf')
         l_i = tl.zeros([1], dtype=tl.float32)
@@ -46,7 +49,11 @@ if _HAS_TRITON:
         base = c * CW
         for start in range(base, base + CW, BLK):
             offs = start + tl.arange(0, BLK)
-            keep = tl.load(M + offs).to(tl.int1)
+            if POS_MODE:
+                pos = tl.load(M)
+                keep = offs <= pos
+            else:
+                keep = tl.load(M + offs).to(tl.int1)
             kt = tl.load(K + h * sk_h + offs[:, None] * sk_l
                          + offs_d[None, :],
                          mask=keep[:, None], other=0.0).to(tl.float32)
@@ -65,9 +72,9 @@ if _HAS_TRITON:
                          mask=keep[:, None], other=0.0).to(tl.float32)
             acc += tl.sum(p[:, None] * vt, axis=0)
             m_i = m_new
-        tl.store(PM + h * (W // CW) + c, tl.sum(m_i, axis=0))
-        tl.store(PL + h * (W // CW) + c, tl.sum(l_i, axis=0))
-        tl.store(PA + (h * (W // CW) + c) * HD + offs_d, acc)
+        tl.store(PM + hq * (W // CW) + c, tl.sum(m_i, axis=0))
+        tl.store(PL + hq * (W // CW) + c, tl.sum(l_i, axis=0))
+        tl.store(PA + (hq * (W // CW) + c) * HD + offs_d, acc)
 
     @triton.jit
     def _s1_attn_merge_kernel(PM, PL, PA, O,
@@ -92,6 +99,7 @@ if _HAS_TRITON:
         """q [1,H,1,D] bf16, k/v [1,H,W,D] bf16 full-width views,
         mask [1,1,1,W] bool -> [1,H,1,D] like SDPA."""
         H, D = q.shape[1], q.shape[3]
+        rep = max(1, H // k.shape[1])
         W = k.shape[2]
         o = torch.empty_like(q)
         NS = 8
@@ -104,8 +112,32 @@ if _HAS_TRITON:
             q.stride(1),
             k.stride(1), k.stride(2),
             v.stride(1), v.stride(2),
-            mask.stride(3),
-            scale,
+            0,
+            scale, rep, 0,
+            HD=D, W=W, CW=CW, BLK=128, num_warps=4)
+        _s1_attn_merge_kernel[(H,)](pm, pl, pa, o,
+                                    o.stride(1), NS=NS, HD=D,
+                                    num_warps=1)
+        return o
+
+    def _s1_attention_pos(q, k, v, pos, scale):
+        """pos mode: pos = device int64 tensor with the decode position."""
+        H, D = q.shape[1], q.shape[3]
+        rep = max(1, H // k.shape[1])
+        W = k.shape[2]
+        o = torch.empty_like(q)
+        NS = 8
+        CW = W // NS
+        pm = torch.empty(H, NS, device=q.device, dtype=torch.float32)
+        pl = torch.empty(H, NS, device=q.device, dtype=torch.float32)
+        pa = torch.empty(H, NS, D, device=q.device, dtype=torch.float32)
+        _s1_attn_part_kernel[(H, NS)](
+            q, k, v, pos, pm, pl, pa,
+            q.stride(1),
+            k.stride(1), k.stride(2),
+            v.stride(1), v.stride(2),
+            0,
+            scale, rep, 1,
             HD=D, W=W, CW=CW, BLK=128, num_warps=4)
         _s1_attn_merge_kernel[(H,)](pm, pl, pa, o,
                                     o.stride(1), NS=NS, HD=D,
@@ -115,6 +147,7 @@ if _HAS_TRITON:
 
 _orig_sdpa = F.scaled_dot_product_attention
 _patched = False
+_pos_tensor = None      # device int64 tensor with the decode position
 
 
 @torch.compiler.disable(recursive=True)
@@ -124,15 +157,24 @@ def _fast_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
             and query.shape[2] == 1
             and query.dtype == torch.bfloat16
             and key.dtype == torch.bfloat16
-            and attn_mask is not None and attn_mask.dtype == torch.bool
             and dropout_p == 0.0 and not is_causal
             and query.is_cuda):
-        return _s1_attention(query, key, value, attn_mask,
-                             scale if scale is not None
-                             else 1.0 / (query.shape[-1] ** 0.5))
+        sc = scale if scale is not None else 1.0 / (query.shape[-1] ** 0.5)
+        if attn_mask is None and _pos_tensor is not None:
+            return _s1_attention_pos(query, key, value, _pos_tensor, sc)
+        if attn_mask is not None and attn_mask.dtype == torch.bool:
+            return _s1_attention(query, key, value, attn_mask, sc)
     return _orig_sdpa(query, key, value, attn_mask=attn_mask,
                       dropout_p=dropout_p, is_causal=is_causal,
                       scale=scale, **kw)
+
+
+def attach_pos_tensor(pos):
+    """Give the kernel a device int64 tensor holding the decode position;
+    mask-less decode SDPA calls then route to the positional kernel and
+    the engine can skip HF's per-step causal-mask construction."""
+    global _pos_tensor
+    _pos_tensor = pos
 
 
 def install_fast_decode_attention():

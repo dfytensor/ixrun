@@ -234,6 +234,44 @@ class StepGraphEngine:
             else self._cfg.vocab_size,
             dtype=torch.bfloat16, device=dev)
 
+        # positional fast attention: the S=1 kernel reads self.pos
+        # (device int, kernel-arg pointer + value-at-execution = replay
+        # safe), so HF's per-step causal-mask construction (cat/neg
+        # elementwise kernels ~0.2ms/step) is skipped entirely.  The
+        # eager prefill still gets is_causal=True (q_len>1, mask=None).
+        # IXRUN_POS_ATTN=0 keeps the bool-mask path.
+        if os.environ.get('IXRUN_POS_ATTN', '1') not in ('', '0'):
+            from . import fast_attn as _fa
+
+            if _fa._patched:
+                _fa.attach_pos_tensor(self.pos)
+                _n = 0
+                for _m in self.model.modules():
+                    if hasattr(_m, '_update_causal_mask'):
+                        _m._update_causal_mask = lambda *a, **k: None
+                        _n += 1
+                # transformers 5.15 builds the decode bool mask in
+                # masking_utils.create_causal_mask, bound into the
+                # modeling module (llama for MiniCPM5-1B); stub it so the
+                # S=1 kernel's positional path replaces the mask kernels
+                # (IXRUN_POS_STUB=0 isolates pos-attach from the stub)
+                import sys as _sys
+
+                _stub_on = os.environ.get('IXRUN_POS_STUB', '1') != '0'
+                _hook_modules = ('transformers.masking_utils',
+                                 f'{type(self.model_raw).__module__}'
+                                 ) if _stub_on else ()
+                for _mn in _hook_modules:
+                    _mo = _sys.modules.get(_mn)
+                    if _mo is not None and hasattr(
+                            _mo, 'create_causal_mask'):
+                        _mo.create_causal_mask = lambda *a, **k: None
+                        _n += 1
+                if verbose and _n:
+                    print(f'[step-graph] pos-attention mode '
+                          f'(mask build skipped on {_n} hooks)',
+                          flush=True)
+
         # warmup on a side stream then capture the full decode step
         if verbose:
             print('[step-graph] capturing full decode step...', flush=True)
