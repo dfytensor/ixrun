@@ -50,7 +50,10 @@ __global__ void bf16xl_gemv_kernel(
         const uint8_t* sb = sgn + gidx * 2;
         uint32_t mw0 = ld_u32(mb);      uint32_t mw1 = ld_u32(mb + 4);
         uint32_t mw2 = ld_u32(mb + 8);  uint32_t mw3 = ld_u32(mb + 12);
+        uint32_t mw4 = 0;               // funnelshift hi guard
+        uint32_t mw_sel[5] = {mw0, mw1, mw2, mw3, mw4};
         uint32_t dw0 = ld_u32(db);      uint32_t dw1 = ld_u32(db + 4);
+        uint32_t dw_sel[3] = {dw0, dw1, 0};
         uint32_t sw = ld_u32(sb);
         uint8_t em = emax[gidx / sg];
         const __nv_bfloat16* x16 = x + jb * 16;
@@ -58,16 +61,14 @@ __global__ void bf16xl_gemv_kernel(
         #pragma unroll
         for (int j = 0; j < 16; ++j) {
             int b7 = 7 * j, b3 = 3 * j;
-            const uint32_t mw_sel[4] = {mw0, mw1, mw2, mw3};
-            const uint32_t dw_sel[2] = {dw0, dw1};
-            uint32_t mv = (b7 % 32 + 7 <= 32)
-                ? (mw_sel[b7 / 32] >> (b7 % 32)) & 0x7F
-                : __funnelshift_r(mw_sel[b7 / 32], mw_sel[b7 / 32 + 1],
-                                  b7 % 32) & 0x7F;
-            uint32_t dv = (b3 % 32 + 3 <= 32)
-                ? (dw_sel[b3 / 32] >> (b3 % 32)) & 0x7
-                : __funnelshift_r(dw_sel[b3 / 32], dw_sel[b3 / 32 + 1],
-                                  b3 % 32) & 0x7;
+            // branchless cross-word extraction (j is a compile-time index:
+            // the word select + shift fold at compile time)
+            uint32_t mv = __funnelshift_r(mw_sel[b7 >> 5],
+                                          mw_sel[(b7 >> 5) + 1],
+                                          b7 & 31) & 0x7F;
+            uint32_t dv = __funnelshift_r(dw_sel[b3 >> 5],
+                                          dw_sel[(b3 >> 5) + 1],
+                                          b3 & 31) & 0x7;
             uint8_t ee = em > dv ? (uint8_t)(em - dv) : (uint8_t)0;
             float wv = w_from_bits((sw >> j) & 1u, (uint32_t)ee, mv);
             inner += wv * __bfloat162float(x16[j]);

@@ -172,7 +172,8 @@ class StepGraphEngine:
         # under Dynamo functionalization (do NOT enable there).
         # STEP_GRAPH_COMPILE=0 disables. Prefill runs through the raw
         # (_orig_mod) model to avoid a shape-recompile at startup.
-        if (codec == 'gsq' and os.environ.get('STEP_GRAPH_COMPILE', '1')
+        if (codec in ('gsq', 'bf16xl') and
+                os.environ.get('STEP_GRAPH_COMPILE', '1')
                 not in ('', '0')):
             _t0 = time.perf_counter()
             model = torch.compile(model)

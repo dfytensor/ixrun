@@ -10,6 +10,20 @@ import sys
 
 import torch
 
+_EXT = None
+
+
+def _ext():
+    global _EXT
+    if _EXT is None:
+        from experiments.bf16xl_gemv_cuda.bf16xl_gemv_cuda import _load
+        _EXT = _load()
+    return _EXT
+
+
+from experiments.bf16xl_gemv_cuda.bf16xl_gemv_cuda import \
+    bf16xl_gemv_cuda as _gemv_wrap
+
 
 def bf16xl_pack(W, kg=64):
     """v2 three-plane layout (llama.cpp BF16X-style): mant 14B | delta
@@ -99,18 +113,15 @@ class Bf16xlLinear(torch.nn.Module):
         self.in_features = pk['in_f']
 
     def _decode(self):
-        from experiments.bf16xl_gemv_cuda.bf16xl_gemv_cuda import _load
-        ext = _load()
+        ext = _ext()
         return ext.decode(self.pk['mant'], self.pk['delta'],
                           self.pk['sgn'], self.pk['emax'],
                           self.pk['out_f'], self.pk['in_f'],
                           self.pk['kg'])
 
     def forward(self, x):
-        from experiments.bf16xl_gemv_cuda.bf16xl_gemv_cuda import \
-            bf16xl_gemv_cuda
         if x.numel() == self.in_features:
-            return bf16xl_gemv_cuda(x.reshape(-1), self.pk)
+            return _gemv_wrap(x.reshape(-1), self.pk)
         W = self._decode()
         return torch.nn.functional.linear(
             x.to(W.dtype), W)
