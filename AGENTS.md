@@ -502,6 +502,28 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   order => bit-exact. down 783->793GB/s (already 88% of practical; decode
   GEMVs are at their bandwidth ceiling - per-shape finals qkv 787 / z 720 /
   q 832 / gate 825 / down 793 / o 677 / lm_head 869 GB/s).
+- **Silu epilogue fusion (decode)**: udcq_gemv_dual_silu_kernel - one warp
+  walks BOTH gate/up packs for the same x row (x smem read once feeds both
+  fma chains), epilogue writes act = v/(1+expf(-v))*up (identical to
+  silu_kernel). TOKEN-EXACT; 27ms/step = 37.4 tok/s; eager 0.85->0.59s.
+  LESSON: an aborted test run left a zombie python holding the GPU - the
+  next test measured 63s/step of pure contention; ALWAYS kill zombies and
+  re-test before believing a regression.
+- **Long-ctx / KV-FP8 CLOSED with data**: at 4K the attention is COMPUTE-
+  bound (attn v3 fixed the read inefficiency; KV bytes 268MB = ~0.3ms);
+  FP8 KV saves ~0.15ms at 4K (0.5%) and only ~1-2ms at 16K where the
+  O(pos) attention COMPUTE already caps us (~29 tok/s at 16K, ~23 at 32K
+  extrapolated). The real 32K+ fix is attention-compute restructuring
+  (chunked causal / paged), not KV bytes. VRAM: bf16 KV supports ~39K
+  ctx in the free VRAM - already above the compute-capped useful range.
+- **PY multi-pack CLOSED**: PY mt4 already runs at 0.96x a single call
+  per 4 tokens (the L1-cached bf16-x design); the PY spec's bottleneck is
+  the MTP draft quality (E=1.6) and the PY graph's gap to C++ is python
+  host overhead - neither is fixed by packing.
+- **Decode ladder final**: 37 tok/s = 72% of the absolute DRAM ceiling
+  (51-53 at 900-940GB/s), ~95% of the 2-3h-reachable maximum. Every
+  byte-reduction and kernel path measured and closed (per-32 16.5% err,
+  int8 4.0%, fused-mma decode-ALU+register-ceiling, spec E-bound).
 - **Fused mma decode-GEMM — CLOSED with measurements**: v1->v3 built and all
   gated (rel <= 2.2e-4, 5 shapes incl edges): v1 naive 1.12ms, v2
   double-buffer + 16-token sliver epilogue (smem 41.5KB, no attr), v3
