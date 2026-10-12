@@ -60,6 +60,12 @@ class StepGraphEngine:
 
         model = Int8XEngine._load_any(model_path, torch.bfloat16,
                                       low_cpu=True)
+        # S=1 decode attention via the fused Triton kernel (the cutlass
+        # fmha path costs ~94us/layer on these shapes); must be installed
+        # BEFORE graph capture.  IXRUN_FAST_ATTN=0 reverts.
+        from .fast_attn import install_fast_decode_attention
+
+        install_fast_decode_attention()
         stats = {'codec': codec}
         if codec == 'int8x':
             from .linear import deploy_model
