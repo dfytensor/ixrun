@@ -354,6 +354,11 @@ def serve(
 
         eng = CppGsqEngine.from_pretrained(model_path,
                                            ctx=max(max_ctx, 512))
+    elif mode == "cpp-q38":
+        from .cpp_engine_27b import CppQwen27bEngine
+
+        eng = CppQwen27bEngine.from_blob(cache_path, model_path,
+                                         ctx=max(max_ctx, 4096))
     elif codec == "peakq":
         from .peakq_engine import PeakQEngine
 

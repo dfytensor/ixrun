@@ -46,6 +46,13 @@ def _build_engine(args):
     --codec peakq     PeakQEngine (cached/streaming, 10.6bpw 54dB)
     --mode udcq-graph + --cache <blob>  Q38GraphEngine (27B 6bpw, 15 tok/s)
     """
+    if getattr(args, "mode", None) == "cpp-q38":
+        from .cpp_engine_27b import CppQwen27bEngine
+
+        if not args.cache:
+            raise SystemExit("cpp-q38 requires --cache <uls_blob.pt>")
+        return CppQwen27bEngine.from_blob(args.cache, args.model,
+                                          ctx=max(mctx, 4096))
     if getattr(args, "mode", None) == "udcq-graph":
         from .q38_graph import Q38GraphEngine
 
@@ -219,7 +226,7 @@ def main():
     pg.add_argument("prompt")
     pg.add_argument("--model", default=MODEL_PATH)
     pg.add_argument("--mode", default="cached",
-                    choices=["cached", "streaming", "graph", "udcq-graph", "udcq-spec", "step-graph", "cpp-gsq"])
+                    choices=["cached", "streaming", "graph", "udcq-graph", "udcq-spec", "step-graph", "cpp-gsq", "cpp-q38"])
     pg.add_argument("--codec", default="int8x", choices=["int8x", "peakq", "bf16", "udcq", "udcq-stream", "gmm-stream", "hpqs-mixed", "gsq", "bf16xl"])
     pg.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pg.add_argument("--max-new-tokens", type=int, default=128)
@@ -243,7 +250,7 @@ def main():
     pc = sub.add_parser("chat", help="interactive chat REPL")
     pc.add_argument("--model", default=MODEL_PATH)
     pc.add_argument("--mode", default="streaming",
-                    choices=["cached", "streaming", "udcq-graph", "udcq-spec", "step-graph", "cpp-gsq"])
+                    choices=["cached", "streaming", "udcq-graph", "udcq-spec", "step-graph", "cpp-gsq", "cpp-q38"])
     pc.add_argument("--codec", default="int8x", choices=["int8x", "peakq", "bf16", "udcq", "udcq-stream", "gmm-stream", "hpqs-mixed", "gsq", "bf16xl"])
     pc.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pc.add_argument("--max-new-tokens", type=int, default=256)
@@ -265,7 +272,7 @@ def main():
     pv = sub.add_parser("serve", help="OpenAI-compatible API server")
     pv.add_argument("--model", default=MODEL_PATH)
     pv.add_argument("--mode", default="streaming",
-                    choices=["cached", "streaming", "udcq-graph", "udcq-spec", "step-graph", "cpp-gsq"])
+                    choices=["cached", "streaming", "udcq-graph", "udcq-spec", "step-graph", "cpp-gsq", "cpp-q38"])
     pv.add_argument("--codec", default="int8x", choices=["int8x", "peakq", "bf16", "udcq", "udcq-stream", "gmm-stream", "hpqs-mixed", "gsq", "bf16xl"])
     pv.add_argument("--levels", type=int, nargs="+", default=list(DEFAULT_LEVELS))
     pv.add_argument("--cache", default=None, help="packed-weight cache file / UDCQ blob")

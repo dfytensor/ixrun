@@ -168,6 +168,7 @@ class CppQwen27bEngine:
         eng = cls.__new__(cls)
         eng.ext = ext
         eng.tok = tok
+        eng.tokenizer = tok
         eng.ctx = ctx
         eng.hidden = hidden
         eng.emb = emb
@@ -295,14 +296,32 @@ class CppQwen27bEngine:
                 print(f'  pos {pos} ok tok {nxt}', flush=True)
         return toks
 
-    def generate(self, prompt, max_new_tokens=32, graph=True):
+    def generate(self, prompt, max_new_tokens=32, graph=True, **kw):
+        # greedy-only engine: the CLI/serve sampling kwargs are accepted for
+        # interface compatibility and ignored (one notice per process)
+        if (kw.get('do_sample') or kw.get('temperature', 0) > 0) \
+                and not getattr(self, '_samp_warned', False):
+            print('[cpp-27b] greedy-only engine: sampling kwargs ignored',
+                  flush=True)
+            self._samp_warned = True
         ids = self.tok(prompt, return_tensors='pt').input_ids[0].tolist()
         if graph:
             try:
-                return self.tok.decode(self._graph_generate(ids, max_new_tokens))
+                return self.tok.decode(
+                    self._graph_generate(ids, max_new_tokens))
             except Exception as e:
-                print(f'[graph path failed: {e}] -> eager fallback', flush=True)
+                print(f'[graph path failed: {e}] -> eager fallback',
+                      flush=True)
                 self._graph = None
+        return self._eager_generate(ids, max_new_tokens)
+
+    def stream(self, prompt, max_new_tokens=64, graph=True, **kw):
+        for t in self._graph_generate(
+                self.tok(prompt, return_tensors='pt').input_ids[0].tolist(),
+                max_new_tokens):
+            yield self.tok.decode([t])
+
+    def _eager_generate(self, ids, max_new_tokens):
         self.ext.s27_reset()
         torch.cuda.synchronize()
         toks = []
@@ -317,6 +336,4 @@ class CppQwen27bEngine:
                 raise
             if pos >= len(ids) - 1:
                 toks.append(nxt)
-            if pos < 3 or pos % 8 == 0:
-                print(f'  pos {pos} ok tok {nxt}', flush=True)
         return self.tok.decode(toks)
