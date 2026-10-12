@@ -76,7 +76,7 @@ class StepGraphEngine:
             from .udcq import deploy_udcq
 
             stats.update(deploy_udcq(model, cache='full', verbose=verbose))
-        elif codec == 'udcq-stream':
+        elif codec in ('udcq', 'udcq-stream', 'udcq-uls'):
             from .udcq import deploy_udcq
 
             stats.update(deploy_udcq(model, cache='stream', verbose=verbose))
@@ -179,13 +179,21 @@ class StepGraphEngine:
                 == 'Linear' and lm.weight.numel() > 1_000_000
                 and os.environ.get('IXRUN_Q_LMHEAD', '1')
                 not in ('', '0')):
-            from .udcq import (UDCQ_G, UDCQ_NLEV, UdcqLinear,
-                               udcq_fit_codebook, udcq_quantize)
+            from .udcq import (UDCQ_G, UdcqLinear, udcq_fit_codebook,
+                               udcq_quantize)
             from .linear import _set_parent_child
 
             _t0 = time.perf_counter()
             W = lm.weight.data
-            cb = udcq_fit_codebook(W.cpu(), nlev=UDCQ_NLEV, g=UDCQ_G)
+            # MUST quantize with the BODY's global codebook: the ext
+            # kernels read the one __constant__ codebook installed by the
+            # first module - a per-module refit here silently decodes the
+            # lm_head with the wrong codebook (-> degenerate '<s>' text;
+            # the kernels ignore the per-call cb argument).
+            cb_l = stats.get('codebook')
+            cb = (torch.tensor(cb_l, dtype=torch.float32)
+                  if cb_l is not None
+                  else udcq_fit_codebook(W.cpu(), nlev=16, g=UDCQ_G))
             packed = udcq_quantize(W, cb, g=UDCQ_G)
             bias = lm.bias.data if lm.bias is not None else None
             _set_parent_child(model, 'lm_head',
@@ -196,6 +204,20 @@ class StepGraphEngine:
                 mb = packed['total_bytes'] / 1e6
                 print(f'[lmhead-q] UDCQ stream {mb:.0f}MB '
                       f'({time.perf_counter()-_t0:.0f}s)', flush=True)
+        # ULS transform: fp16 scales -> i8 log2 per-row streams (5.5bpw).
+        # Runs AFTER lmhead-q so the quantized lm_head is converted too.
+        if codec == 'udcq-uls':
+            from .udcq import UdcqLinear, udcq_scale_to_uls
+
+            _t0 = time.perf_counter()
+            _n = 0
+            for _m in model.modules():
+                if isinstance(_m, UdcqLinear):
+                    _n += udcq_scale_to_uls(_m)
+            stats['uls_layers'] = _n
+            if verbose:
+                print(f'[uls] {_n} matrices -> i8 log2 scales (5.5bpw, '
+                      f'{time.perf_counter()-_t0:.0f}s)', flush=True)
         model = model.cuda()
         gc.collect()
         torch.cuda.empty_cache()

@@ -779,3 +779,43 @@ def udcq_snr(w: torch.Tensor, wq: torch.Tensor) -> float:
     e = (w.reshape(-1).float() - wq.reshape(-1).float()).pow(2).mean().item()
     v = w.reshape(-1).float().var(unbiased=False).item()
     return 10 * float(torch.log10(torch.tensor(v / max(e, 1e-30))))
+
+
+def udcq_scale_to_uls(mod) -> int:
+    """In-place UDCQ -> ULS on an UdcqLinear: the fp16 per-16 scales
+    become a per-row uint8 log2 stream with an 8-byte [base, step]
+    header inside the stream (the 27B production format, 6.0 -> 5.5bpw,
+    -8% weight bytes; worst row-scale error ~1.3% = below the 3.4%
+    quantization format tier).  Returns 1 if transformed, 0 if the
+    module is already ULS.  The runtime auto-detects via the uint8
+    dtype; the ext kernels take <bool ULS>, M in (1,4,8) + chunked mt
+    for prefill; no Triton path exists for ULS."""
+    s = mod._scale
+    if s.dtype == torch.uint8:
+        return 0
+    out_f = mod.out_features
+    n_gr = mod.in_features // 16
+    sc = s.float().view(out_f, n_gr)
+    pos = sc > 0
+    lg = torch.log2(torch.where(pos, sc, torch.ones_like(sc)))
+    lg = torch.where(pos, lg, torch.full_like(lg, -30.0))
+    real = torch.where(pos, lg, torch.full_like(lg, float("inf")))
+    base = real.min(dim=1).values
+    base = torch.where(torch.isfinite(base), base,
+                       torch.full_like(base, -30.0))
+    mx = lg.max(dim=1).values
+    mx = torch.where(torch.isfinite(mx), mx, torch.full_like(mx, -30.0))
+    step = (mx - base) / 255.0
+    i8 = ((lg - base[:, None])
+          / torch.where(step > 0, step,
+                        torch.ones_like(step))[:, None]
+          ).round().clamp(0, 255).to(torch.uint8)
+    i8 = torch.where(pos, i8, torch.zeros_like(i8))
+    buf = torch.empty(out_f, 8 + n_gr, dtype=torch.uint8,
+                      device=s.device)
+    hdr = torch.stack([base, step], dim=1).contiguous()
+    buf[:, :8] = hdr.view(torch.uint8).view(out_f, 8)
+    buf[:, 8:] = i8
+    mod._scale = buf
+    mod.packed["scale"] = buf
+    return 1
