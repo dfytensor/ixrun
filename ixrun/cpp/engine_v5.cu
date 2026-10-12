@@ -1583,7 +1583,138 @@ static void udcq_gemv_dual_launch(
             x, i0, s0, sc0, i1, s1, sc1, cb, y0, y1, in_f, out_f, group);
 }
 
-// multi-pack GEMV: ONE launch covers several packs that share x (qkv+z+b+a
+// gate+up fused GEMV with the silu epilogue: one warp walks BOTH packs'
+// rows for the same x, then writes act[r] = silu(acc_gate)*acc_up.
+// Per-pack group order + inner chain identical to v2 => bit-exact vs the
+// separate gate/up GEMV calls; the siLU expression matches silu_kernel.
+template <bool ULS>
+__global__ void udcq_gemv_dual_silu_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ i0, const uint32_t* __restrict__ s0,
+    const __half* __restrict__ sc0,
+    const uint8_t* __restrict__ i1, const uint32_t* __restrict__ s1,
+    const __half* __restrict__ sc1,
+    const float* __restrict__ cb, float* __restrict__ y,
+    int in_f, int out_f, int GROUP)
+{
+    extern __shared__ float smem[];
+    float* x_sm = smem;
+    float* cb_sm = smem + in_f;
+    for (int i = threadIdx.x; i < 16; i += blockDim.x) {
+        cb_sm[i] = -cb[i];
+        cb_sm[i + 16] = cb[i];
+    }
+    for (int i = threadIdx.x; i < in_f; i += blockDim.x) x_sm[i] = x[i];
+    __syncthreads();
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (r >= out_f) return;
+    int n_gr = in_f / GROUP;
+    const uint8_t* irow0 = i0 + (size_t)r * (in_f / 2);
+    const uint8_t* irow1 = i1 + (size_t)r * (in_f / 2);
+    const uint32_t* wrow0 = s0 + (size_t)r * (in_f / 32);
+    const uint32_t* wrow1 = s1 + (size_t)r * (in_f / 32);
+    const __half* srow0 = sc0 + (size_t)r * n_gr;
+    const __half* srow1 = sc1 + (size_t)r * n_gr;
+    const uint8_t* urow0 = reinterpret_cast<const uint8_t*>(sc0)
+                           + (size_t)r * (size_t)(n_gr + 8);
+    const uint8_t* urow1 = reinterpret_cast<const uint8_t*>(sc1)
+                           + (size_t)r * (size_t)(n_gr + 8);
+    float sb0 = 0.f, st0 = 0.f, sb1 = 0.f, st1 = 0.f;
+    if (ULS) {
+        sb0 = *reinterpret_cast<const float*>(urow0);
+        st0 = *reinterpret_cast<const float*>(urow0 + 4);
+        sb1 = *reinterpret_cast<const float*>(urow1);
+        st1 = *reinterpret_cast<const float*>(urow1 + 4);
+    }
+    float acc0 = 0.f, acc1 = 0.f;
+    for (int g = lane; g < n_gr; g += 32) {
+        uint2 b2a = *reinterpret_cast<const uint2*>(irow0 + (size_t)g * 8);
+        uint2 b2b = *reinterpret_cast<const uint2*>(irow1 + (size_t)g * 8);
+        uint32_t swa = wrow0[g >> 1] >> (16 * (g & 1));
+        uint32_t swb = wrow1[g >> 1] >> (16 * (g & 1));
+        float sca = ULS ? exp2f(sb0 + st0 * (float)urow0[8 + g])
+                        : __half2float(srow0[g]);
+        float scb = ULS ? exp2f(sb1 + st1 * (float)urow1[8 + g])
+                        : __half2float(srow1[g]);
+        const float* xs = x_sm + (size_t)g * GROUP;
+        float xr[16];
+        #pragma unroll
+        for (int q = 0; q < 4; ++q)
+            *reinterpret_cast<float4*>(&xr[q * 4]) =
+                *reinterpret_cast<const float4*>(xs + q * 4);
+        float ia = 0.f, ib = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int ba = (int)((b2a.x >> (8 * i)) & 0xFF);
+            int sa0 = (int)((swa >> (2 * i)) & 1u) << 4;
+            int sa1 = (int)((swa >> (2 * i + 1)) & 1u) << 4;
+            int bb = (int)((b2b.x >> (8 * i)) & 0xFF);
+            int sb_0 = (int)((swb >> (2 * i)) & 1u) << 4;
+            int sb_1 = (int)((swb >> (2 * i + 1)) & 1u) << 4;
+            ia = fmaf(cb_sm[(ba & 0xF) | sa0], xr[2 * i], ia);
+            ia = fmaf(cb_sm[(ba >> 4) | sa1], xr[2 * i + 1], ia);
+            ib = fmaf(cb_sm[(bb & 0xF) | sb_0], xr[2 * i], ib);
+            ib = fmaf(cb_sm[(bb >> 4) | sb_1], xr[2 * i + 1], ib);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int ba = (int)((b2a.y >> (8 * i)) & 0xFF);
+            int sa0 = (int)((swa >> (8 + 2 * i)) & 1u) << 4;
+            int sa1 = (int)((swa >> (8 + 2 * i + 1)) & 1u) << 4;
+            int bb = (int)((b2b.y >> (8 * i)) & 0xFF);
+            int sb_0 = (int)((swb >> (8 + 2 * i)) & 1u) << 4;
+            int sb_1 = (int)((swb >> (8 + 2 * i + 1)) & 1u) << 4;
+            ia = fmaf(cb_sm[(ba & 0xF) | sa0], xr[8 + 2 * i], ia);
+            ia = fmaf(cb_sm[(ba >> 4) | sa1], xr[8 + 2 * i + 1], ia);
+            ib = fmaf(cb_sm[(bb & 0xF) | sb_0], xr[8 + 2 * i], ib);
+            ib = fmaf(cb_sm[(bb >> 4) | sb_1], xr[8 + 2 * i + 1], ib);
+        }
+        acc0 += ia * sca;
+        acc1 += ib * scb;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc0 += __shfl_down_sync(0xffffffff, acc0, off);
+        acc1 += __shfl_down_sync(0xffffffff, acc1, off);
+    }
+    if (lane == 0) {
+        float v = acc0;
+        y[r] = v / (1.f + expf(-v)) * acc1;
+    }
+}
+
+static void udcq_gemv_dual_silu_launch(
+    const float* x, const uint8_t* i0, const uint32_t* s0,
+    const __half* sc0, const uint8_t* i1, const uint32_t* s1,
+    const __half* sc1, const float* cb, float* y,
+    int out_f, int in_f, int group, cudaStream_t st)
+{
+    static int max_sm = -1;
+    if (max_sm < 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&max_sm,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        if (max_sm > 0) {
+            cudaFuncSetAttribute(udcq_gemv_dual_silu_kernel<false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, max_sm);
+            cudaFuncSetAttribute(udcq_gemv_dual_silu_kernel<true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, max_sm);
+        }
+    }
+    size_t sm = (size_t)in_f * sizeof(float) + 32 * sizeof(float);
+    unsigned nb = (unsigned)((out_f + 7) / 8);
+    if (g_uls)
+        udcq_gemv_dual_silu_kernel<true><<<nb, 256, sm, st>>>(
+            x, i0, s0, sc0, i1, s1, sc1, cb, y, in_f, out_f, group);
+    else
+        udcq_gemv_dual_silu_kernel<false><<<nb, 256, sm, st>>>(
+            x, i0, s0, sc0, i1, s1, sc1, cb, y, in_f, out_f, group);
+}
+
+
 // in GDN layers; q+k+v and gate+up in attn layers). grid.x covers
 // ceil(sum(out_f)/8) blocks; each warp locates its pack with a short linear
 // scan over out_tab (npack <= 8). The per-pack walk is IDENTICAL to
@@ -4804,21 +4935,17 @@ std::vector<torch::Tensor> gdn_decoder_step(
         xn2.data_ptr<float>(), hidden, 1e-6f);
     if ((int)l == s27_probe_l) s27d_h1 = h1.clone();       // probe
     if ((int)l == s27_probe_l) s27d_xn2 = xn2.clone(); // probe
-    // mlp: gate+up share xn2 in ONE multi-pack launch
-    int gslot = (int)l * 2 + 1;
-    if (!g_mt_ready[gslot]) {
-        const void* ii[2] = {gg_i.data_ptr(), uu_i.data_ptr()};
-        const void* ss[2] = {gg_s.data_ptr(), uu_s.data_ptr()};
-        const void* cc[2] = {gg_sc.data_ptr(), uu_sc.data_ptr()};
-        const void* yy[2] = {mgs.data_ptr(), mus.data_ptr()};
-        int oo[2] = {(int)inter, (int)inter};
-        mt_build_table(gslot, st, ii, ss, cc, yy, oo, 2);
-    }
-    mt_gemv_launch(xn2.data_ptr<float>(), cb.data_ptr<float>(), gslot,
-                   2 * (int)inter, 2, hidden, 16, st);
-    silu_kernel<<<(unsigned)((inter + 255) / 256), 256, 0, st>>>(
-        mgs.data_ptr<float>(), mus.data_ptr<float>(),
-        acts.data_ptr<float>(), (int)inter);
+    // mlp: gate+up fused with the silu epilogue (one launch, shared x)
+    udcq_gemv_dual_silu_launch(
+        xn2.data_ptr<float>(),
+        gg_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(gg_s.data_ptr()),
+        reinterpret_cast<const __half*>(gg_sc.data_ptr()),
+        uu_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(uu_s.data_ptr()),
+        reinterpret_cast<const __half*>(uu_sc.data_ptr()),
+        cb.data_ptr<float>(), acts.data_ptr<float>(),
+        (int)inter, hidden, 16, st);
     torch::Tensor md = udcq_gemv_out(
         acts, dd_i, dd_s, dd_sc, cb, hidden, 17408, 16);
     add_norm_f32<<<1, 1024, 0, st>>>(
@@ -4981,20 +5108,17 @@ std::vector<torch::Tensor> attn_layer_step(
         h.data_ptr<float>(), o.data_ptr<float>(),
         post_w.data_ptr<float>(), h1.data_ptr<float>(),
         xn2.data_ptr<float>(), hidden, 1e-6f);
-    // mlp: gate+up share xn2 in ONE multi-pack launch (slot l*2+1)
-    if (!g_mt_ready[(int)l * 2 + 1]) {
-        const void* ii[2] = {g_i.data_ptr(), u_i.data_ptr()};
-        const void* ss[2] = {g_s.data_ptr(), u_s.data_ptr()};
-        const void* cc[2] = {g_sc.data_ptr(), u_sc.data_ptr()};
-        const void* yy[2] = {mg.data_ptr(), mu.data_ptr()};
-        int oo[2] = {(int)inter, (int)inter};
-        mt_build_table((int)l * 2 + 1, st, ii, ss, cc, yy, oo, 2);
-    }
-    mt_gemv_launch(xn2.data_ptr<float>(), cb.data_ptr<float>(),
-                   (int)l * 2 + 1, 2 * (int)inter, 2, hidden, 16, st);
-    silu_kernel<<<(unsigned)((inter + 255) / 256), 256, 0, st>>>(
-        mg.data_ptr<float>(), mu.data_ptr<float>(),
-        act.data_ptr<float>(), (int)inter);
+    // mlp: gate+up fused with the silu epilogue (one launch, shared x)
+    udcq_gemv_dual_silu_launch(
+        xn2.data_ptr<float>(),
+        g_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(g_s.data_ptr()),
+        reinterpret_cast<const __half*>(g_sc.data_ptr()),
+        u_i.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(u_s.data_ptr()),
+        reinterpret_cast<const __half*>(u_sc.data_ptr()),
+        cb.data_ptr<float>(), act.data_ptr<float>(),
+        (int)inter, hidden, 16, st);
     udcq_gemv_launch(
         act.data_ptr<float>(), d_i.data_ptr<uint8_t>(),
         reinterpret_cast<const uint32_t*>(d_s.data_ptr()),
