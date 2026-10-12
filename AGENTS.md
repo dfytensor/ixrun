@@ -537,3 +537,47 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   per token-tile => the design loses MORE at large T. Do not re-open
   without a different mma input strategy (e.g. 4-bit tensor ops).
 
+## 1B StepGraph decode marathon (2026/10/13) — 161 -> 373 tok/s in one session
+- PROFILE FIRST: the "1B is overhead-bound" folklore was WRONG at the
+  kernel level - torch.profiler on the captured graph showed attention
+  2.25ms/step (38%): transformers 5.15 StaticCache hands SDPA the
+  FULL-WIDTH 2048-slot k/v + bool mask, and the cutlass mem-efficient
+  kernel burns ~94us/layer regardless of position. Backend switching
+  (flash/math/cudnn) does nothing; a dedicated S=1 kernel is the fix.
+- ixrun/fast_attn.py: intercept F.scaled_dot_product_attention (call-
+  time attribute lookup in sdpa_attention_forward), two-phase split-KV
+  Triton (8 chunks, local online softmax + merge), 12x faster than
+  cutlass. Wrapper needs @torch.compiler.disable or Dynamo inlines it
+  and inductor tries to recompile the Triton kernel (fails).
+- GQA TRAP: mask=None decode takes the enable_gqa path - k/v stay at
+  2 kv-heads (no repeat_kv). Indexing k/v by the Q head id = OOB IMA
+  at capture. REP constexpr (h_kv = hq // REP); mask mode receives
+  pre-repeated kv (rep=1). Partials must be stored per Q head.
+- Triton loop-carried state MUST be tensors: a python-scalar -inf m_i
+  changes type after iteration 1 -> silently wrong code (the flash
+  tutorial initializes m_i as a zeros-tensor minus inf for a reason).
+  Fully-masked block: s - (-inf) = nan -> clamp m_new via m_safe.
+- Positional mode: kernel reads the engine's self.pos device tensor
+  (offs <= pos; pointer captured, value read at execution - the 27B
+  write_pos_kernel pattern), HF mask build stubbed via
+  masking_utils.create_causal_mask + the modeling_llama binding
+  (transformers 5.15 has NO _update_causal_mask method). Saves the
+  per-step cat/neg mask kernels (~0.2ms). Prefill goes is_causal -
+  DIFFERENT rounding than the masked path: near-tie first tokens can
+  flip vs mask mode (1 of 4 prompts). Engine deterministic per mode.
+- bf16xl GEMV v4: torch::zeros + yf.to(bf16) per call = 2 wasted
+  kernels x168/step. n_sp==1 stores bf16 directly; n_sp>1 writes
+  disjoint fp32 partial slots + one tiny reduce. REJECTED en route:
+  (a) single global arrival counter - 1728 atomics serialize on ONE
+  L2 address = 4x slower; (b) per-row counters + __threadfence -
+  device-scope fences ~50ns x blocks dominated (95us vs 25us).
+  Split-K path now deterministic (bonus - atomicAdd was not).
+- UDCQ lm_head (IXRUN_Q_LMHEAD=1 default; skipped for bf16/bf16xl by
+  design): cublas 0.4GB bf16 gemv 0.47ms -> fused stream GEMV ~0.2ms,
+  -0.26GB VRAM. Gate: 4/4 prompts BIT-IDENTICAL vs bf16 lm_head on
+  the deterministic bf16 codec (noise below every argmax margin).
+- Env flags: IXRUN_FAST_ATTN=0 (revert attention), IXRUN_POS_ATTN=0
+  (bool-mask path), IXRUN_POS_STUB=0 (keep HF mask build), 
+  IXRUN_Q_LMHEAD=0 (bf16 lm_head), STEP_GRAPH_COMPILE=0.
+- Final: gsq 373 / bf16xl 312 / udcq 289 tok/s (48-step decode,
+  4090/WDDM). gsq >= llama.cpp bf16 (350) / BF16X (380) at 5.5bpw.
