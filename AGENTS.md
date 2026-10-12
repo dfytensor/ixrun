@@ -581,3 +581,19 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   IXRUN_Q_LMHEAD=0 (bf16 lm_head), STEP_GRAPH_COMPILE=0.
 - Final: gsq 373 / bf16xl 312 / udcq 289 tok/s (48-step decode,
   4090/WDDM). gsq >= llama.cpp bf16 (350) / BF16X (380) at 5.5bpw.
+
+## bf16xl GEMV ~582GB/s wall — three hypotheses tested and FALSIFIED (2026/10/13)
+- smem-x staging (27B-v2 style, fp32 +1-pad tiles): isolated wide-shape
+  neutral, small shapes WORSE (staging/sync tax), in-model 306 vs 312.
+  The x path was never the bottleneck (L1 broadcast was already fine).
+- aligned-uint4 multi-group walk (8 groups = 112B = 7x16B; per-lane
+  16B-aligned when n_gr%8==0): bit-exact, in-model 313-319 = v4 within
+  noise.  The unaligned ld_u32 L1-double-booking theory: falsified.
+- occupancy splits for small-row layers (k/v out_f=256 -> 32 blocks):
+  in-model 306-307 = slightly WORSE (the extra reduce-kernel dependency
+  costs more than the occupancy gains).
+- Desktop noise NOTE: same-code reruns spanned 231-321 tok/s today
+  (QQ/Quark/Edge background load); ±15% swings make sub-5% kernel
+  deltas UNFALSIFIABLE in-model on this box.  All three attempts
+  reverted; v4 stands.  Remaining lever: NCU-grade profiling or a
+  different decode strategy - do NOT reopen without one.
