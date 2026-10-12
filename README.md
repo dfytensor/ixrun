@@ -26,7 +26,7 @@
 | **GMM**（贝叶斯高斯混合）| 5.0-6.0 | K=32 6bpw ppl 57.92 ≈ UDCQ；+残差 8.5bpw == bf16 | 最省 bpw 档；流式 5.03bpw |
 | **GSQ**（组尺度量化）| **5.50** | K32 学习码本 + 对数 i8 组 scale，**ppl 57.9** | **1B StepGraph ~300 tok/s（compile 后）** |
 | **HPQ×scale**（块码本×组尺度）| 6.36 | 混合部署 ppl 57.22；CUDA kernel 0.84-0.90× bf16 | 质量强化层（27B 支持点状注入）|
-| **bf16xl**（无损压缩 bf16）| 14.12 | **逐 bit == bf16（零误差）**；速度 ≈ bf16（137 tok/s 稳态）| 无损档：质量敏感部署 |
+| **bf16xl**（无损压缩 bf16）| 14.12 | **逐 bit == bf16（零误差）**；速度 ~141 tok/s（compile + 分支-free 解码）| 无损档：质量敏感部署 |
 | **ixgs** | 4.2 | per-group scale，25.4dB | 重尾权重/视频 DiT 方向 |
 | TPAB | 2-6 | tile 定长 | 原型 |
 
