@@ -168,6 +168,34 @@ class StepGraphEngine:
             stats['bpw'] = 14.12
         elif codec != 'bf16':
             raise ValueError(f'unknown codec: {codec}')
+        # quantize lm_head with the UDCQ stream path (fused decode+GEMV
+        # over packed streams): the cublas bf16 gemv costs ~0.47ms/step
+        # (vocab 130560 x 1536 = 0.4GB reads), the fused kernel ~0.2ms
+        # and -0.26GB VRAM.  27B ships the same way (int8 embed/lm_head).
+        # IXRUN_Q_LMHEAD=0 reverts.  Skipped for the bf16 (lossless)
+        # codec: that tier exists precisely to be bit-exact.
+        lm = getattr(model, 'lm_head', None)
+        if (codec not in ('bf16', 'bf16xl') and type(lm).__name__
+                == 'Linear' and lm.weight.numel() > 1_000_000
+                and os.environ.get('IXRUN_Q_LMHEAD', '1')
+                not in ('', '0')):
+            from .udcq import (UDCQ_G, UDCQ_NLEV, UdcqLinear,
+                               udcq_fit_codebook, udcq_quantize)
+            from .linear import _set_parent_child
+
+            _t0 = time.perf_counter()
+            W = lm.weight.data
+            cb = udcq_fit_codebook(W.cpu(), nlev=UDCQ_NLEV, g=UDCQ_G)
+            packed = udcq_quantize(W, cb, g=UDCQ_G)
+            bias = lm.bias.data if lm.bias is not None else None
+            _set_parent_child(model, 'lm_head',
+                              UdcqLinear(packed, bias=bias, cache='stream'))
+            lm.weight.data = torch.empty(0)
+            stats['lm_head_q'] = True
+            if verbose:
+                mb = packed['total_bytes'] / 1e6
+                print(f'[lmhead-q] UDCQ stream {mb:.0f}MB '
+                      f'({time.perf_counter()-_t0:.0f}s)', flush=True)
         model = model.cuda()
         gc.collect()
         torch.cuda.empty_cache()

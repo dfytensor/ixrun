@@ -34,8 +34,10 @@ __global__ void bf16xl_gemv_kernel(
     const uint8_t* __restrict__ delta,  // [nG, 6]
     const uint8_t* __restrict__ sgn,    // [nG, 2]
     const uint8_t* __restrict__ emax,   // [nSuper]
-    float* __restrict__ yf,
-    int n_gr, int sg, int n_sp)
+    float* __restrict__ part,           // [n_sp, out_f] persistent scratch
+    unsigned int* __restrict__ ctr,     // [1] persistent, self-resetting
+    __nv_bfloat16* __restrict__ y,      // [out_f] bf16 output
+    int n_gr, int sg, int n_sp, int out_f)
 {
     int lane = threadIdx.x & 31;
     int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -79,9 +81,34 @@ __global__ void bf16xl_gemv_kernel(
     for (int off = 16; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffff, acc, off);
     }
-    if (lane == 0) {
-        atomicAdd(&yf[r], acc);
+    if (n_sp == 1) {                       // direct store, no scratch
+        if (lane == 0) {
+            y[r] = __float2bfloat16(acc);
+        }
+        return;
     }
+    // plain store to this split's slot; a separate tiny kernel sums the
+    // n_sp slots (device-scope threadfences here cost ~50ns x blocks and
+    // dominated the kernel; per-row arrival counters serialized too)
+    if (lane == 0) {
+        part[blockIdx.y * out_f + r] = acc;
+    }
+}
+
+__global__ void bf16xl_reduce_kernel(
+    const float* __restrict__ part,     // [n_sp, out_f]
+    __nv_bfloat16* __restrict__ y,      // [out_f]
+    int out_f, int n_sp)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= out_f) {
+        return;
+    }
+    float s = 0.f;
+    for (int k = 0; k < n_sp; ++k) {
+        s += part[k * out_f + r];
+    }
+    y[r] = __float2bfloat16(s);
 }
 
 __global__ void bf16xl_decode_kernel(
@@ -128,13 +155,26 @@ __global__ void bf16xl_decode_kernel(
     }
 }
 
+// persistent split-K scratch (stable device addresses: CUDA-graph safe).
+// ctr[r] arrival counters are zeroed at ALLOC ONLY - atomicInc wraps to 0
+// at n_sp-1, so they self-reset every launch.
+static float* g_part = nullptr;
+static int g_part_cap = 0;
+
+static void ensure_scratch(int out_f, int n_sp) {
+    int need = out_f * n_sp;
+    if (need > g_part_cap) {
+        if (g_part) cudaFree(g_part);
+        cudaMalloc(&g_part, (size_t)need * sizeof(float));
+        g_part_cap = need;
+    }
+}
+
 torch::Tensor gemv(torch::Tensor x, torch::Tensor mant,
                    torch::Tensor delta, torch::Tensor sgn,
                    torch::Tensor emax, int64_t out_f, int64_t in_f,
                    int64_t kg)
 {
-    auto yf = torch::zeros({out_f},
-        torch::dtype(torch::kFloat32).device(x.device()));
     int n_gr = (int)(in_f / 16);
     int sg = (int)(kg / 16);
     int n_sp = n_gr / 96; if (n_sp < 1) n_sp = 1;
@@ -142,13 +182,30 @@ torch::Tensor gemv(torch::Tensor x, torch::Tensor mant,
     int wpb = 8;
     unsigned gx = (unsigned)(out_f / wpb);
     dim3 grid(gx, (unsigned)n_sp);
+    auto y = torch::empty({out_f},
+        torch::dtype(torch::kBFloat16).device(x.device()));
     auto s0 = at::cuda::getCurrentCUDAStream();
-    bf16xl_gemv_kernel<<<grid, wpb * 32, 0, s0>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
-        mant.data_ptr<uint8_t>(), delta.data_ptr<uint8_t>(),
-        sgn.data_ptr<uint8_t>(), emax.data_ptr<uint8_t>(),
-        yf.data_ptr<float>(), n_gr, sg, n_sp);
-    return yf.to(torch::kBFloat16);
+    auto yptr = reinterpret_cast<__nv_bfloat16*>(y.data_ptr());
+    if (n_sp > 1) {
+        ensure_scratch((int)out_f, n_sp);
+        bf16xl_gemv_kernel<<<grid, wpb * 32, 0, s0>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+            mant.data_ptr<uint8_t>(), delta.data_ptr<uint8_t>(),
+            sgn.data_ptr<uint8_t>(), emax.data_ptr<uint8_t>(),
+            g_part, nullptr,
+            yptr, n_gr, sg, n_sp, (int)out_f);
+        unsigned rx = (unsigned)((out_f + 255) / 256);
+        bf16xl_reduce_kernel<<<rx, 256, 0, s0>>>(
+            g_part, yptr, (int)out_f, n_sp);
+    } else {
+        bf16xl_gemv_kernel<<<grid, wpb * 32, 0, s0>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+            mant.data_ptr<uint8_t>(), delta.data_ptr<uint8_t>(),
+            sgn.data_ptr<uint8_t>(), emax.data_ptr<uint8_t>(),
+            nullptr, nullptr,
+            yptr, n_gr, sg, n_sp, (int)out_f);
+    }
+    return y;
 }
 
 torch::Tensor decode(torch::Tensor mant, torch::Tensor delta,
@@ -190,7 +247,7 @@ def _load():
     global _EXT
     if _EXT is None:
         _EXT = load_inline(
-            name='bf16xl_gemv_cuda_v3',
+            name='bf16xl_gemv_cuda_v4',
             cpp_sources=[_CPP_SRC],
             cuda_sources=[_CUDA_SRC],
             functions=['gemv', 'decode'],
