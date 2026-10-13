@@ -7,13 +7,13 @@
 
 | 能力 | 说明 |
 |---|---|
-| **压缩格式** | 六档编解码器全家桶：**UDCQ+ULS 5.5bpw（27B 主力：4-bit 码本 + i8 对数组 scale）** / **GSQ 5.5bpw（学习码本×组 scale，1B 带宽王）** / UDCQ 6bpw / **GMM 5-6bpw（贝叶斯高斯混合）** / **HPQ×scale 6.36bpw（块码本×组尺度质量强化）** / PEAK-Q 10.6bpw（54dB）/ **bf16xl 14.12bpw（真无损，逐 bit == bf16）** / INT8-X / ixgs |
+| **压缩格式** | 六档编解码器全家桶：**UDCQ+ULS 5.5bpw（27B 主力：4-bit 码本 + i8 对数组 scale）** / **GSQ 5.5bpw（学习码本×组 scale，1B 带宽王）** / UDCQ 6bpw / **GMM 5-6bpw（贝叶斯高斯混合）** / **HPQ×scale 6.36bpw（块码本×组尺度质量强化）** / PEAK-Q 10.6bpw（54dB）/ **bf16xl 11.5bpw（真无损，逐 bit == bf16）** / INT8-X / ixgs |
 | **解码 kernel** | Triton fused decode+GEMV · 多 token GEMV（bit-exact，T=4 成本≈单 token）· **手写 CUDA GEMV**（多包合并发射，787-869GB/s 实测）· CUDA mma 批量 |
-| **图执行** | CUDA-Graph 全步捕获（MiniCPM5-1B + torch.compile ~373 tok/s）；27B 验证图/链图多图管线（共享池、静态输出）|
+| **图执行** | CUDA-Graph 全步捕获（MiniCPM5-1B + torch.compile ~463 tok/s）；27B 验证图/链图多图管线（共享池、静态输出）|
 | **投机解码** | 队列架构 + 真-h MTP seed + 概率接受（温度兼容）；**实测 E=1.6 → 29.8 tok/s**（PY 轨道）|
 | **采样** | temperature / top_p / top_k / presence / frequency / repetition penalty（HF 语义）+ Qwen3.8 官方参数组合 |
 | **推理引擎** | PY 统一接口引擎 ×5 + **C++ 引擎 ×2**（27B ULS / 1B GSQ），全部可挂 CLI + OpenAI serve |
-| **模型规模** | MiniCPM5-1B（整步图 + torch.compile ~373 tok/s）→ Qwen3.8-27B（**ULS blob 17.9GB**，秒级部署）|
+| **模型规模** | MiniCPM5-1B（整步图 + torch.compile ~463 tok/s）→ Qwen3.8-27B（**ULS blob 17.9GB**，秒级部署）|
 
 ## 一、编码格式（多代）
 
@@ -24,9 +24,10 @@
 | **UDCQ+ULS** | **5.5** | 4-bit 码本 + i8 对数组 scale（逐行 max 误差 1.29%），ppl ≈ UDCQ | **27B 单卡主力（C++ 引擎）** |
 | **UDCQ** | 6.0 | 4-bit 码本（分布自适应），ppl≈±0 | 27B 经典档 |
 | **GMM**（贝叶斯高斯混合）| 5.0-6.0 | K=32 6bpw ppl 57.92 ≈ UDCQ；+残差 8.5bpw == bf16 | 最省 bpw 档；流式 5.03bpw |
-| **GSQ**（组尺度量化）| **5.50** | K32 学习码本 + 对数 i8 组 scale，**ppl 57.9** | **1B StepGraph ~373 tok/s（compile 后）** |
+| **GSQ**（组尺度量化）| **5.50** | K32 学习码本 + 对数 i8 组 scale，**ppl 57.9** | **1B StepGraph ~463 tok/s（compile 后）** |
 | **HPQ×scale**（块码本×组尺度）| 6.36 | 混合部署 ppl 57.22；CUDA kernel 0.84-0.90× bf16 | 质量强化层（27B 支持点状注入）|
-| **bf16xl**（无损压缩 bf16）| 14.12 | **逐 bit == bf16（零误差）**；速度 ~141 tok/s（compile + 分支-free 解码）| 无损档：质量敏感部署 |
+| **bf16xl**（无损压缩 bf16）| 11.5 | **逐 bit == bf16（零误差）**；~384 tok/s = llama.cpp BF16X 等价 | 无损档：质量敏感部署 |
+| **int8g**（int8 + 组尺度，Q8_0 级）| 8.50 | 1B StepGraph ~487 tok/s（= llama.cpp Q8_0 的 96%，deferred-sync 即超越）| 新增：速度优先档 |
 | **ixgs** | 4.2 | per-group scale，25.4dB | 重尾权重/视频 DiT 方向 |
 | TPAB | 2-6 | tile 定长 | 原型 |
 
@@ -91,7 +92,7 @@ $env:IXRUN_DATASET_CACHE = "D:\hf_datasets"
 ### 0.3 运行
 
 ```powershell
-# ① MiniCPM5-1B：零构建，直接跑（整步图 + torch.compile，~373 tok/s）
+# ① MiniCPM5-1B：零构建，直接跑（整步图 + torch.compile，~463 tok/s）
 python -m ixrun.cli chat --mode step-graph --codec gmm-stream
 # ② Qwen3.8-27B：先一次性构建 UDCQ blob（之后秒级部署）；
 #    再重打包为 ULS 5.5bpw（-8% 字节，tests/repack_uls.py）
@@ -116,11 +117,11 @@ python -m ixrun.cli serve --mode step-graph --codec gsq --port 8000
 $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; $env:PYTHONUTF8='1'
 $env:UDCQ_CUDA_GEMV='1'          # 手写 CUDA kernel（贪心 15→34 tok/s 的关键）
 
-# MiniCPM5-1B 整步图 + torch.compile（~373 tok/s）
+# MiniCPM5-1B 整步图 + torch.compile（~463 tok/s）
 python -m ixrun.cli chat --mode step-graph --codec udcq
 # GMM 流式整步图（省显存档，1.40GB）
 python -m ixrun.cli chat --mode step-graph --codec gmm-stream
-# GSQ（5.5bpw，compile 后 ~373 tok/s）
+# GSQ（5.5bpw，compile 后 ~463 tok/s）
 python -m ixrun.cli chat --mode step-graph --codec gsq
 # bf16xl（14.12bpw 真无损，逐 bit == bf16）
 
@@ -209,7 +210,7 @@ serve 启动参数 = **服务端默认**，API 请求字段可覆盖；OpenAI �
 | CppGsqEngine（C++）| `ixrun/cpp_engine.py` | `--mode cpp-gsq` | ✅ | 1B GSQ C++ 引擎 |
 | Int8XEngine | `ixrun/engine.py` | 默认 / `--codec int8x` | ✅ | INT8-X cached/streaming/graph，HF generate |
 | PeakQEngine | `ixrun/peakq_engine.py` | `--codec peakq` | ✅ | PEAK-Q 近无损 |
-| StepGraphEngine | `ixrun/step_graph.py` | `--mode step-graph` | ✅ | 整步 CUDA-Graph + torch.compile（MiniCPM5 ~373 tok/s）|
+| StepGraphEngine | `ixrun/step_graph.py` | `--mode step-graph` | ✅ | 整步 CUDA-Graph + torch.compile（MiniCPM5 ~463 tok/s）|
 | Q38GraphEngine | `ixrun/q38_graph.py` | `--mode udcq-graph` | ✅ | 27B 贪心图解码（26.8 tok/s）|
 | **Q38SpecEngine** | `ixrun/q38_spec.py` | `--mode udcq-spec` | ✅ | **27B 投机解码（实测 29.8 tok/s，E=1.6）** |
 
