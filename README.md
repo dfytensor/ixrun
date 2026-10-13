@@ -10,7 +10,7 @@
 | **压缩格式** | 六档编解码器全家桶：**UDCQ+ULS 5.5bpw（27B 主力：4-bit 码本 + i8 对数组 scale）** / **GSQ 5.5bpw（学习码本×组 scale，1B 带宽王）** / UDCQ 6bpw / **GMM 5-6bpw（贝叶斯高斯混合）** / **HPQ×scale 6.36bpw（块码本×组尺度质量强化）** / PEAK-Q 10.6bpw（54dB）/ **bf16xl 11.5bpw（真无损，逐 bit == bf16）** / INT8-X / ixgs |
 | **解码 kernel** | Triton fused decode+GEMV · 多 token GEMV（bit-exact，T=4 成本≈单 token）· **手写 CUDA GEMV**（多包合并发射，787-869GB/s 实测）· CUDA mma 批量 |
 | **图执行** | CUDA-Graph 全步捕获（MiniCPM5-1B + torch.compile ~463 tok/s）；27B 验证图/链图多图管线（共享池、静态输出）|
-| **投机解码** | 队列架构 + 真-h MTP seed + 概率接受（温度兼容）；**实测 E=1.6 → 32.4 tok/s (en) / 28.4 (zh)**（PY 轨道）|
+| **投机解码** | 队列架构 + 真-h MTP seed + 概率接受（温度兼容）；**实测 E=2.09 → 36.5 tok/s (en) / 28.5 (zh)**（PY 轨道）|
 | **采样** | temperature / top_p / top_k / presence / frequency / repetition penalty（HF 语义）+ Qwen3.8 官方参数组合 |
 | **推理引擎** | PY 统一接口引擎 ×5 + **C++ 引擎 ×2**（27B ULS / 1B GSQ），全部可挂 CLI + OpenAI serve |
 | **模型规模** | MiniCPM5-1B（整步图 + torch.compile ~463 tok/s）→ Qwen3.8-27B（**ULS blob 17.9GB**，秒级部署）|
@@ -141,8 +141,8 @@ python -m ixrun.cli serve --mode udcq-spec `
 |---|---|---|
 | **C++ 引擎贪心图解码** | **37.4 tok/s**（27ms/步）| ULS 5.5bpw + CUDA 图（逐位门通过）|
 | C++ 引擎 @4K ctx | 35.3 tok/s | 长上下文衰减已消除（attn v3）|
-| PY 投机（贪心）| 32.4 tok/s (en) / 28.4 (zh)（E=1.6 实测）| mt4 内核 + 队列架构 |
-| PY 贪心图 | 26.8 tok/s | udcq-graph |
+| PY 投机（贪心）| 36.5 tok/s (en) / 28.5 (zh)（E=2.09 实测（接受比较在图内））| mt4 内核 + 队列架构 |
+| PY 贪心图 | 31.5 tok/s | udcq-graph |
 | 历史档：PY 投机早期宣称 53-60（E=2.8）| 未能在受控测量中复现 | 保留为特定内容/早期口径 |
 
  decode 天花板账本：权重流 17.6GB @900-940GB/s = 18.7-19.5ms → **实用极限
@@ -211,8 +211,8 @@ serve 启动参数 = **服务端默认**，API 请求字段可覆盖；OpenAI �
 | Int8XEngine | `ixrun/engine.py` | 默认 / `--codec int8x` | ✅ | INT8-X cached/streaming/graph，HF generate |
 | PeakQEngine | `ixrun/peakq_engine.py` | `--codec peakq` | ✅ | PEAK-Q 近无损 |
 | StepGraphEngine | `ixrun/step_graph.py` | `--mode step-graph` | ✅ | 整步 CUDA-Graph + torch.compile（MiniCPM5 ~463 tok/s）|
-| Q38GraphEngine | `ixrun/q38_graph.py` | `--mode udcq-graph` | ✅ | 27B 贪心图解码（26.8 tok/s）|
-| **Q38SpecEngine** | `ixrun/q38_spec.py` | `--mode udcq-spec` | ✅ | **27B 投机解码（实测 32.4 tok/s (en) / 28.4 (zh)，E=1.6）** |
+| Q38GraphEngine | `ixrun/q38_graph.py` | `--mode udcq-graph` | ✅ | 27B 贪心图解码（31.5 tok/s）|
+| **Q38SpecEngine** | `ixrun/q38_spec.py` | `--mode udcq-spec` | ✅ | **27B 投机解码（实测 36.5 tok/s (en) / 28.5 (zh)，E=2.09）** |
 
 通用参数：`--max-ctx`（KV 窗口，默认 256，上限 16384）· `--codec` · `--cache`
 （blob/打包权重）· 全部采样参数。server 另支持 `<think>` 隐藏、SSE 流式、
