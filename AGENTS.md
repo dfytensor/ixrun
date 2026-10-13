@@ -614,3 +614,37 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   '<s>' degeneracy.  Fix: quantize lm_head with stats['codebook'].
   RULE: a gate must verify the CONFIG IT SHIPS - check the side
   actually changed (log the lmhead-q/uls deploy lines in BOTH runs).
+
+## 1B vs llama.cpp: parity campaign (2026/10/13 late, 8875543..34f4acb)
+- The llama.cpp table (their own numbers, 4090): F16 371t/s @801GB/s
+  79% | BF16X 389 @606 60% | Q8_0 508 @584 58%.  Read it as: the
+  SIMPLEST-format-wins hierarchy + the decode-ALU tax visible in the
+  falling effective bandwidth.  Our bf16xl GEMV was ALREADY at their
+  BF16X kernel rate (582 vs 606 GB/s) - the whole gap was the
+  everything-else around the GEMVs, not the GEMVs.
+- The fusion ladder that closed it (PY side, each with a gate):
+  cached rotary tables (build [max_ctx,hd] ONCE, forward = gather;
+  the HF chains were 0.27ms/step) -> fused rope application (ONE
+  triton kernel for all q+k rows per layer, rotate_half via the
+  partner-element load + sign; replaces 5 kernels/tensor = 0.3ms)
+  -> explicit codebook staging BEFORE capture (the lazy install
+  leaked into the graph and the lm_head decoded with a stale
+  constant = '<s>' spam that looked codec-dependent) -> lmhead-q
+  for bf16xl too -> fused add+rmsnorm layer (one kernel emits the
+  new residual AND the normed output; in-place on the attn buffer).
+- int8g codec: int8 + per-group f16 scale (g=32 = exactly Q8_0's
+  block; 8.5bpw).  The GEMV = a uint4 load + 16 FMAs - 901GB/s on
+  the lm_head shape isolated.  rel 0.0056.  169 linears incl lm_head.
+- LATENT BUG the campaign flushed out: Int8GLinear/Bf16xlLinear M=1
+  paths returned 1-D tensors; HF's post-o_proj reshape masked it
+  until the fused add+norm consumed o_proj output directly.
+  RULE: every flat-returning GEMV module must view() back to x's
+  shape (UdcqLinear always did).
+- RESULT (48-step decode, sync-per-token = the CONSERVATIVE protocol;
+  deferred-sync generate runs faster):
+  bf16xl 384+-5 vs BF16X 389  = parity
+  gsq    463    vs BF16X 389  = +19% at 5.5bpw
+  int8g  487+-4 vs Q8_0  508  = 96% conservative, >= parity deferred
+- Desktop noise remains +-10-15%: sub-5% claims need median-of-3+
+  runs interleaved, and even then one 350-vs-490 outlier/day is
+  normal (background load bursts).
