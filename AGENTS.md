@@ -671,3 +671,28 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
 - NOT applied (measured dead for the 27B): fast attention (0.25ms
   total), int8g (the 4% int8 quality rejection stands), deferred-sync
   (the graph replay is already zero-sync).
+
+## MTP/spec baseline after the GEMV v5 (2026/10/13 night)
+- The spec engine AUTO-benefited from the chunked-x GEMV (the draft
+  path = single-token MTP-head forwards): 29.8 -> 32.4 (en) / 28.4
+  (zh) tok/s measured with the accept histogram (E=2.09/1.66 at
+  TOK=4; hist en {1:10, 2:4, 3:6, 4:3} - the chain dies at 1-2 most
+  iterations).
+- TOK sweep VERDICT: T=8 en 32.7 (E=2.40) = a wash vs T=4; zh 24.7
+  (E=1.78) = WORSE.  The verify cost is flat in T (mt8 = one weight
+  pass) but the ACCEPT does not scale - the marginal drafts 5-8 are
+  worthless.  TOK=4 stands; the lever is E itself (draft quality),
+  not the chain length.
+- The structural math for a future C++ spec port: the C++ verify =
+  mt4 ~17.2ms (the 1.5x amortization) + the C++ MTP-head draft ~1ms
+  per step (0.65GB: fc + one full layer + the shared lm_head at
+  660GB/s); at the measured E=1.7-2.1 that is ~10-12ms/tok = 80-100
+  t/s.  The old "spec net = LOSS" verdict (mt4 1.3-1.65x) predates
+  the E histograms and the ULS blob - worth re-examining before
+  believing either way.  The port needs: the MTP head in C++ (fc +
+  one decoder layer + norms + the shared lm_head read), the
+  chain-draft graphs, the rollback ring - a multi-hour project.
+- Env forensics note: Q38_MIN_FREE_GB set in a .cmd did not reach
+  python on one box run (read 1.2 while the file said 0.9; a probe
+  cmd with the same pattern propagated fine); forced in-script
+  os.environ assignment as the workaround.  Root cause unidentified.
