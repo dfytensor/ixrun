@@ -648,3 +648,26 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
 - Desktop noise remains +-10-15%: sub-5% claims need median-of-3+
   runs interleaved, and even then one 350-vs-490 outlier/day is
   normal (background load bursts).
+
+## 1B lessons applied to the 27B PY graph (2026/10/13 night, f57b694): 26.2 -> 31.5 tok/s (+20%)
+- PROFILE FIRST held again, and HUMBLED the hypothesis: the 27B PY
+  graph attention is NOT the 1B pathology - 16 full-attn layers x
+  cutlass @ ctx 256 = 0.25ms/step only (the 1B's 94us/layer was the
+  2048-wide cache; the 27B graph runs max_ctx=256).  The real split:
+  GEMV 30.7ms (573GB/s) + ~6ms norm/copy chains.
+- fused add+norm qwen3_5 variant: output = rmsnorm(sum) * (1+weight)
+  (ZERO-CENTERED - the AGENTS lesson).  (1+w) buffers must be built
+  POST-LOAD: an __init__-time build captures the META/unloaded weight
+  (IMA at the first layer).  -1.1ms/step.  IXRUN_FUSED_ADDNORM=0.
+- chunked-x GEMV = the big one (+16%): the PY v2 staged the WHOLE x
+  in dynamic smem (IN_F*4B; 17408 -> 69.6KB = 1 block/SM = 12.5%
+  occupancy).  The C++ v2c already knew this ("smem 32.9KB -> 3
+  blocks/SM"); the PY ext now does the same: 128-group-multiple
+  chunks, static 8.3KB, per-lane order preserved = bit-exact.  GEMV
+  30.7 -> 25.6ms = 660GB/s = the C++ engine's 655.  Ext v4 -> v5.
+- PY graph now 31.5 t/s.  The remaining ~5ms vs the C++ 37.4 = the
+  HF orchestration (867 copies, norm tails, GDN python) - the C++
+  engine's reason to exist, per the revised law.
+- NOT applied (measured dead for the 27B): fast attention (0.25ms
+  total), int8g (the 4% int8 quality rejection stands), deferred-sync
+  (the graph replay is already zero-sync).
