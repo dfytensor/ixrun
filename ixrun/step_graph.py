@@ -165,7 +165,16 @@ class StepGraphEngine:
             from benchmarks.bf16xl_runtime import deploy_bf16xl
 
             stats['n_layers'] = deploy_bf16xl(model, verbose=verbose)
-            stats['bpw'] = 14.12
+            stats['bpw'] = 11.5
+        elif codec == 'int8g':
+            # int8 + per-16 fp16 scale (the Q8_0 class): the decode is
+            # ~3 instr/elem so the GEMV runs near the DRAM ceiling
+            # (860GB/s isolated on the lm_head shape) - the llama.cpp
+            # table shows this tier beats every complex format.
+            from benchmarks.int8g_runtime import deploy_int8g
+
+            stats['n_layers'] = deploy_int8g(model, verbose=verbose)
+            stats['bpw'] = 9.0
         elif codec != 'bf16':
             raise ValueError(f'unknown codec: {codec}')
         # quantize lm_head with the UDCQ stream path (fused decode+GEMV
@@ -229,7 +238,7 @@ class StepGraphEngine:
         # under Dynamo functionalization (do NOT enable there).
         # STEP_GRAPH_COMPILE=0 disables. Prefill runs through the raw
         # (_orig_mod) model to avoid a shape-recompile at startup.
-        if (codec in ('gsq', 'bf16xl') and
+        if (codec in ('gsq', 'bf16xl', 'int8g') and
                 os.environ.get('STEP_GRAPH_COMPILE', '1')
                 not in ('', '0')):
             _t0 = time.perf_counter()
