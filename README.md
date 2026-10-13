@@ -23,6 +23,7 @@
 | **PEAK-Q** | 10.6 | 54dB SNR，69% 元素 bit-exact | 近无损档 |
 | **UDCQ+ULS** | **5.5** | 4-bit 码本 + i8 对数组 scale（逐行 max 误差 1.29%），ppl ≈ UDCQ | **27B 单卡主力（C++ 引擎）** |
 | **UDCQ** | 6.0 | 4-bit 码本（分布自适应），ppl≈±0 | 27B 经典档 |
+| **UDCQ-ULS**（对数尺度）| **5.5** | i8 log2 尺度流（每行 [base,step] 头）；尺度误差 ≤1.3%| **1B ~361 tok/s；27B 生产格式**
 | **GMM**（贝叶斯高斯混合）| 5.0-6.0 | K=32 6bpw ppl 57.92 ≈ UDCQ；+残差 8.5bpw == bf16 | 最省 bpw 档；流式 5.03bpw |
 | **GSQ**（组尺度量化）| **5.50** | K32 学习码本 + 对数 i8 组 scale，**ppl 57.9** | **1B StepGraph ~463 tok/s（compile 后）** |
 | **HPQ×scale**（块码本×组尺度）| 6.36 | 混合部署 ppl 57.22；CUDA kernel 0.84-0.90× bf16 | 质量强化层（27B 支持点状注入）|
@@ -206,7 +207,7 @@ serve 启动参数 = **服务端默认**，API 请求字段可覆盖；OpenAI �
 
 | 引擎 | 库 | CLI mode | serve | 说明 |
 |---|---|---|---|---|
-| **Qwen27bCppEngine（C++）** | `ixrun/cpp_engine_27b.py` | Python API（CLI 待接）| — | **27B ULS 5.5bpw：解码 37.4 / 预填充 603 tok/s**；反量化+cuBLAS GEMM 段 + 批量核 + 状态常驻 smem |
+| **Qwen27bCppEngine（C++）** | `ixrun/cpp_engine_27b.py` | Python API + CLI + serve（--mode cpp-q38）| — | **27B ULS 5.5bpw：解码 37.4 / 预填充 603 tok/s**；反量化+cuBLAS GEMM 段 + 批量核 + 状态常驻 smem |
 | CppGsqEngine（C++）| `ixrun/cpp_engine.py` | `--mode cpp-gsq` | ✅ | 1B GSQ C++ 引擎 |
 | Int8XEngine | `ixrun/engine.py` | 默认 / `--codec int8x` | ✅ | INT8-X cached/streaming/graph，HF generate |
 | PeakQEngine | `ixrun/peakq_engine.py` | `--codec peakq` | ✅ | PEAK-Q 近无损 |
@@ -248,8 +249,13 @@ serve 启动参数 = **服务端默认**，API 请求字段可覆盖；OpenAI �
 | StepGraphEngine bf16 | 105 | 2.28GB |
 | StepGraphEngine UDCQ（无 compile，历史）| 134 | 2.28GB |
 | GMM 流式（无 compile，历史）| 141 | 1.40GB |
-| **StepGraph GSQ + torch.compile（现默认）** | **~300**（ctx=512 差分实测）| ~2.3GB |
+| **int8g（8.5bpw，Q8_0 级）** | **~487** | ~1.1GB |
+| **GSQ + compile（5.5bpw，现默认）** | **~463** | ~2.3GB |
+| bf16xl（无损 11.5bpw）| ~384 | ~2.6GB |
+| UDCQ-ULS（5.5bpw）| ~361 | ~1.9GB |
 | CppGsqEngine（C++）| 264.9 | — |
+
+llama.cpp 对照（4090，官方数）：F16 371 / BF16X 389 / Q8_0 508 → bf16xl = BF16X 等价；gsq 超 BF16X 19%；int8g = Q8_0 的 96%（deferred-sync 即超越）。协议：48-token 解码、逐 token 同步（保守）；deferred-sync generate 更快。
 
 torch.compile 对 1B 整步图 +8-17%（默认开启，`STEP_GRAPH_COMPILE=0`
 关闭）；compile 对 27B GDN 引擎有损（状态函数化 → 退化），保持关闭。
