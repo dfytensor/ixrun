@@ -328,9 +328,11 @@ class StepGraphEngine:
                                 self._sin_cache[idx].unsqueeze(0))
 
                     _m.forward = _types.MethodType(_rope_fwd, _m)
+                    _rope_mod = _m
                     _nr += 1
             if verbose and _nr:
-                print(f'[step-graph] cached rope on {_nr} modules',
+                print(f'[step-graph] cached rope on {_nr} modules, '
+                      f'rows={_rope_mod._cos_cache.shape[0]}',
                       flush=True)
         # fused rotary application: one Triton kernel per layer replaces
         # HF's 5-kernel mul/neg/cat/add chain per tensor (~0.3ms/step).

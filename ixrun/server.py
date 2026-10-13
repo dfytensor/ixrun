@@ -478,7 +478,8 @@ def serve(
     elif mode == "step-graph":
         from .step_graph import StepGraphEngine
 
-        eng = StepGraphEngine.from_pretrained(model_path, codec=codec)
+        eng = StepGraphEngine.from_pretrained(model_path, codec=codec,
+                                              max_ctx=max_ctx)
     elif mode == "cpp-gsq":
         from .cpp_engine import CppGsqEngine
 
