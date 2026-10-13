@@ -340,6 +340,13 @@ class StepGraphEngine:
 
             if install_fused_rope() and verbose:
                 print('[step-graph] fused rope application', flush=True)
+        # fused residual-add + rmsnorm at the attention->MLP boundary
+        # (one kernel emits the sum AND the normed output)
+        if os.environ.get('IXRUN_FUSED_ADDNORM', '1') not in ('', '0'):
+            from .fast_attn import install_fused_add_norm
+
+            if install_fused_add_norm() and verbose:
+                print('[step-graph] fused add+norm layers', flush=True)
 
         # install the UDCQ codebook EXPLICITLY once, before any graph
         # capture: the ext kernels read the __constant__ c_cb staged by

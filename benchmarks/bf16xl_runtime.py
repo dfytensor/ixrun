@@ -121,7 +121,10 @@ class Bf16xlLinear(torch.nn.Module):
 
     def forward(self, x):
         if x.numel() == self.in_features:
-            return _gemv_wrap(x.reshape(-1), self.pk)
+            # view back to >=2-D: the ext returns flat, and downstream
+            # consumers (fused add+norm, HF reshapes) expect x's shape
+            y = _gemv_wrap(x.reshape(-1), self.pk)
+            return y.view(*x.shape[:-1], self.out_features)
         W = self._decode()
         return torch.nn.functional.linear(
             x.to(W.dtype), W)

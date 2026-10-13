@@ -253,6 +253,89 @@ def install_fused_rope():
     return True
 
 
+# ------------------------------------------------------------------ #
+# fused residual-add + RMSNorm: one kernel emits BOTH the sum (the new
+# residual) and the normed output - replaces HF's separate add kernel
+# + layernorm chain at the attention->MLP boundary (~0.1-0.2ms/step).
+# ------------------------------------------------------------------ #
+if _HAS_TRITON:
+
+    @triton.jit
+    def _add_norm_kernel(A, B, W, SUM, OUT, eps,
+                         HD: tl.constexpr, BLK: tl.constexpr):
+        r = tl.program_id(0)
+        offs = tl.arange(0, BLK)
+        mask = offs < HD
+        a = tl.load(A + r * HD + offs, mask=mask, other=0.0).to(tl.float32)
+        b = tl.load(B + r * HD + offs, mask=mask, other=0.0).to(tl.float32)
+        s = a + b
+        tl.store(SUM + r * HD + offs, s.to(OUT.dtype.element_ty), mask=mask)
+        var = tl.sum(s * s, axis=0) / HD
+        rr = 1.0 / tl.sqrt(var + eps)
+        w = tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
+        tl.store(OUT + r * HD + offs, (s * rr * w).to(OUT.dtype.element_ty),
+                 mask=mask)
+
+
+@torch.compiler.disable(recursive=True)
+def _fused_add_norm(residual, x, ln_weight, eps):
+    hd = residual.shape[-1]
+    rows = residual.numel() // hd
+    a = residual.reshape(rows, hd)
+    b = x.reshape(rows, hd)
+    out = torch.empty_like(a)
+    BLK = 2048 if hd <= 2048 else 4096
+    _add_norm_kernel[(rows,)](a, b, ln_weight, b, out,
+                              float(eps), HD=hd, BLK=BLK, num_warps=8)
+    return out.reshape(x.shape), b.reshape(x.shape)
+
+
+_orig_layer_fwd = None
+_layer_patched = False
+
+
+def _patched_layer_fwd(self, hidden_states, attention_mask=None,
+                       position_ids=None, past_key_values=None,
+                       use_cache=False, position_embeddings=None,
+                       **kwargs):
+    residual = hidden_states
+    hidden_states = self.input_layernorm(hidden_states)
+    hidden_states, _ = self.self_attn(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        use_cache=use_cache,
+        position_embeddings=position_embeddings,
+        **kwargs)
+    # fused: sum -> new residual, rmsnorm -> mlp input (in-place on the
+    # attention output buffer)
+    hidden_states, residual = _fused_add_norm(
+        residual, hidden_states, self.post_attention_layernorm.weight,
+        self.post_attention_layernorm.variance_epsilon)
+    hidden_states = self.mlp(hidden_states)
+    hidden_states = residual + hidden_states
+    return hidden_states
+
+
+def install_fused_add_norm():
+    """Replace LlamaDecoderLayer.forward with the fused add+norm
+    variant.  Returns True if installed."""
+    global _orig_layer_fwd, _layer_patched
+    if _layer_patched or not _HAS_TRITON or os.environ.get(
+            'IXRUN_FUSED_ADDNORM', '1') in ('', '0'):
+        return False
+    import sys
+
+    mo = sys.modules.get('transformers.models.llama.modeling_llama')
+    if mo is None or not hasattr(mo, 'LlamaDecoderLayer'):
+        return False
+    _orig_layer_fwd = mo.LlamaDecoderLayer.forward
+    mo.LlamaDecoderLayer.forward = _patched_layer_fwd
+    _layer_patched = True
+    return True
+
+
 def install_fast_decode_attention():
     """Route q_len==1 bf16 masked SDPA calls to the Triton kernel."""
     global _patched

@@ -21,7 +21,7 @@ __global__ void int8g_gemv_kernel(
     const int8_t* __restrict__ q,       // [out_f, in_f]
     const __half* __restrict__ scale,   // [out_f, n_gr]
     __nv_bfloat16* __restrict__ y,      // [out_f]
-    int n_gr, int out_f)
+    int n_gr, int out_f, int sdiv)
 {
     const int lane = threadIdx.x & 31;
     const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -29,12 +29,12 @@ __global__ void int8g_gemv_kernel(
         return;
     }
     const int8_t* row = q + (long long)r * n_gr * 16;
-    const __half* srow = scale + (long long)r * n_gr;
+    const __half* srow = scale + (long long)r * ((n_gr + sdiv) >> sdiv);
     float acc = 0.f;
     for (int jb = lane; jb < n_gr; jb += 32) {
         const uint4 v = *reinterpret_cast<const uint4*>(row + jb * 16);
         const __nv_bfloat16* x16 = x + jb * 16;
-        const float sc = __half2float(srow[jb]);
+        const float sc = __half2float(srow[jb >> sdiv]);
         const int8_t* b = reinterpret_cast<const int8_t*>(&v);
         float inner = 0.f;
         #pragma unroll
@@ -53,7 +53,7 @@ __global__ void int8g_gemv_kernel(
 }
 
 torch::Tensor gemv(torch::Tensor x, torch::Tensor q, torch::Tensor scale,
-                   int64_t out_f, int64_t in_f)
+                   int64_t out_f, int64_t in_f, int64_t sdiv)
 {
     const int n_gr = (int)(in_f / 16);
     const int wpb = 8;
@@ -66,14 +66,14 @@ torch::Tensor gemv(torch::Tensor x, torch::Tensor q, torch::Tensor scale,
         q.data_ptr<int8_t>(),
         reinterpret_cast<const __half*>(scale.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr()),
-        n_gr, (int)out_f);
+        n_gr, (int)out_f, (int)sdiv);
     return y;
 }
 """
 
 _CPP_SRC = """
 torch::Tensor gemv(torch::Tensor x, torch::Tensor q, torch::Tensor scale,
-                   int64_t out_f, int64_t in_f);
+                   int64_t out_f, int64_t in_f, int64_t sdiv);
 """
 
 _EXT = None
@@ -83,7 +83,7 @@ def _load():
     global _EXT
     if _EXT is None:
         _EXT = load_inline(
-            name='int8g_gemv_cuda_v1',
+            name='int8g_gemv_cuda_v2',
             cpp_sources=[_CPP_SRC],
             cuda_sources=[_CUDA_SRC],
             functions=['gemv'],
@@ -93,7 +93,7 @@ def _load():
     return _EXT
 
 
-def int8g_pack(W, g=16):
+def int8g_pack(W, g=32):
     """W [out, in] bf16 -> dict(q i8 [out,in], scale fp16 [out, in/g])."""
     of, inf = W.shape
     assert inf % g == 0
@@ -116,7 +116,8 @@ def int8g_decode_ref(pk):
 def int8g_gemv_cuda(x, pk):
     ext = _load()
     return ext.gemv(x.contiguous(), pk['q'].cuda(), pk['scale'].cuda(),
-                    pk['out_f'], pk['in_f'])
+                    pk['out_f'], pk['in_f'],
+                    1 if pk['g'] == 32 else 0)
 
 
 if __name__ == '__main__':

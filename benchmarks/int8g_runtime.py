@@ -25,8 +25,10 @@ class Int8GLinear(torch.nn.Module):
     def forward(self, x):
         if x.numel() == self.in_features:
             ext = _load()
-            return ext.gemv(x.reshape(-1), self.q, self.scale,
-                            self.out_features, self.in_features)
+            y = ext.gemv(x.reshape(-1), self.q, self.scale,
+                         self.out_features, self.in_features,
+                         1 if self.packed['g'] == 32 else 0)
+            return y.view(*x.shape[:-1], self.out_features)
         return torch.nn.functional.linear(x, self._dequant())
 
 
