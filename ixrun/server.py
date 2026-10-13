@@ -26,6 +26,23 @@ from .engine import Int8XEngine
 __all__ = ["create_app"]
 
 
+_EOS_MARKERS = ('<|im_end|>', '<|endoftext|>', '<|im_start|>',
+                '<|user|>', '<|assistant|>')
+
+
+def _clean(text: str) -> tuple[str, str]:
+    """Truncate at the first chat-control stop marker and report the
+    hit.  The engines decode the markers into the text AND keep
+    generating past them when the eos id set mismatches the chat
+    template, so stripping alone is not enough."""
+    cut = len(text)
+    for m in _EOS_MARKERS:
+        i = text.find(m)
+        if 0 <= i < cut:
+            cut = i
+    return text[:cut], cut < len(text)
+
+
 def _split_think(text: str) -> tuple[str, str]:
     """Return (reasoning, answer). Handles both explicit <think>...</think>
     blocks and prompt-side auto-opened blocks (output starts mid-thinking)."""
@@ -186,7 +203,7 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
 
         if not req.stream:
             with gen_lock:
-                text = eng.generate(prompt, **kw)
+                text, _ = _clean(eng.generate(prompt, **kw))
             reasoning, answer = _split_think(text)
             msg = {"role": "assistant", "content": answer}
             if reasoning:
@@ -231,8 +248,9 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
                             if req_obj.done.is_set():
                                 break
                             continue
-                        _, a_delta = splitter.feed(chunk)
-                        if a_delta:
+                        text, eos_hit = _clean(chunk)
+                        _, a_delta = splitter.feed(text)
+                        if a_delta and not eos_hit:
                             yield _sse_chunk(rid, created, req.model or model_id,
                                              content=a_delta)
                     yield _sse_chunk(rid, created, req.model or model_id,
@@ -248,8 +266,12 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
                 splitter = _ThinkSplitter(expect_think=expect_think)
                 it = eng.stream(prompt, **kw)
                 try:
+                    eos_hit = False
                     for chunk in it:
-                        r_delta, a_delta = splitter.feed(chunk)
+                        if eos_hit:
+                            break
+                        text, eos_hit = _clean(chunk)
+                        r_delta, a_delta = splitter.feed(text)
                         if a_delta:
                             yield _sse_chunk(rid, created, req.model or model_id,
                                              content=a_delta)
