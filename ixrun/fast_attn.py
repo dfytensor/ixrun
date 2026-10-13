@@ -336,6 +336,80 @@ def install_fused_add_norm():
     return True
 
 
+# ------------------------------------------------------------------ #
+# qwen3_5 (27B PY engines) variant: Qwen3_5RMSNorm is ZERO-CENTERED -
+# output = rmsnorm(x) * (1 + weight).  The (1+w) factor is precomputed
+# per layer at install time; the kernel math is otherwise the same.
+# ------------------------------------------------------------------ #
+def install_fused_add_norm_q35():
+    """Replace Qwen3_5DecoderLayer.forward with the fused add+norm
+    variant (zero-centered RMSNorm).  Returns True if installed."""
+    if not _HAS_TRITON or os.environ.get(
+            'IXRUN_FUSED_ADDNORM', '1') in ('', '0'):
+        return False
+    import sys
+    import types
+
+    mo = sys.modules.get('transformers.models.qwen3_5.modeling_qwen3_5')
+    if mo is None or not hasattr(mo, 'Qwen3_5DecoderLayer'):
+        return False
+    if getattr(mo.Qwen3_5DecoderLayer, '_fused_an', False):
+        return False
+
+    def _fwd(self, hidden_states, position_embeddings,
+             attention_mask=None, position_ids=None,
+             past_key_values=None, **kwargs):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        if self.block_type == 'linear_attention':
+            hidden_states = self.linear_attn(
+                hidden_states=hidden_states,
+                cache_params=past_key_values,
+                attention_mask=attention_mask, **kwargs)
+        else:
+            hidden_states, _ = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                position_embeddings=position_embeddings, **kwargs)
+        # fused: sum -> new residual (in-place on the attn output),
+        # rmsnorm * (1+w) -> mlp input
+        ln = self.post_attention_layernorm
+        hd = residual.shape[-1]
+        rows = residual.numel() // hd
+        a = residual.reshape(rows, hd)
+        b = hidden_states.reshape(rows, hd)
+        out = torch.empty_like(a)
+        BLK = 2048 if hd <= 2048 else (4096 if hd <= 4096 else 8192)
+        _add_norm_kernel[(rows,)](a, b, self._w1p, b, out,
+                                  float(ln.eps), HD=hd, BLK=BLK,
+                                  num_warps=8)
+        residual = b.reshape(residual.shape)
+        hidden_states = out.reshape(residual.shape)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+    cls = mo.Qwen3_5DecoderLayer
+    cls.forward = _fwd
+    cls._fused_an = True
+    # (1+w) buffers are built post-load by prep_q35_layers - building
+    # them in __init__ would capture the META/unloaded weight
+    return True
+
+
+def prep_q35_layers(model):
+    """(Re)build the (1+w) buffers from the LOADED weights."""
+    n = 0
+    for m in model.modules():
+        if type(m).__name__ == 'Qwen3_5DecoderLayer':
+            ln = m.post_attention_layernorm
+            m._w1p = (1.0 + ln.weight.data.float()).contiguous()
+            n += 1
+    return n
+
+
 def install_fast_decode_attention():
     """Route q_len==1 bf16 masked SDPA calls to the Triton kernel."""
     global _patched

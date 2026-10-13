@@ -35,15 +35,15 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_cuda_kernel(
     const __half* __restrict__ scale,        // [OUT_F * IN_F / 16]
     int OUT_F, int IN_F, int ULS)
 {
-    extern __shared__ float smem[];
-    float* x_sm = smem;                      // IN_F floats
-    float* cb_sm = smem + IN_F;              // 32 floats, sign-folded
+    // chunked-x staging (the C++ v2c design): staging the WHOLE x costs
+    // IN_F*4B of smem (17408 -> 69.6KB = 1 block/SM = 12.5% occupancy);
+    // 32-group-multiple chunks keep the per-lane order => bit-exact.
+    __shared__ float cb_sm[32];
+    __shared__ float x_sm[2048];             // 128 groups per chunk
     for (int i = threadIdx.x; i < 16; i += blockDim.x) {
         cb_sm[i] = -c_cb[i];                 // bit=0 -> negative
         cb_sm[i + 16] = c_cb[i];             // bit=1 -> positive
     }
-    for (int i = threadIdx.x; i < IN_F; i += blockDim.x)
-        x_sm[i] = __bfloat162float(x[i]);
     __syncthreads();
     int lane = threadIdx.x & 31;
     int r = blockIdx.x * WARPS + (threadIdx.x >> 5);
@@ -60,35 +60,45 @@ __global__ __launch_bounds__(WARPS * 32) void udcq_gemv_cuda_kernel(
         sstep = *reinterpret_cast<const float*>(urow + 4);
     }
     float acc = 0.f;
-    for (int g = lane; g < n_gr; g += 32) {
-        uint2 b2 = *reinterpret_cast<const uint2*>(irow + (size_t)g * 8);
-        uint32_t sw = (uint32_t)srow[g >> 1] >> (16 * (g & 1));
-        float sc = ULS ? exp2f(sbase + sstep * (float)urow[8 + g])
-                       : __half2float(crow[g]);
-        const float* xs = x_sm + (size_t)g * 16;
-        float xr[16];
-        #pragma unroll
-        for (int q = 0; q < 4; ++q)
-            *reinterpret_cast<float4*>(&xr[q * 4]) =
-                *reinterpret_cast<const float4*>(xs + q * 4);
-        float inner = 0.f;
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            int b = (int)((b2.x >> (8 * i)) & 0xFF);
-            int s0 = (int)((sw >> (2 * i)) & 1u) << 4;
-            int s1 = (int)((sw >> (2 * i + 1)) & 1u) << 4;
-            inner = fmaf(cb_sm[(b & 0xF) | s0], xr[2 * i], inner);
-            inner = fmaf(cb_sm[(b >> 4) | s1], xr[2 * i + 1], inner);
+    const int CG = 128;                      // groups per chunk
+    for (int g0 = 0; g0 < n_gr; g0 += CG) {
+        const int g1 = min(g0 + CG, n_gr);
+        for (int i = threadIdx.x; i < (g1 - g0) * 16; i += blockDim.x)
+            x_sm[i] = __bfloat162float(x[(size_t)(g0 * 16) + i]);
+        __syncthreads();
+        for (int g = g0 + lane; g < g1; g += 32) {
+            uint2 b2 = *reinterpret_cast<const uint2*>(
+                irow + (size_t)g * 8);
+            uint32_t sw = (uint32_t)srow[g >> 1] >> (16 * (g & 1));
+            float sc = ULS ? exp2f(sbase + sstep * (float)urow[8 + g])
+                           : __half2float(crow[g]);
+            const float* xs = x_sm + (size_t)(g - g0) * 16;
+            float xr[16];
+            #pragma unroll
+            for (int q = 0; q < 4; ++q)
+                *reinterpret_cast<float4*>(&xr[q * 4]) =
+                    *reinterpret_cast<const float4*>(xs + q * 4);
+            float inner = 0.f;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int b = (int)((b2.x >> (8 * i)) & 0xFF);
+                int s0 = (int)((sw >> (2 * i)) & 1u) << 4;
+                int s1 = (int)((sw >> (2 * i + 1)) & 1u) << 4;
+                inner = fmaf(cb_sm[(b & 0xF) | s0], xr[2 * i], inner);
+                inner = fmaf(cb_sm[(b >> 4) | s1], xr[2 * i + 1], inner);
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int b = (int)((b2.y >> (8 * i)) & 0xFF);
+                int s0 = (int)((sw >> (8 + 2 * i)) & 1u) << 4;
+                int s1 = (int)((sw >> (8 + 2 * i + 1)) & 1u) << 4;
+                inner = fmaf(cb_sm[(b & 0xF) | s0], xr[8 + 2 * i], inner);
+                inner = fmaf(cb_sm[(b >> 4) | s1], xr[8 + 2 * i + 1],
+                             inner);
+            }
+            acc += inner * sc;
         }
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            int b = (int)((b2.y >> (8 * i)) & 0xFF);
-            int s0 = (int)((sw >> (8 + 2 * i)) & 1u) << 4;
-            int s1 = (int)((sw >> (8 + 2 * i + 1)) & 1u) << 4;
-            inner = fmaf(cb_sm[(b & 0xF) | s0], xr[8 + 2 * i], inner);
-            inner = fmaf(cb_sm[(b >> 4) | s1], xr[8 + 2 * i + 1], inner);
-        }
-        acc += inner * sc;
+        __syncthreads();
     }
     #pragma unroll
     for (int o = 16; o; o >>= 1)
@@ -334,8 +344,9 @@ torch::Tensor gemv_cuda(torch::Tensor x, torch::Tensor idx,
                         int64_t uls) {
     auto y = torch::empty({out_f}, x.options());
     int grid = (out_f + WARPS - 1) / WARPS;
-    size_t sm = (size_t)in_f * sizeof(float) + 32 * sizeof(float);
-    udcq_gemv_cuda_kernel<<<grid, WARPS * 32, sm,
+    // chunked-x: static smem only (8.3KB) -> 3+ blocks/SM (the whole-x
+    // staging needed 69.6KB dynamic = 1 block/SM on down_proj shapes)
+    udcq_gemv_cuda_kernel<<<grid, WARPS * 32, 0,
                             at::cuda::getCurrentCUDAStream()>>>(
         (const __nv_bfloat16*)x.data_ptr(),
         (__nv_bfloat16*)y.data_ptr(),
@@ -363,7 +374,7 @@ def _load():
     global _EXT
     if _EXT is None:
         _EXT = load_inline(
-            name='udcq_gemv_cuda_v4',
+            name='udcq_gemv_cuda_v5',
             cpp_sources=['torch::Tensor gemv_cuda(torch::Tensor x, '
                          'torch::Tensor idx, torch::Tensor sign, '
                          'torch::Tensor scale, torch::Tensor cb, '

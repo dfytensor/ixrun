@@ -281,7 +281,24 @@ class Q38GraphEngine:
         apply_fla_kernels()
         apply_gdn_sequential_patch()
         _apply_static_attention()
+        # fused residual-add + rmsnorm at the attention->MLP boundary
+        # (zero-centered (1+w) RMSNorm variant); IXRUN_FUSED_ADDNORM=0
+        # reverts.  ~1.2ms/step of mean/pow/rsqrt/add kernel chains.
+        import os as _os
+
+        if _os.environ.get('IXRUN_FUSED_ADDNORM', '1') not in ('', '0'):
+            from .fast_attn import (install_fused_add_norm_q35,
+                                    prep_q35_layers)
+
+            if install_fused_add_norm_q35():
+                if verbose:
+                    print('[q38] fused add+norm patched', flush=True)
         m = _build_from_blob(blob_path, model_path, verbose=verbose)
+        from .fast_attn import prep_q35_layers
+
+        n = prep_q35_layers(m)
+        if verbose and n:
+            print(f'[q38] (1+w) buffers for {n} layers', flush=True)
         return cls(m, tokenizer, max_ctx=max_ctx, verbose=verbose)
 
     # ------------------------------------------------------------------ #
