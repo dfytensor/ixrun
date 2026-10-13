@@ -432,8 +432,15 @@ class Q38SpecEngine:
             self.out_h4.copy_(h)
             if self.greedy_only:
                 # argmax in-graph: no [1,4,V] logits buffer needed
-                # (-1.2GB); _verify only does the accept-length compare
+                # (-1.2GB); the accept compare is ALSO in-graph (the
+                # cumprod chain + L + the token ring) so the host only
+                # reads the pinned dec_gpu - kills the per-iter int()
+                # sync and 4-5 python-launched kernels.
                 self.a_buf.copy_(lg[0].argmax(dim=-1))
+                m = (self.a_buf[:TOK - 1] == self.tok_out[1:TOK])
+                cm = m.to(torch.long).cumprod(0)
+                self.dec_gpu[0] = cm.sum() + 1
+                self.dec_gpu[1:TOK + 1] = self.tok_out
             else:
                 self.out_l4.copy_(lg)
 
@@ -648,6 +655,8 @@ class Q38SpecEngine:
             self.g4dec.replay()
             if temp:
                 self._verify_temp(pend_cpu, temperature)
+            elif self.greedy_only:
+                pass   # the accept compare ran in-graph (g4dec_body)
             else:
                 self._verify(0.0, 1.0, 0)
             dec_pin.copy_(self.dec_gpu, non_blocking=True)
