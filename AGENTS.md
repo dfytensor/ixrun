@@ -696,3 +696,20 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   python on one box run (read 1.2 while the file said 0.9; a probe
   cmd with the same pattern propagated fine); forced in-script
   os.environ assignment as the workaround.  Root cause unidentified.
+
+## MTP round 2: the in-graph accept (2026/10/13 late, e822c77)
+- The greedy accept moved INTO g4dec_body (captured): kills the
+  per-iter int() hard sync + 4-5 python kernels.  en 32.4 -> 36.5
+  t/s (+13%) = within 3% of the C++ GREEDY engine; the PY spec is
+  now the fastest 27B config on this box.  zh flat (28.5): zh rolls
+  back 27/29 iters and the _fast_rollback state ring dominates.
+- The E ceiling is P1 (the one-step MTP accuracy ~0.57 en): the
+  measured E=2.09 = 1 + P1(1 + P2|1(...)) exactly; raising E means
+  touching the MTP weights, not inference-time code.
+- C++ spec port floor math (a dedicated session): the PY iter =
+  the mt4 25.6 + the GDN chunk ~14 + host; the C++ GDN core is 0.6
+  for the same tokens -> ~70 t/s at the SAME E.  Needs: the MTP
+  weights in C++ (fc = a 2H->H GEMV, one full-attn layer with
+  use_cache=False = the degenerate per-token attention = the
+  existing kernels, 3 norms, the shared lm_head), the chain graphs,
+  the rollback ring.
