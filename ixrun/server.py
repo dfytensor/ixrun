@@ -13,6 +13,7 @@ Run:
 """
 from __future__ import annotations
 import json
+import re
 import threading
 import time
 import uuid
@@ -43,6 +44,56 @@ def _clean(text: str) -> tuple[str, str]:
     return text[:cut], cut < len(text)
 
 
+_FUNC_RE = re.compile(r'<function name="([^"]+)">(.*?)</function>', re.S)
+_PARAM_RE = re.compile(
+    r'<param name="([^"]+)">(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</param>', re.S)
+_TC_JSON_RE = re.compile(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', re.S)
+
+
+def _parse_tool_calls(text: str) -> tuple[str, list[dict]]:
+    """Parse the chat-template tool-call formats into OpenAI tool_calls.
+    Returns (content_without_calls, calls)."""
+    calls = []
+    first = len(text)
+    for m in _FUNC_RE.finditer(text):
+        first = min(first, m.start())
+        args = {}
+        for pm in _PARAM_RE.finditer(m.group(2)):
+            v = pm.group(2)
+            try:
+                v = json.loads(v)
+            except Exception:
+                pass
+            args[pm.group(1)] = v
+        calls.append({
+            "id": "call_" + uuid.uuid4().hex[:8],
+            "type": "function",
+            "function": {"name": m.group(1),
+                         "arguments": json.dumps(args,
+                                                 ensure_ascii=False)},
+        })
+    for m in _TC_JSON_RE.finditer(text):
+        first = min(first, m.start())
+        try:
+            obj = json.loads(m.group(1))
+            fn = obj.pop("arguments", obj.pop("parameters", {}))
+            if isinstance(fn, str):
+                fn_s = fn
+            else:
+                fn_s = json.dumps(fn, ensure_ascii=False)
+            calls.append({
+                "id": "call_" + uuid.uuid4().hex[:8],
+                "type": "function",
+                "function": {"name": obj.get("name", ""),
+                             "arguments": fn_s},
+            })
+        except Exception:
+            pass
+    if not calls:
+        return text, []
+    return text[:first].strip(), calls
+
+
 def _split_think(text: str) -> tuple[str, str]:
     """Return (reasoning, answer). Handles both explicit <think>...</think>
     blocks and prompt-side auto-opened blocks (output starts mid-thinking)."""
@@ -57,13 +108,18 @@ def _split_think(text: str) -> tuple[str, str]:
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: str | None = None
+    tool_calls: list[dict] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[ChatMessage]
     stream: bool = False
+    tools: list[dict] | None = None
+    tool_choice: object | None = None
     max_tokens: int | None = Field(default=None, alias="max_tokens")
     max_completion_tokens: int | None = None
     temperature: float | None = None
@@ -126,16 +182,40 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
 
     def _prompt(req: ChatCompletionRequest) -> tuple[str, bool]:
         """Returns (prompt, expect_think)."""
-        msgs = [{"role": m.role, "content": m.content} for m in req.messages]
+        msgs = []
+        for m in req.messages:
+            d = {"role": m.role, "content": m.content}
+            if m.tool_calls:
+                # the template renders arguments as a DICT (.items());
+                # the OpenAI wire format is a JSON string - normalize
+                tcs = []
+                for tc in m.tool_calls:
+                    tc2 = dict(tc)
+                    fn = dict(tc2.get("function") or {})
+                    a = fn.get("arguments")
+                    if isinstance(a, str):
+                        try:
+                            fn["arguments"] = json.loads(a)
+                        except Exception:
+                            pass
+                    tc2["function"] = fn
+                    tcs.append(tc2)
+                d["tool_calls"] = tcs
+            if m.tool_call_id:
+                d["tool_call_id"] = m.tool_call_id
+            if m.name:
+                d["name"] = m.name
+            msgs.append(d)
+        tools = req.tools or None
         try:
             try:
                 p = eng.tokenizer.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=True,
-                    enable_thinking=enable_thinking,
+                    enable_thinking=enable_thinking, tools=tools,
                 )
             except TypeError:
                 p = eng.tokenizer.apply_chat_template(
-                    msgs, tokenize=False, add_generation_prompt=True
+                    msgs, tokenize=False, add_generation_prompt=True,
                 )
         except Exception:
             p = "".join(f"{m['role']}: {m['content']}\n" for m in msgs)
@@ -204,8 +284,14 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
         if not req.stream:
             with gen_lock:
                 text, _ = _clean(eng.generate(prompt, **kw))
-            reasoning, answer = _split_think(text)
-            msg = {"role": "assistant", "content": answer}
+            content, tcs = _parse_tool_calls(text)
+            reasoning, answer = _split_think(content)
+            msg = {"role": "assistant",
+                   "content": answer if answer else None}
+            finish = "stop"
+            if tcs:
+                msg["tool_calls"] = tcs
+                finish = "tool_calls"
             if reasoning:
                 msg["reasoning_content"] = reasoning
             return {
@@ -214,7 +300,7 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
                 "created": created,
                 "model": req.model or model_id,
                 "choices": [
-                    {"index": 0, "finish_reason": "stop", "message": msg}
+                    {"index": 0, "finish_reason": finish, "message": msg}
                 ],
                 "usage": {
                     "prompt_tokens": -1,
@@ -263,6 +349,27 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
 
         def sse():
             with gen_lock:
+                if req.tools:
+                    # tool calls are parsed on the COMPLETE text: buffer
+                    # the generation, emit one tool_calls delta + finish
+                    text, _ = _clean(eng.generate(prompt, **kw))
+                    content, tcs = _parse_tool_calls(text)
+                    reasoning, answer = _split_think(content)
+                    finish = "stop"
+                    if tcs:
+                        delta = {"tool_calls": [
+                            {**tc, "index": i}
+                            for i, tc in enumerate(tcs)]}
+                        finish = "tool_calls"
+                    else:
+                        delta = {"content": answer or ""}
+                    yield _sse_chunk(rid, created, req.model or model_id,
+                                     content=None, finish=None,
+                                     raw_delta=delta)
+                    yield _sse_chunk(rid, created, req.model or model_id,
+                                     content=None, finish=finish)
+                    yield "data: [DONE]\n\n"
+                    return
                 splitter = _ThinkSplitter(expect_think=expect_think)
                 it = eng.stream(prompt, **kw)
                 try:
@@ -299,8 +406,9 @@ def create_app(eng: Int8XEngine, model_id: str, enable_thinking: bool = False,
 
         return StreamingResponse(sse(), media_type="text/event-stream")
 
-    def _sse_chunk(rid, created, model, content=None, finish=None, usage=False):
-        delta = {}
+    def _sse_chunk(rid, created, model, content=None, finish=None,
+                   usage=False, raw_delta=None):
+        delta = raw_delta if raw_delta is not None else {}
         if content is not None:
             delta["content"] = content
         payload = {

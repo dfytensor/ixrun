@@ -431,7 +431,12 @@ class StepGraphEngine:
             # synchronous loop (MiniCPM5 steps are ~7ms, fine)
             self.hard_reset()
             first = self._first_token(ids)
-            eos = self.tokenizer.eos_token_id
+            eos_ids = {self.tokenizer.eos_token_id}
+            gc = getattr(self.model.config, "generation_config", None)
+            gids = getattr(gc, "eos_token_id", None) if gc else None
+            if gids is not None:
+                eos_ids |= {gids} if isinstance(gids, int) else set(gids)
+            eos = eos_ids
             out = [first]
             t = len(ids)
             while len(out) < max_new_tokens and t < self.max_ctx - 1:
@@ -443,7 +448,7 @@ class StepGraphEngine:
                     temperature=temperature if do_sample else 0.0,
                     top_p=top_p, top_k=top_k,
                     repetition_penalty=repetition_penalty, past_ids=out)
-                if nxt == eos:
+                if nxt in eos:
                     break
                 out.append(nxt)
                 t += 1
@@ -453,7 +458,12 @@ class StepGraphEngine:
         # WDDM device sync per period instead of per token).
         self.hard_reset()
         first = self._first_token(ids)          # single sync (prefill)
-        eos = self.tokenizer.eos_token_id
+        eos_ids = {self.tokenizer.eos_token_id}
+        gc = getattr(self.model.config, "generation_config", None)
+        gids = getattr(gc, "eos_token_id", None) if gc else None
+        if gids is not None:
+            eos_ids |= {gids} if isinstance(gids, int) else set(gids)
+        eos = eos_ids
         t = len(ids)
         nxt_g = torch.full((1,), first, dtype=torch.long, device='cuda')
         out_g = torch.zeros(max_new_tokens, dtype=torch.long, device='cuda')
@@ -478,8 +488,9 @@ class StepGraphEngine:
                 pin.copy_(out_g[n - period:n], non_blocking=True)
                 torch.cuda.synchronize()        # one sync per period
                 vals = pin.tolist()
-                if eos in vals:
-                    out.extend(vals[:vals.index(eos) + 1])
+                hit = [i for i, v in enumerate(vals) if v in eos]
+                if hit:
+                    out.extend(vals[:hit[0] + 1])
                     return out
                 out.extend(vals)
         r = n % period
@@ -488,8 +499,9 @@ class StepGraphEngine:
             pin2.copy_(out_g[n - r:n], non_blocking=True)
             torch.cuda.synchronize()
             vals = pin2.tolist()
-            if eos in vals:
-                vals = vals[:vals.index(eos) + 1]
+            hit = [i for i, v in enumerate(vals) if v in eos]
+            if hit:
+                vals = vals[:hit[0] + 1]
             out.extend(vals)
         return out
 
