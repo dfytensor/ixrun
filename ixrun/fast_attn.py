@@ -177,6 +177,82 @@ def attach_pos_tensor(pos):
     _pos_tensor = pos
 
 
+# ------------------------------------------------------------------ #
+# fused rotary application: one kernel per layer handles q AND k rows
+# (rotate_half via the partner-element load: rot[j] = x[(j+D/2)%D],
+# sign -1 on the low half) - replaces HF's 5-kernel mul/neg/cat/add
+# chain per tensor (~0.3ms/step on the 1B).
+# ------------------------------------------------------------------ #
+if _HAS_TRITON:
+
+    @triton.jit
+    def _rope_qk_kernel(Q, K, COS, SIN, NQ, S,
+                        sq_h, sq_s, sk_h, sk_s,
+                        HD: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = tl.arange(0, HD)
+        half: tl.constexpr = HD // 2
+        if pid < NQ:
+            h = pid // S
+            s = pid % S
+            base = Q + h * sq_h + s * sq_s
+        else:
+            r = pid - NQ
+            h = r // S
+            s = r % S
+            base = K + h * sk_h + s * sk_s
+        c = tl.load(COS + s * HD + offs).to(tl.float32)
+        sn = tl.load(SIN + s * HD + offs).to(tl.float32)
+        row = tl.load(base + offs).to(tl.float32)
+        row_p = tl.load(base + ((offs + half) % HD)).to(tl.float32)
+        sign = tl.where(offs < half, -1.0, 1.0)
+        out = row * c + row_p * sign * sn
+        tl.store(base + offs, out.to(Q.dtype.element_ty))
+
+
+_orig_rope = None
+_rope_patched = False
+
+
+@torch.compiler.disable(recursive=True)
+def _fused_apply_rotary(q, k, cos, sin, position_ids=None,
+                        unsqueeze_dim=1):
+    if (q.shape[0] != 1 or q.dtype != torch.bfloat16
+            or not q.is_cuda or not k.is_cuda or not cos.is_cuda):
+        return _orig_rope(q, k, cos, sin, position_ids, unsqueeze_dim)
+    B, H, S, D = q.shape
+    kvh = k.shape[1]
+    c2 = cos[0] if cos.dim() == 3 else cos.reshape(
+        cos.shape[1], cos.shape[-1])
+    s2 = sin[0] if sin.dim() == 3 else sin.reshape(
+        sin.shape[1], sin.shape[-1])
+    # in-place on the ORIGINAL 4-D tensors (stride-addressed rows;
+    # reshape would copy non-contiguous q and orphan the stores)
+    _rope_qk_kernel[(B * (H + kvh) * S,)](
+        q, k, c2, s2, B * H * S, S,
+        q.stride(1), q.stride(2), k.stride(1), k.stride(2),
+        HD=D, num_warps=1)
+    return q, k
+
+
+def install_fused_rope():
+    """Replace modeling_llama.apply_rotary_pos_emb with the fused
+    Triton kernel (in-place).  Returns True if installed."""
+    global _orig_rope, _rope_patched
+    if _rope_patched or not _HAS_TRITON or os.environ.get(
+            'IXRUN_FUSED_ROPE', '1') in ('', '0'):
+        return False
+    import sys
+
+    mo = sys.modules.get('transformers.models.llama.modeling_llama')
+    if mo is None or not hasattr(mo, 'apply_rotary_pos_emb'):
+        return False
+    _orig_rope = mo.apply_rotary_pos_emb
+    mo.apply_rotary_pos_emb = _fused_apply_rotary
+    _rope_patched = True
+    return True
+
+
 def install_fast_decode_attention():
     """Route q_len==1 bf16 masked SDPA calls to the Triton kernel."""
     global _patched

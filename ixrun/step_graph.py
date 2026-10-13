@@ -171,11 +171,12 @@ class StepGraphEngine:
         # quantize lm_head with the UDCQ stream path (fused decode+GEMV
         # over packed streams): the cublas bf16 gemv costs ~0.47ms/step
         # (vocab 130560 x 1536 = 0.4GB reads), the fused kernel ~0.2ms
-        # and -0.26GB VRAM.  27B ships the same way (int8 embed/lm_head).
-        # IXRUN_Q_LMHEAD=0 reverts.  Skipped for the bf16 (lossless)
-        # codec: that tier exists precisely to be bit-exact.
+        # and -0.26GB VRAM.  The 27B ships the same way (int8
+        # embed/lm_head); llama.cpp's BF16X tier quantizes the lm_head
+        # too.  Only the pure bf16 lossless codec skips it.
+        # IXRUN_Q_LMHEAD=0 reverts.
         lm = getattr(model, 'lm_head', None)
-        if (codec not in ('bf16', 'bf16xl') and type(lm).__name__
+        if (codec != 'bf16' and type(lm).__name__
                 == 'Linear' and lm.weight.numel() > 1_000_000
                 and os.environ.get('IXRUN_Q_LMHEAD', '1')
                 not in ('', '0')):
@@ -293,6 +294,62 @@ class StepGraphEngine:
                     print(f'[step-graph] pos-attention mode '
                           f'(mask build skipped on {_n} hooks)',
                           flush=True)
+        # cached rotary: HF rebuilds cos/sin (matmul + cat + cos/sin
+        # chains) every step = ~0.27ms of clone/expand kernels; build the
+        # full [max_ctx, hd] tables ONCE and leave a positional gather
+        # (bit-identical: the table IS the original forward's output).
+        # IXRUN_CACHED_ROPE=0 reverts.
+        if os.environ.get('IXRUN_CACHED_ROPE', '1') not in ('', '0'):
+            import types as _types
+
+            _nr = 0
+            for _m in self.model.modules():
+                if type(_m).__name__ == 'LlamaRotaryEmbedding' \
+                        and hasattr(_m, 'inv_freq'):
+                    _ids = torch.arange(max_ctx, device=dev).view(1, -1)
+                    _xb = torch.zeros(1, 8, device=dev,
+                                      dtype=torch.bfloat16)
+                    _cos, _sin = _m.forward(_xb, _ids)
+                    _m._cos_cache = _cos[0].contiguous()
+                    _m._sin_cache = _sin[0].contiguous()
+
+                    def _rope_fwd(self, x, position_ids):
+                        idx = position_ids.reshape(-1)
+                        return (self._cos_cache[idx].unsqueeze(0),
+                                self._sin_cache[idx].unsqueeze(0))
+
+                    _m.forward = _types.MethodType(_rope_fwd, _m)
+                    _nr += 1
+            if verbose and _nr:
+                print(f'[step-graph] cached rope on {_nr} modules',
+                      flush=True)
+        # fused rotary application: one Triton kernel per layer replaces
+        # HF's 5-kernel mul/neg/cat/add chain per tensor (~0.3ms/step).
+        # IXRUN_FUSED_ROPE=0 reverts.
+        if os.environ.get('IXRUN_FUSED_ROPE', '1') not in ('', '0'):
+            from .fast_attn import install_fused_rope
+
+            if install_fused_rope() and verbose:
+                print('[step-graph] fused rope application', flush=True)
+
+        # install the UDCQ codebook EXPLICITLY once, before any graph
+        # capture: the ext kernels read the __constant__ c_cb staged by
+        # install_codebook ("call ONCE outside any graph capture").
+        # Relying on the lazy per-forward install leaks a memcpy into
+        # the capture (the _cb_installed flag does not survive across
+        # the warmup/capture module instances) and the lm_head decoded
+        # with a stale codebook -> '<s>' degeneration.
+        from .udcq import UdcqLinear as _Udcq, _cuda_gemv_mod as _cgm
+
+        _um = [m for m in self.model.modules()
+               if isinstance(m, _Udcq)]
+        if _um and os.environ.get('UDCQ_CUDA_GEMV', '1') not in ('', '0'):
+            _cg = _cgm()
+            _cg.install_codebook(_um[0]._cb.float().contiguous())
+            _cg._cb_installed = True
+            if verbose:
+                print(f'[step-graph] codebook staged for '
+                      f'{len(_um)} UdcqLinear modules', flush=True)
 
         # warmup on a side stream then capture the full decode step
         if verbose:
