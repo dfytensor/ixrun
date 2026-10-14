@@ -80,7 +80,7 @@ def _build_engine(args):
         from .step_graph import StepGraphEngine
 
         return StepGraphEngine.from_pretrained(
-            args.model, codec=args.codec, verbose=True)
+            args.model, codec=args.codec, max_ctx=mctx, verbose=True)
     if getattr(args, "mode", None) == "cpp-gsq":
         from .cpp_engine import CppGsqEngine
 

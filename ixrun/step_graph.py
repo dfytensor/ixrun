@@ -471,16 +471,38 @@ class StepGraphEngine:
         out_g = torch.zeros(max_new_tokens, dtype=torch.long, device='cuda')
         period = min(sync_period, max_new_tokens)
         pin = torch.zeros(period, dtype=torch.long, pin_memory=True)
-        out = []
+        out = [first]          # the prefill argmax IS the first generated
         n = 0
-        while n < max_new_tokens and t < self.max_ctx - 1:
+        while n < max_new_tokens - 1 and t < self.max_ctx - 1:
             self.in_ids.copy_(nxt_g.view(1, 1))
             self.pos.fill_(t)
             self.graph.replay()
-            if temperature and temperature > 0:
-                probs = F.softmax(self.logits[:, -1].float() / temperature,
-                                  dim=-1)
-                torch.multinomial(probs, 1, out=nxt_g)
+            if temperature and temperature > 0 or top_p < 1.0 \
+                    or top_k > 0:
+                # on-GPU sampling (temp + top-k + nucleus): the logits
+                # row NEVER leaves the device - the CPU sampling path
+                # costs a full-vocab D2H copy per token (~65ms on WDDM)
+                lg = self.logits[:, -1].float()
+                if top_k and top_k > 0:
+                    k = min(top_k, lg.shape[-1])
+                    vals = torch.topk(lg, k).values
+                    lg = torch.where(
+                        lg >= vals[..., -1:],
+                        lg, torch.tensor(float('-inf'), device=lg.device))
+                if top_p < 1.0:
+                    sorted_l, order = torch.sort(lg, descending=True)
+                    cum = torch.cumsum(
+                        torch.softmax(sorted_l, dim=-1), dim=-1)
+                    keep = cum <= top_p
+                    keep[..., 0] = True
+                    mask = torch.zeros_like(lg, dtype=torch.bool)
+                    mask.scatter_(-1, order, keep)
+                    lg = torch.where(
+                        mask, lg,
+                        torch.tensor(float('-inf'), device=lg.device))
+                if temperature and temperature > 0:
+                    lg = lg / temperature
+                torch.multinomial(F.softmax(lg, dim=-1), 1, out=nxt_g)
             else:
                 torch.argmax(self.logits[:, -1], out=nxt_g)
             out_g[n] = nxt_g

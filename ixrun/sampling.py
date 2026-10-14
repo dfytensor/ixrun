@@ -19,9 +19,17 @@ def needs_sampling(do_sample: bool, temperature: float, top_p: float,
                    top_k: int, repetition_penalty: float,
                    presence_penalty: float = 0.0,
                    frequency_penalty: float = 0.0) -> bool:
-    return bool(do_sample and temperature > 0) or top_p < 1.0 \
-        or top_k > 0 or repetition_penalty != 1.0 \
-        or presence_penalty != 0.0 or frequency_penalty != 0.0
+    """Greedy (temperature==0, do_sample=False) NEVER needs the CPU
+    sampling path: top_p/top_k do not affect argmax, so a server-side
+    top_p default must not demote every request to the per-token
+    full-vocab D2H copy.  The penalties DO reshape the argmax -> they
+    stay triggers."""
+    if do_sample and temperature > 0:
+        return True
+    if temperature and temperature > 0:
+        return True
+    return (repetition_penalty != 1.0 or presence_penalty != 0.0
+            or frequency_penalty != 0.0)
 
 
 def gpu_sample_token(logits1, temperature: float = 0.0, top_p: float = 1.0,
