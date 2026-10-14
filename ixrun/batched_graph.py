@@ -259,14 +259,21 @@ class BatchedGraphEngine:
             attn[i, L - li:] = 1
         pos = attn.cumsum(-1) - 1
         pos.clamp_(min=0)
-        # the EXPLICIT 4-D mask (the causal + the pads): the
-        # pos-attention install stubs create_causal_mask globally, so
-        # the batched prefill cannot rely on the HF mask machinery
-        mask4 = torch.zeros((B, 1, L, L), dtype=torch.bfloat16,
-                            device='cuda')
-        mask4.masked_fill_(attn[:, None, None, :] == 0, float('-inf'))
-        pm = pos[:, None, :] > pos[:, :, None]     # the key after the query
-        mask4.masked_fill_(pm[:, None, :, :], float('-inf'))
+        # the EXPLICIT FULL-WIDTH mask [B, 1, L, max_ctx]: the StaticCache
+        # update returns the full-width KV (8192 slots), so the mask
+        # must cover it - the causal band + the pads open, everything
+        # else (the zero slots + the pads) blocked.  The pos-attention
+        # install stubs create_causal_mask globally, so the batched
+        # prefill cannot rely on the HF mask machinery.
+        valid = (pos[:, :, None] <= pos[:, -1:, None]) & \
+                (attn[:, None, :] > 0)
+        mask4 = torch.full((B, 1, L, self.max_ctx), float('-inf'),
+                           dtype=torch.bfloat16, device='cuda')
+        mask4[..., :L] = torch.where(valid, torch.zeros_like(valid,
+                                                             dtype=torch.bfloat16),
+                                     torch.full_like(valid, float('-inf'),
+                                                     dtype=torch.bfloat16)
+                                     )[:, None]
         # the eager batched prefill into the batched cache
         out = eng.model(input_ids=inp, attention_mask=mask4,
                         position_ids=pos, past_key_values=eng.bcache,
