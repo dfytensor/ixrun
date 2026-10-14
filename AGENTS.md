@@ -822,3 +822,25 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   defaults are the identity).  One graph serves EVERY config.
 - do_sample probabilistic requests still take the python loop
   (IXRUN_GRAPH_SAMPLE=0 reverts everything).
+
+## The batching core investigated (2026/10/14 late)
+- BatchedGreedyGenerator is broken at its OWN layer, not just the
+  custom-module interaction: with EVERY custom patch disabled (the
+  vanilla HF stack) the batched decode yields exactly ONE token
+  (<think>) per request then stops; with the custom stack it yields
+  EMPTY.  The chat template must be rendered by the CALLER (the
+  server does; the raw-text repro gives garbage) AND the core eos
+  set = {tokenizer.eos, pad} misses <|im_end|> (130073) - but the
+  1-token stop persists after both fixes, so the core step loop
+  itself is the bug (the left-pad + DynamicCache + the HF 5.15 API
+  drift suspects).  A REWRITE, not a patch: the modern replacement
+  would capture the BATCHED forward as a graph (the self-feeding
+  pattern generalizes: B rows in-graph, the per-row sampling
+  in-graph, the per-row eos counters) - the same architecture as the
+  single-request sampling graph at B=8, reusing the proven capture
+  rules (scatter_ only, no sort, the full-body warmup).
+- Meanwhile the SHIPPED concurrency = the serialized gen_lock which
+  the in-graph sampling made 6x faster: 6 concurrent clients in
+  1.0s wall (0.16s/req at max_tokens 24) vs 10.7s the day before.
+  The economics of true batching remain proven (3.5x at B>=8) but
+  the rewrite bar is a session, not a patch.
