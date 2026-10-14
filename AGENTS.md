@@ -757,3 +757,22 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   one launch) + the penalties move on-GPU (the CPU sampling path
   retires).  Do NOT reopen without the in-kernel gmax/denom dump
   vs the torch first.
+
+## Sampling fast path (2026/10/14, 300af17): served sampled decode 134 -> 262 tok/s
+- The per-token sampling ran ~12 FULL-VOCAB kernels (the 130k sort
+  ~2-4ms + the multinomial ~1ms) = ~8.7ms/token of the served
+  overhead.  Replacement: everything within a top-1024 subset
+  (topk -> temp -> the sort/cumsum within 1024 -> the nucleus + the
+  top-k mask -> the Gumbel-max pick).  The Gumbel-max IS an exact
+  categorical sample.  ~0.5ms/token.  No host coverage sync (the
+  top-1024 truncation at top_p <= 0.95 is statistically negligible;
+  documented).
+- Server round-trip (the official 0.9/0.95): 30/60/120-token
+  requests = 219/256/262 tok/s.  The gap to the direct greedy
+  (312-384) = the sampling launches + the HTTP/SSE.
+- The WIP fused kernel (sample_fused) remains parked: its payoff
+  (8.7 -> 0.15ms) is now mostly captured by the subset trick (8.7 ->
+  ~0.5ms) - the reopen bar is higher.
+- Still on the CPU path: repetition/presence/frequency penalties
+  (the GPU version needs the counts scatter + the in-kernel logits
+  adjust - fold it into the parked kernel or a small standalone).
