@@ -732,3 +732,28 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   the serialized path and 'Berlin' in the batched path (different
   kernel rounding) - a 1B knowledge error near the tie, NOT a
   quantization issue (the tier is lossless).
+
+## Fused sampling kernel: WIP parked (2026/10/14)
+- experiments/sample_fused/: ONE-kernel penalties+top-k+top-p+temp+
+  softmax+multinomial (v6).  Greedy+penalties = EXACT vs the torch
+  reference; 33us/launch isolated.  The SAMPLING path is NOT correct:
+  u reads negative with a positive total, thr/total alternate by the
+  curand subsequence parity, supp=1.  Verified-not-the-cause: the
+  int/float s_bins, the pass-3 per-thread walk (replaced with the
+  correct exclusive-prefix-scan walk), the smem sizes, the stale
+  binary (v6 rebuilt clean, float out).  REMAINING SUSPECTS: the
+  block reduction (fixed once but the symptom persisted -> re-verify
+  gmax in-kernel vs torch), the curand_init/Philox in a
+  fast_math TU, or an smem alias the compiler hid.  Debug protocol
+  that works: the float out[4] dump (tok/thr/u/total), the python
+  mimic of the threshold logic (the logic IS sound: 93k tokens pass
+  the hist path at the wide test distribution).
+- The SHIPPED path stays: the torch-op GPU sampling in step_graph
+  (_gen_tokens): the top-k mask + the sort/nucleus + the multinomial
+  on-device (~10 launches, 8.7ms/tok served overhead) - the server
+  round-trip 15 -> 134 tok/s after the needs_sampling routing fix.
+- The fused kernel payoff when finished: the sampling overhead
+  8.7ms -> ~0.15ms per token (the L2-resident row, 3 passes,
+  one launch) + the penalties move on-GPU (the CPU sampling path
+  retires).  Do NOT reopen without the in-kernel gmax/denom dump
+  vs the torch first.
