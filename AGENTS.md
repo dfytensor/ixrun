@@ -776,3 +776,49 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
 - Still on the CPU path: repetition/presence/frequency penalties
   (the GPU version needs the counts scatter + the in-kernel logits
   adjust - fold it into the parked kernel or a small standalone).
+
+## Sampling fast path (2026/10/14, 300af17): served sampled decode 134 -> 262 tok/s
+- The per-token sampling ran ~12 FULL-VOCAB kernels (the 130k sort
+  ~2-4ms + the multinomial ~1ms) = ~8.7ms/token of the served
+  overhead.  Replacement: everything within a top-1024 subset
+  (topk -> temp -> the sort/cumsum within 1024 -> the nucleus + the
+  top-k mask -> the Gumbel-max pick).  The Gumbel-max IS an exact
+  categorical sample.  ~0.5ms/token.  No host coverage sync (the
+  top-1024 truncation at top_p <= 0.95 is statistically negligible;
+  documented).
+- Server round-trip (the official 0.9/0.95): 30/60/120-token
+  requests = 219/256/262 tok/s.  The gap to the direct greedy
+  (312-384) = the sampling launches + the HTTP/SSE.
+- The WIP fused kernel (sample_fused) remains parked: its payoff
+  (8.7 -> 0.15ms) is now mostly captured by the subset trick (8.7 ->
+  ~0.5ms) - the reopen bar is higher.
+- Still on the CPU path: repetition/presence/frequency penalties
+  (the GPU version needs the counts scatter + the in-kernel logits
+  adjust - fold it into the parked kernel or a small standalone).
+
+## The SELF-FEEDING SAMPLING GRAPH (2026/10/14 late, 8e31c9a): 6x the
+## concurrent throughput, WDDM-noise-immune
+- The python sampling (even the top-1024 subset) = ~13 python
+  launches per token; a loaded WDDM desktop swings the submission
+  cost 10-30x (the same hour: 3.6ms/tok -> 25ms/tok).  The fix is
+  structural: the Gumbel-max sampling over the top-1024 CAPTURED
+  with the forward into a second shared-pool graph.  The graph READS
+  nxt_g as its input and writes the pick back - the self-feeding
+  loop; the host per token = pos.fill_ + one replay.  Concurrent x6:
+  1.0s wall (was 10.7s).
+- Capture-safe bisected findings (each verified in isolation):
+  - device-indexed tensor[idx] = x writes BREAK the capture
+    (use scatter_/gather)
+  - fill_(0-dim CUDA tensor) = a hidden D2H sync -> BREAKS it
+    (use gather + copy_)
+  - torch.sort BREAKS it (the 4096-bin histogram nucleus instead)
+  - the warmup MUST run the FULL body before the capture (the
+    kernel selection/workspace allocs during a capture invalidate it)
+  - the readback trigger = an ITERATION counter (len(out) % period
+    never fires - out is static between readbacks -> the loop ran to
+    max_ctx, 27s/request)
+- The greedy = the SAME graph with temp clamped to 1e-6 (the exact
+  argmax); the penalties unconditionally applied in-graph (the
+  defaults are the identity).  One graph serves EVERY config.
+- do_sample probabilistic requests still take the python loop
+  (IXRUN_GRAPH_SAMPLE=0 reverts everything).
