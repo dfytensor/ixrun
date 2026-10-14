@@ -215,11 +215,29 @@ _rope_patched = False
 
 
 @torch.compiler.disable(recursive=True)
-def _fused_apply_rotary(q, k, cos, sin, position_ids=None,
-                        unsqueeze_dim=1):
-    if (q.shape[0] != 1 or q.dtype != torch.bfloat16
-            or not q.is_cuda or not k.is_cuda or not cos.is_cuda):
-        return _orig_rope(q, k, cos, sin, position_ids, unsqueeze_dim)
+def _fused_apply_rotary(*args, **kw):
+    # the signature-agnostic passthrough: the HF versions differ on
+    # the positional tail (the position_ids dropped in 5.15)
+    if (len(args) >= 4 and args[0].dim() == 4
+            and args[0].shape[0] == 1 and args[0].shape[2] == 1
+            and args[0].dtype == torch.bfloat16 and args[0].is_cuda
+            and args[2].is_cuda):
+        return _s1_rope_fast(args[0], args[1], args[2], args[3])
+    return _orig_rope(*args, **kw)
+
+
+def _s1_rope_fast(q, k, cos, sin):
+    cos2 = cos[0] if cos.dim() == 3 else cos.reshape(
+        cos.shape[1], cos.shape[-1])
+    sin2 = sin[0] if sin.dim() == 3 else sin.reshape(
+        sin.shape[1], sin.shape[-1])
+    B, H, S, D = q.shape
+    kvh = k.shape[1]
+    _rope_qk_kernel[(B * (H + kvh) * S,)](
+        q, k, cos2, sin2, B * H * S, S,
+        q.stride(1), q.stride(2), k.stride(1), k.stride(2),
+        HD=D, num_warps=1)
+    return q, k
     B, H, S, D = q.shape
     kvh = k.shape[1]
     c2 = cos[0] if cos.dim() == 3 else cos.reshape(
