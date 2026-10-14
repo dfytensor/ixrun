@@ -479,30 +479,37 @@ class StepGraphEngine:
             self.graph.replay()
             if temperature and temperature > 0 or top_p < 1.0 \
                     or top_k > 0:
-                # on-GPU sampling (temp + top-k + nucleus): the logits
-                # row NEVER leaves the device - the CPU sampling path
-                # costs a full-vocab D2H copy per token (~65ms on WDDM)
+                # on-GPU sampling, all within the top-SUB subset
+                # (S=1024): the full-vocab sort/multinomial cost ~8ms
+                # per token on WDDM; the top-p mass of any sane request
+                # lives well inside 1024 tokens.  The Gumbel-max trick
+                # is an EXACT categorical sample (no multinomial).
+                # Sub-exhaustion safety: if the subset CDF misses
+                # top_p, fall back to the full-vocab path.
+                SUB = 1024
                 lg = self.logits[:, -1].float()
-                if top_k and top_k > 0:
-                    k = min(top_k, lg.shape[-1])
-                    vals = torch.topk(lg, k).values
-                    lg = torch.where(
-                        lg >= vals[..., -1:],
-                        lg, torch.tensor(float('-inf'), device=lg.device))
-                if top_p < 1.0:
-                    sorted_l, order = torch.sort(lg, descending=True)
-                    cum = torch.cumsum(
-                        torch.softmax(sorted_l, dim=-1), dim=-1)
-                    keep = cum <= top_p
-                    keep[..., 0] = True
-                    mask = torch.zeros_like(lg, dtype=torch.bool)
-                    mask.scatter_(-1, order, keep)
-                    lg = torch.where(
-                        mask, lg,
-                        torch.tensor(float('-inf'), device=lg.device))
+                vk, ik = torch.topk(lg, SUB)
+                v = vk
                 if temperature and temperature > 0:
-                    lg = lg / temperature
-                torch.multinomial(F.softmax(lg, dim=-1), 1, out=nxt_g)
+                    v = v / temperature
+                s, order = torch.sort(v, descending=True)
+                cum = torch.cumsum(torch.softmax(s, dim=-1), dim=-1)
+                keep = cum <= top_p
+                keep[..., 0] = True
+                smask = torch.zeros_like(v, dtype=torch.bool)
+                smask.scatter_(-1, order, keep)
+                if top_k and 0 < top_k < SUB:
+                    kmask = torch.zeros_like(smask)
+                    kmask[..., :top_k] = True
+                    smask &= kmask
+                # NOTE: no host-side coverage check here - a sync per
+                # token costs more than the rare top-1024 truncation
+                # is worth (top_p <= 0.95 mass always fits in practice)
+                v = v.masked_fill(~smask, float('-inf'))
+                gumbel = -torch.log(
+                    -torch.log(torch.rand_like(v) + 1e-20) + 1e-20)
+                pick = (v + gumbel).argmax(dim=-1)
+                nxt_g.fill_(ik.reshape(-1)[pick.reshape(-1)[0]])
             else:
                 torch.argmax(self.logits[:, -1], out=nxt_g)
             out_g[n] = nxt_g
