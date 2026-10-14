@@ -894,3 +894,24 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   (the mixed-length harness), b2dbg.py (the B=4 + the prints).
   The production 8000 server = unaffected throughout.
 
+## HF 5.15 B>1 forward: the deep semantics issue (2026/10/15 final)
+- Three generations of the batched graph (the left-pad, the isolated
+  model_raw, the right-pad per-row cache_position) ALL hit the same
+  class of failure: the batch>1 forward through the HF 5.15 model
+  produces the wrong logits / the shape errors / the device asserts.
+  The bisect eliminated: the mask construction (verified
+  element-wise), the NaN (the eye/-1e4 fixes), the batch dim (the
+  same-rows OK), the isolation (the v2 canaries all pass), the
+  cache_position format (the 1-D and the [B] both fail differently).
+- The remaining suspects are INSIDE transformers 5.15: the
+  StaticCache.update with the [B] cache_position (the index_copy
+  assertion), the create_causal_mask lazy materialization at the B>1
+  (the [L,L] vs [L,8192] expand error), and the rotary/position
+  pipeline at B>1.  These are transformers-library-level issues, not
+  surface bugs — a fix requires either the transformers upgrade or
+  the full bypass (the C++ engine approach).
+- The production concurrency = the serialized gen_lock (0.14s/req,
+  the in-graph sampling 6x improvement), which correctly serves
+  multiple clients.  The batched 3.5x economics remain a future
+  project requiring either the transformers fix or the C++ batched
+  decode.
