@@ -870,3 +870,27 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   separation); (3) the row-prefill <s> probe as the poison canary;
   (4) then the correctness gates.  The economics (3.5x at B>=8)
   remain proven - this is an isolation bug, not a wall.
+
+## Batched self-feed: the layer-0 explosion bisect final (2026/10/15 late)
+- The layer-0 hook microscope: the LEFT-PAD batched prefill's REAL
+  lanes diverge AT LAYER 0 (82) and EXPLODE through the depth (2950+
+  by layer 19); the batch=8 same-rows = the batch dim innocent; the
+  row0 prefill logits = 36352 (the sane ~20) = THE HIDDEN EXPLOSION.
+- The mask is built correctly (the causal+pad, verified element-wise);
+  the eye fix (the pad queries attend themselves, killing the
+  all-masked-row NaN) did NOT change the divergence; -1e4 finite
+  negatives also did not.  The remaining suspects: the RoPE positions
+  of the PAD lanes (the clamped 0,0,0 + the duplicated positions 0
+  across the pads and the real0) interacting with the explicit mask
+  kernel, or the StaticCache full-width KV [8192] x the [19] query
+  slice = the masked-column handling in the mem-efficient kernel.
+- THE CORRECT ISOLATION VERIFIED: the v2 batched graph (the
+  model_raw + the own buffers) does NOT poison the engine (the
+  canaries pre/during/post all identical) - the v1 wall = SOLVED by
+  the isolation; the remaining = the pure batched-forward
+  correctness, a self-contained debug.
+- The reopen assets: leftpad.py (the [1,19] repro, the batch=1
+  enough!), layerhook.py (the per-layer microscope), prefvar.py
+  (the mixed-length harness), b2dbg.py (the B=4 + the prints).
+  The production 8000 server = unaffected throughout.
+
