@@ -915,3 +915,21 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   multiple clients.  The batched 3.5x economics remain a future
   project requiring either the transformers fix or the C++ batched
   decode.
+
+## B>1 forward: the fundamental GQA/SDPA limitation confirmed (2026/10/15 final-final)
+- The minimal test (the [2,1] forward, no cache, no mask, no patches)
+  crashes inside the HF 5.15 attention: the SDPA mem-efficient kernel
+  does not support the GQA broadcast when the batch > 1 and the
+  attention_mask is None.  The error: "Expected size for first two
+  dimensions of batch2 tensor to be: [32, 2] but got: [32, 1]"
+  (32 = B*num_heads, 2 = num_kv_heads vs 1 = the missing repeat).
+- This is a transformers 5.15 library limitation, not a patchable
+  surface bug.  The fix requires either: (a) the transformers
+  upgrade, (b) the explicit repeat_kv before the SDPA (the HF
+  internal change), or (c) the full bypass (the custom decoder).
+- The three batched graph generations (the left-pad, the isolated,
+  the right-pad) all implicitly depended on this working.  The
+  production serialized mode is unaffected (B=1).
+- The economics: the serialized 0.14s/req x 6 clients = the served
+  throughput already improved 6x by the in-graph sampling.  The
+  true batching 3.5x = a future C++ engine project.
