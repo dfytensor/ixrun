@@ -170,7 +170,8 @@ class BatchedGraphEngine:
         self.gen_buf.view(-1).scatter_(0, flat.reshape(-1),
                                       self.nxt)
         self.n_gen += 1
-        self.eos_hit += self.eos_mask.gather(0, self.nxt).sum()
+        self.n_dev += 1
+        self.eos_hit += self.eos_mask.gather(0, self.nxt)
         self.active = self.active * (
             1.0 - (self.eos_hit > 0).float()) * (
             (self.n_gen < self.max_new_g).float())
@@ -232,63 +233,56 @@ class BatchedGraphEngine:
     @torch.no_grad()
     def run_cohort(self, reqs, period: int = 8):
         """reqs: list[CohortRequest] (len <= B).  The cohort runs to
-        completion (the dummy rows pad to the FULL B: the StaticCache
-        update requires the exact batch).  The per-row outputs land in
-        req.out_q at the end (the batched streaming = the deferred
-        whole-row emission for v1)."""
+        completion.  The PREFILL = the per-row eager [1,L] prefills
+        (the proven-correct path: no pads, no mask, is_causal) with the
+        per-row KV copied RIGHT-ALIGNED into the batched cache
+        (the row i's real KV at [L-li, L)); the decode graph then runs
+        B rows in lock-step with the per-row pos + the per-row pad
+        mask (the abuf).  NO left-pad, NO explicit prefill mask."""
         B = self.B
         eng = self.eng
         tok = self.tok
-        # the dummy rows pad to the FULL B (the StaticCache update
-        # requires the exact batch; the dummies decode garbage that is
-        # never read)
         dummies = B - len(reqs)
         pad_id = tok.pad_token_id or 0
         all_reqs = list(reqs) + [
             CohortRequest(torch.tensor([[pad_id]], dtype=torch.long,
                                        device='cuda'), 1, 0.0, 1.0, 0,
                           1.0, 0.0, 0.0) for _ in range(dummies)]
-        # the left-pad the prompts to the common length
         L = max(r.ids.shape[1] for r in all_reqs)
-        inp = torch.full((B, L), pad_id, dtype=torch.long,
-                         device='cuda')
-        attn = torch.zeros((B, L), dtype=torch.long, device='cuda')
+        self.aid_len.fill_(L)
+        # the per-row eager prefills (the proven-correct [1,L] path)
+        lg_last = torch.zeros(B, device='cuda')
+        from transformers.cache_utils import StaticCache
+        row_cache = StaticCache(config=eng._cfg, max_batch_size=1,
+                                max_cache_len=L)
+        layers = eng.bcache.layers
+        rlayers = row_cache.layers
         for i, r in enumerate(all_reqs):
             li = r.ids.shape[1]
-            inp[i, L - li:] = r.ids[0]
-            attn[i, L - li:] = 1
-        pos = attn.cumsum(-1) - 1
-        pos.clamp_(min=0)
-        # the causal+pad mask over the PROMPT width [L, L]: the HF
-        # crops the KV via the explicit cache_position (arange(L)), so
-        # the mask width matches.  model_raw (NOT the compiled model):
-        # the B>1 eager shapes must not Dynamo-recompile the decode
-        # graphs' compiled artifact.
-        causal = (pos[:, :, None] <= pos[:, -1:, None]) & \
-                 (attn[:, None, :] > 0)
-        mask4 = torch.zeros((B, 1, L, L), dtype=lg4dt := torch.bfloat16,
-                            device='cuda')
-        mask4.masked_fill_(~causal[:, None], float('-inf'))
-        cpos = torch.arange(L, device='cuda')
-        # the eager batched prefill into the batched cache
-        out = eng.model_raw(input_ids=inp, attention_mask=mask4,
-                            position_ids=pos, cache_position=cpos,
-                            past_key_values=eng.bcache,
-                            use_cache=True)
-        lg_last = out.logits[:, -1].float()
-        # the seed: the prefill argmax per row (the eager sampled first
-        # token would need the per-row gumbel — the graph handles the
-        # rest of every row)
-        for i, r in enumerate(all_reqs):
+            row_cache.reset()
+            out = eng.model_raw(input_ids=r.ids,
+                                position_ids=torch.arange(
+                                    li, device='cuda').view(1, -1),
+                                past_key_values=row_cache,
+                                use_cache=True)
+            lg_last[i] = out.logits[0, -1].argmax().float()
+            # the right-aligned copy into the batched cache: the slots
+            # [L-li, L); the decode graph appends at [L, L+n)
+            for ly in range(len(layers)):
+                layers[ly].keys[i, :, L - li:L] = \
+                    rlayers[ly].keys[0, :, :li]
+                layers[ly].values[i, :, L - li:L] = \
+                    rlayers[ly].values[0, :, :li]
+        del row_cache
+        # the seed
+        for i in range(B):
             t0 = int(lg_last[i].argmax())
             self.nxt[i] = t0
             self.gen_buf[i, 0] = t0
             self.in_ids[i, 0] = t0
-        # the per-row params + the per-row rope positions (the real
-        # position of each row's FIRST generated token = its prompt
-        # length, since the left-pad aligns the last prompt token at
-        # L-1)
+        # the per-row params + the per-row positions + the mask
         for i, r in enumerate(all_reqs):
+            li = r.ids.shape[1]
             self.temp_g[i] = max(r.temp, 1e-6)
             self.top_p_g[i] = r.top_p
             self.top_k_g[i] = r.top_k
@@ -296,15 +290,11 @@ class BatchedGraphEngine:
             self.pres_g[i] = r.pres
             self.freq_g[i] = r.freq
             self.max_new_g[i] = r.max_new
-            self.pos_buf[i, 0] = int(pos[i, -1].item()) + 1
-        # the mask: the decode region opened per step in-graph; the
-        # per-row PAD key regions stay blocked
-        self.abuf.zero_()
-        self.abuf[:, :, :, L:] = float('-inf')
-        for i, r in enumerate(all_reqs):
-            pl = L - r.ids.shape[1]
+            self.pos_buf[i, 0] = li          # the next real position
+            pl = L - li                      # the pad slots to block
             if pl > 0:
                 self.abuf[i, :, :, :pl] = float('-inf')
+            self.abuf[i, :, :, L:] = float('-inf')
         self.active.fill_(1.0)
         self.eos_hit.zero_()
         self.n_gen.fill_(1)

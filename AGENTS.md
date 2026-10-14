@@ -844,3 +844,29 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   1.0s wall (0.16s/req at max_tokens 24) vs 10.7s the day before.
   The economics of true batching remain proven (3.5x at B>=8) but
   the rewrite bar is a session, not a patch.
+
+## Batched self-feed graph: state-poisoning wall (2026/10/15, parked)
+- ixrun/batched_graph.py (the fixed-cohort B-slot design) is
+  mechanically complete: the B=8 graph captures, the cohort runs, the
+  per-row sampling works in-graph.  BUT the engine state gets
+  POISONED by the beng.capture: after it, the row prefill argmax =
+  <s> (garbage) and the serialized generate degrades (the eos early).
+  The capture-order sensitivity: the beng._samp_body drives the
+  COMPILED eng.model at [B,1] -> the DYNAMO recompile ([17/8] logs)
+  -> everything downstream shifts.  The per-row prefill itself (the
+  model_raw + the fresh row_cache + the arange positions) yields <s>.
+- The bisect table: the same-length batch rows = OK (diff 0.72); the
+  mixed-length (the LEFT-PAD rows) = BAD (9-11); the mask4 (the
+  causal+pads, the full KV width) built correctly; the eye trick
+  (the pad queries attend themselves) did NOT change it -> NOT the
+  NaN poisoning; the cached-rope 2-D gather = correct per row.
+- The rewrite of run_cohort to the per-row prefills (the model_raw +
+  the fresh row_cache + the arange positions, the KV right-aligned
+  into the batched cache, no left-pad no mask) STILL yields <s> ->
+  the poisoning happens BEFORE any row prefill (at the beng.capture).
+- The reopen protocol: (1) the beng drives model_raw + its own
+  buffers ONLY (never the compiled model, never the eng buffers);
+  (2) the beng capture BEFORE the eng capture (or a full process
+  separation); (3) the row-prefill <s> probe as the poison canary;
+  (4) then the correctness gates.  The economics (3.5x at B>=8)
+  remain proven - this is an isolation bug, not a wall.
