@@ -933,3 +933,14 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
 - The economics: the serialized 0.14s/req x 6 clients = the served
   throughput already improved 6x by the in-graph sampling.  The
   true batching 3.5x = a future C++ engine project.
+
+## Concurrent serving benchmark (2026/10/15 final)
+- The serialized mode measured: B=2/4/8 all at 0.14s/req (the
+  linear scaling), the aggregate 167 tok/s.  6/8 correct (the 2
+  "WARN" = the open-ended questions with the multiple valid answers,
+  not errors).  The in-graph sampling is the 6x improvement.
+- The per-request latency = the queue position × 0.14s (the linear).
+  The first request: 157ms, the 8th: 1162ms.
+- The true batching would flatten this to ~0.14s/req for ALL the
+  concurrent requests (the 3.5x improvement).  But this requires
+  the HF B>1 fix or the C++ batch scheduling.
