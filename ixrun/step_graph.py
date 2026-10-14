@@ -266,6 +266,32 @@ class StepGraphEngine:
             else self._cfg.vocab_size,
             dtype=torch.bfloat16, device=dev)
 
+        # ---- in-graph sampling buffers (the self-feeding decode
+        # graph: the Gumbel-max sampling over the top-1024 is CAPTURED
+        # with the forward, so the per-token host cost = pos.fill_ +
+        # one replay - the ~13 python launches and their WDDM
+        # submission cost vanish, noise-immune).  The RNG is
+        # graph-safe (torch's philox offset advances per replay).
+        # IXRUN_GRAPH_SAMPLE=0 keeps the python sampling loop.
+        V = self.logits.shape[-1]
+        self.temp_g = torch.ones(1, dtype=torch.float32, device=dev)
+        self.top_p_g = torch.ones(1, dtype=torch.float32, device=dev)
+        self.top_k_g = torch.zeros(1, dtype=torch.long, device=dev)
+        self.rep_g = torch.ones(1, dtype=torch.float32, device=dev)
+        self.pres_g = torch.zeros(1, dtype=torch.float32, device=dev)
+        self.freq_g = torch.zeros(1, dtype=torch.float32, device=dev)
+        self.pen_on = torch.zeros(1, dtype=torch.float32, device=dev)
+        self.eos_mask = torch.zeros(V, dtype=torch.float32, device=dev)
+        self.n_dev = torch.zeros(1, dtype=torch.long, device=dev)
+        self.eos_hit = torch.zeros(1, dtype=torch.float32, device=dev)
+        self.nxt_g = torch.zeros(1, dtype=torch.long, device=dev)
+        self.aid_len = torch.zeros(1, dtype=torch.long, device=dev)
+        self.ABW = max_ctx + 8192
+        self.aid_buf = torch.zeros(self.ABW, dtype=torch.long, device=dev)
+        self.aid_ar = torch.arange(self.ABW, device=dev)
+        self.sub_ar = torch.arange(1024, device=dev)
+        self.out_gw = torch.zeros(self.ABW, dtype=torch.long, device=dev)
+
         # positional fast attention: the S=1 kernel reads self.pos
         # (device int, kernel-arg pointer + value-at-execution = replay
         # safe), so HF's per-step causal-mask construction (cat/neg
@@ -369,6 +395,8 @@ class StepGraphEngine:
                 print(f'[step-graph] codebook staged for '
                       f'{len(_um)} UdcqLinear modules', flush=True)
 
+        self.sgraph_on = (os.environ.get('IXRUN_GRAPH_SAMPLE', '1')
+                     not in ('', '0'))
         # warmup on a side stream then capture the full decode step
         if verbose:
             print('[step-graph] capturing full decode step...', flush=True)
@@ -377,21 +405,95 @@ class StepGraphEngine:
         with torch.cuda.stream(s):
             for _ in range(3):
                 self._step()
+                if self.sgraph_on:
+                    self._samp_body()
         torch.cuda.current_stream().wait_stream(s)
+        pool = torch.cuda.graph_pool_handle()
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
+        with torch.cuda.graph(g, pool=pool):
             lg = self._step()
             self.logits.copy_(lg)          # static output (pool-safe)
         self.graph = g
+        # the SELF-FEEDING SAMPLING graph: the forward + the in-graph
+        # Gumbel-max sampling over the top-1024 + the feed/audit
+        # bookkeeping (the shared pool; the static cache lives outside
+        # it).  The params arrive via the device scalar buffers, so one
+        # graph serves EVERY sampling config (temp/top_p/top_k/penalties
+        # included; temp clamps to 1e-6 = the exact argmax).  The RNG is
+        # graph-safe (the philox offset advances per replay).
+        # IXRUN_GRAPH_SAMPLE=0 skips it (the python sampling then).
+        self.sgraph = None
+        if self.sgraph_on:
+            self.hard_reset()
+            sg = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(sg, pool=pool):
+                self._samp_body()
+            self.sgraph = sg
         self.hard_reset()
         if verbose:
-            print('[step-graph] captured; cache reset', flush=True)
+            print('[step-graph] captured; cache reset'
+                  f'{"; in-graph sampling" if self.sgraph else ""}',
+                  flush=True)
 
     @torch.no_grad()
     def _step(self):
         return self.model(self.in_ids, position_ids=self.pos,
                           past_key_values=self.cache, use_cache=True,
                           attention_mask=None).logits
+
+    @torch.no_grad()
+    def _samp_body(self):
+        """The in-graph sampling: the penalties -> the top-1024 subset
+        -> the temp -> the histogram nucleus (NO torch.sort: it breaks
+        the capture) -> the Gumbel-max pick -> the self-feed/audit
+        (scatter_ only: the device-indexed tensor[idx] = x writes and
+        the in-graph copy_ from nxt_g to the g-graph input buffer ALSO
+        break the capture - so the forward READS nxt_g directly: the
+        graph is self-feeding).  Every op capture-safe; MUST be warmed
+        up before the capture (the kernel selection/workspace allocs
+        during a capture invalidate it)."""
+        lg2 = self.model(self.nxt_g.view(1, 1), position_ids=self.pos,
+                         past_key_values=self.cache, use_cache=True,
+                         attention_mask=None).logits[:, -1].float()
+        self.logits.copy_(lg2)
+        # the penalties UNCONDITIONALLY: the defaults (rep=1, pres=0,
+        # freq=0) are the exact identity, so no data-dependent branch
+        cnt = torch.zeros(lg2.shape[-1], device=lg2.device)
+        w = (self.aid_ar < self.aid_len + self.n_dev + 1).float()
+        cnt.scatter_add_(0, self.aid_buf, w)
+        act = cnt > 0
+        lg2 = torch.where(
+            act, torch.where(lg2 > 0, lg2 / self.rep_g.clamp(min=1e-6),
+                             lg2 * self.rep_g), lg2)
+        lg2 = torch.where(act, lg2 - self.pres_g, lg2)
+        lg2 = torch.where(act, lg2 - self.freq_g * cnt, lg2)
+        vk, ik = torch.topk(lg2, 1024)
+        v = vk / torch.clamp(self.temp_g, min=1e-6)
+        q_all = torch.softmax(v, dim=-1)     # over the subset
+        NB = 4096
+        bins = torch.zeros(NB, device=lg2.device)
+        bb = (q_all.reshape(-1) * NB).long().clamp_(0, NB - 1)
+        bins.scatter_add_(0, bb, q_all.reshape(-1))
+        suf = bins.flip(0).cumsum(0).flip(0)
+        bidx = (suf >= self.top_p_g[0]).float().argmax()
+        mask = bb >= bidx
+        kmask = (self.sub_ar < self.top_k_g[0]) | (self.top_k_g[0] <= 0)
+        mask &= kmask
+        v = v.reshape(-1).masked_fill(~mask, float('-inf'))
+        gumbel = -torch.log(-torch.log(torch.rand_like(v) + 1e-20)
+                            + 1e-20)
+        pick = (v + gumbel).argmax()
+        # NOT fill_(tensor): the 0-dim CUDA value does a hidden D2H
+        # sync inside the capture -> the capture invalidation.  The
+        # D2D gather+copy is capture-safe.
+        self.nxt_g.copy_(ik.reshape(-1).gather(0, pick.reshape(-1)))
+        # the self-feed IS the input read at the head of this body -
+        # an in-graph copy_ to the other graph's input buffer breaks
+        # the capture, so nothing to do here
+        self.out_gw.scatter_(0, self.n_dev, self.nxt_g)
+        self.aid_buf.scatter_(0, self.aid_len + self.n_dev, self.nxt_g)
+        self.n_dev += 1
+        self.eos_hit += self.eos_mask.gather(0, self.nxt_g).sum()
 
     # ------------------------------------------------------------------ #
     def hard_reset(self):
@@ -404,6 +506,11 @@ class StepGraphEngine:
                 t = getattr(layer, attr, None)
                 if isinstance(t, torch.Tensor):
                     t.zero_()
+        # the in-graph sampling bookkeeping
+        for attr in ('n_dev', 'eos_hit'):
+            t = getattr(self, attr, None)
+            if t is not None:
+                t.zero_()
 
     @torch.no_grad()
     def prefill(self, ids):
@@ -423,14 +530,91 @@ class StepGraphEngine:
     @torch.no_grad()
     def _gen_tokens(self, ids, max_new_tokens, temperature=0.0,
                     do_sample=False, top_p=1.0, top_k=0,
-                    repetition_penalty=1.0, sync_period=16):
+                    repetition_penalty=1.0, presence_penalty=0.0,
+                    frequency_penalty=0.0, sync_period=16):
         from .sampling import needs_sampling, sample_token
 
-        knobs = needs_sampling(do_sample, temperature, top_p, top_k,
-                               repetition_penalty)
+        # ---- the in-graph sampling path (the default): the params go
+        # into device scalars, the decode graph samples in-graph (the
+        # self-feeding); the host only fills pos + replays + the
+        # periodic pinned readback.  IXRUN_GRAPH_SAMPLE=0 falls back to
+        # the python sampling loop.
+        if self.sgraph is not None and not (do_sample and temperature > 0):
+            self.hard_reset()
+            logits = self.prefill(ids)
+            first = int(logits[:, -1].argmax(-1).item())
+            # the eos mask (the full set: the tokenizer + the gen cfg)
+            eos_ids = {self.tokenizer.eos_token_id}
+            gc = getattr(self.model.config, "generation_config", None)
+            gids = getattr(gc, "eos_token_id", None) if gc else None
+            if gids is not None:
+                eos_ids |= {gids} if isinstance(gids, int) else set(gids)
+            self.eos_mask.zero_()
+            for e in eos_ids:
+                if 0 <= e < self.eos_mask.numel():
+                    self.eos_mask[e] = 1.0
+            # the params
+            self.temp_g.fill_(max(float(temperature), 1e-6))
+            self.top_p_g.fill_(float(top_p))
+            self.top_k_g.fill_(int(top_k))
+            self.rep_g.fill_(float(repetition_penalty))
+            self.pres_g.fill_(float(presence_penalty))
+            self.freq_g.fill_(float(frequency_penalty))
+            self.pen_on.fill_(1.0 if (repetition_penalty != 1.0
+                                      or presence_penalty != 0.0
+                                      or frequency_penalty != 0.0)
+                              else 0.0)
+            # the aid window: the prompt ids
+            L = len(ids)
+            self.aid_len.fill_(L)
+            self.aid_buf[:L] = torch.tensor(ids, dtype=torch.long,
+                                            device='cuda')
+            self.nxt_g.fill_(first)
+            out = [first]
+            t = L
+            n_cap = min(max_new_tokens - 1, self.ABW - L - 2)
+            period = min(sync_period, max(1, n_cap))
+            pin = torch.zeros(2, dtype=torch.long, pin_memory=True)
+            it = 0
+            while len(out) < max_new_tokens and t < self.max_ctx - 1:
+                self.pos.fill_(t)
+                self.sgraph.replay()
+                it += 1
+                if it % period == 0 or t + 1 >= self.max_ctx - 1:
+                    pin[0] = self.n_dev[0]
+                    pin[1] = self.eos_hit[0]
+                    torch.cuda.synchronize()
+                    nd = int(pin[0])
+                    if int(pin[1]) > 0:
+                        vals = self.out_gw[:nd].cpu().tolist()
+                        hit = [i for i, v in enumerate(vals) if v in eos_ids]
+                        if hit:
+                            out.extend(vals[:hit[0] + 1])
+                            return out
+                    got = nd - (len(out) - 1)
+                    if got > 0:
+                        vals = self.out_gw[len(out) - 1:nd].cpu().tolist()
+                        out.extend(vals)
+                t += 1
+            # the final readback
+            nd = int(self.n_dev[0])
+            if nd > len(out) - 1:
+                vals = self.out_gw[len(out) - 1:nd].cpu().tolist()
+                hit = [i for i, v in enumerate(vals) if v in eos_ids]
+                if hit:
+                    vals = vals[:hit[0] + 1]
+                out.extend(vals)
+            return out
+
+        from .sampling import needs_sampling, sample_token
+
+        # the penalties are applied ON-GPU in the deferred path now, so
+        # they no longer force the per-token CPU (D2H) sampling path
+        knobs = do_sample and temperature > 0
         if knobs:
-            # CPU-side sampling needs per-token decisions: fall back to the
-            # synchronous loop (MiniCPM5 steps are ~7ms, fine)
+            # probabilistic sampling with the CPU logits (rare: the
+            # explicit do_sample requests); temp>0 stays on the GPU
+            # deferred path below
             self.hard_reset()
             first = self._first_token(ids)
             eos_ids = {self.tokenizer.eos_token_id}
@@ -473,21 +657,44 @@ class StepGraphEngine:
         pin = torch.zeros(period, dtype=torch.long, pin_memory=True)
         out = [first]          # the prefill argmax IS the first generated
         n = 0
+        # the GPU penalty bookkeeping: the ids the penalties see =
+        # the prompt + everything generated so far (HF semantics)
+        penalize = (repetition_penalty != 1.0 or presence_penalty != 0.0
+                    or frequency_penalty != 0.0)
+        pids = torch.tensor(ids, dtype=torch.long,
+                            device='cuda') if penalize else None
         while n < max_new_tokens - 1 and t < self.max_ctx - 1:
             self.in_ids.copy_(nxt_g.view(1, 1))
             self.pos.fill_(t)
             self.graph.replay()
             if temperature and temperature > 0 or top_p < 1.0 \
-                    or top_k > 0:
-                # on-GPU sampling, all within the top-SUB subset
-                # (S=1024): the full-vocab sort/multinomial cost ~8ms
-                # per token on WDDM; the top-p mass of any sane request
-                # lives well inside 1024 tokens.  The Gumbel-max trick
-                # is an EXACT categorical sample (no multinomial).
-                # Sub-exhaustion safety: if the subset CDF misses
-                # top_p, fall back to the full-vocab path.
+                    or top_k > 0 or penalize:
+                # on-GPU sampling, all within the top-SUB subset:
+                # top-k FIRST (the subset IS the top-k), then the
+                # nucleus INSIDE it - the sort touches SUB elements,
+                # never the full vocab (~8ms/token on WDDM).  The
+                # Gumbel-max trick is an EXACT categorical sample.
                 SUB = 1024
+                if top_k and 0 < top_k < SUB:
+                    SUB = top_k
                 lg = self.logits[:, -1].float()
+                if penalize:
+                    # bincount + full-vocab where (NO torch.unique: it
+                    # costs ~25ms/token; the vectorized where applies
+                    # the HF semantics exactly via the counts mask)
+                    aid = torch.cat([pids, out_g[:n], nxt_g.view(1)])
+                    cnt = torch.bincount(
+                        aid, minlength=lg.shape[-1]).float()
+                    act = cnt > 0
+                    if repetition_penalty != 1.0:
+                        lg = torch.where(
+                            act, torch.where(lg > 0, lg / repetition_penalty,
+                                             lg * repetition_penalty), lg)
+                    if presence_penalty != 0.0:
+                        lg = torch.where(act, lg - presence_penalty, lg)
+                    if frequency_penalty != 0.0:
+                        lg = torch.where(act, lg - frequency_penalty * cnt,
+                                         lg)
                 vk, ik = torch.topk(lg, SUB)
                 v = vk
                 if temperature and temperature > 0:
@@ -498,18 +705,31 @@ class StepGraphEngine:
                 keep[..., 0] = True
                 smask = torch.zeros_like(v, dtype=torch.bool)
                 smask.scatter_(-1, order, keep)
-                if top_k and 0 < top_k < SUB:
-                    kmask = torch.zeros_like(smask)
-                    kmask[..., :top_k] = True
-                    smask &= kmask
                 # NOTE: no host-side coverage check here - a sync per
-                # token costs more than the rare top-1024 truncation
-                # is worth (top_p <= 0.95 mass always fits in practice)
+                # token costs more than the rare subset truncation is
+                # worth (top_p <= 0.95 mass fits in the top-1024; a
+                # set top_k IS the subset).
                 v = v.masked_fill(~smask, float('-inf'))
                 gumbel = -torch.log(
                     -torch.log(torch.rand_like(v) + 1e-20) + 1e-20)
                 pick = (v + gumbel).argmax(dim=-1)
                 nxt_g.fill_(ik.reshape(-1)[pick.reshape(-1)[0]])
+            elif penalize:
+                # greedy + penalties: the penalized argmax on-GPU
+                lg = self.logits[:, -1].float()
+                aid = torch.cat([pids, out_g[:n], nxt_g.view(1)])
+                cnt = torch.bincount(
+                    aid, minlength=lg.shape[-1]).float()
+                act = cnt > 0
+                if repetition_penalty != 1.0:
+                    lg = torch.where(
+                        act, torch.where(lg > 0, lg / repetition_penalty,
+                                         lg * repetition_penalty), lg)
+                if presence_penalty != 0.0:
+                    lg = torch.where(act, lg - presence_penalty, lg)
+                if frequency_penalty != 0.0:
+                    lg = torch.where(act, lg - frequency_penalty * cnt, lg)
+                nxt_g.fill_(lg.argmax(dim=-1).reshape(-1)[0])
             else:
                 torch.argmax(self.logits[:, -1], out=nxt_g)
             out_g[n] = nxt_g
@@ -545,10 +765,13 @@ class StepGraphEngine:
         top_k = int(kw.pop('top_k', top_k))
         repetition_penalty = float(kw.pop('repetition_penalty',
                                           repetition_penalty))
+        presence_penalty = float(kw.pop('presence_penalty', 0.0))
+        frequency_penalty = float(kw.pop('frequency_penalty', 0.0))
         ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'][0] \
             .tolist()
         out = self._gen_tokens(ids, max_new_tokens, temperature, do_sample,
-                               top_p, top_k, repetition_penalty)
+                               top_p, top_k, repetition_penalty,
+                               presence_penalty, frequency_penalty)
         return self.tokenizer.decode(out)
 
     def stream(self, prompt, max_new_tokens=64, temperature=0.0,
