@@ -713,3 +713,22 @@ $env:HF_HUB_OFFLINE='1'; $env:TRANSFORMERS_OFFLINE='1'; & 'F:\rwkv\.venv\Scripts
   use_cache=False = the degenerate per-token attention = the
   existing kernels, 3 norms, the shared lm_head), the chain graphs,
   the rollback ring.
+
+## Server concurrency state (2026/10/13 night)
+- The serialized mode (gen_lock) is CONCURRENCY-SAFE: 6-8 parallel
+  HTTP clients queue correctly, zero corruption, ~1.78s/req at
+  max_tokens 24 (the aggregate ~0.56 req/s).  That is the shipped
+  behavior; the fastapi layer handles the connections, the
+  generations serialize on the single decode graph.
+- --batched (BatchedGreedyGenerator, continuous batching) is
+  INCOMPATIBLE with the step-graph custom-module stack: the batched
+  forward hits a device-side assert (the batching core predates
+  UdcqLinear-stream/Bf16xlLinear/fused add+norm/pos-attention and
+  drives the raw model at M=8 through paths those modules do not
+  cover).  Reverted to the serialized server; the flag stays off.
+  Fixing it = port the batching core to the custom modules (a
+  dedicated session; the economics are proven at B>=8 = 3.5x).
+- bf16xl served answers at temp 0: 'Germany -> Dresden' happened in
+  the serialized path and 'Berlin' in the batched path (different
+  kernel rounding) - a 1B knowledge error near the tie, NOT a
+  quantization issue (the tier is lossless).
