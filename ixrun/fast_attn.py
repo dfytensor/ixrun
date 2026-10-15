@@ -153,6 +153,14 @@ _pos_tensor = None      # device int64 tensor with the decode position
 @torch.compiler.disable(recursive=True)
 def _fast_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                is_causal=False, scale=None, **kw):
+    # the GQA repeat: the HF 5.15 doesn't repeat the KV for the B>1
+    # + the mask=None (the enable_gqa path breaks at B>1)
+    if query.dim() == 4 and query.is_cuda \
+            and query.shape[1] != key.shape[1] and key.shape[1] > 0:
+        rep = query.shape[1] // key.shape[1]
+        if rep > 1:
+            key = key.repeat_interleave(rep, dim=1)
+            value = value.repeat_interleave(rep, dim=1)
     if (_HAS_TRITON and query.dim() == 4 and query.shape[0] == 1
             and query.shape[2] == 1
             and query.dtype == torch.bfloat16
