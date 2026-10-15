@@ -349,10 +349,15 @@ class StepGraphEngine:
                     _m._sin_cache = _sin[0].contiguous()
 
                     def _rope_fwd(self, x, position_ids):
+                        if position_ids.shape[0] > 1:
+                            return self._orig_fwd(x, position_ids)
                         idx = position_ids.reshape(-1)
                         return (self._cos_cache[idx].unsqueeze(0),
                                 self._sin_cache[idx].unsqueeze(0))
 
+                    if not hasattr(_m, '_orig_fwd_saved'):
+                        _m._orig_fwd_saved = _m.forward
+                    _m._orig_fwd = _m.forward
                     _m.forward = _types.MethodType(_rope_fwd, _m)
                     _rope_mod = _m
                     _nr += 1
